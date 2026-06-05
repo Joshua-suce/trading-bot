@@ -1,0 +1,31 @@
+version: '3.8'
+services:
+  trading-bot:
+    build: .
+    container_name: trading-bot
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    env_file:
+      - .env
+    environment:
+      AUDIT_DB_PATH: /app/data/audit/trading_audit.db
+      LOG_DIR: /app/data/logs
+      MODEL_DIR: /app/data/models
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8501:8501" # Streamlit
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 2g
+    cpus: "1.5"
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.main", "--mode", "health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: python -m src.main --mode paper
