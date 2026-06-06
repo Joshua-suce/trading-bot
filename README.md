@@ -54,7 +54,8 @@ from being sent to an unknown endpoint.
 3. Restore and reconcile audited exchange positions.
 4. Scan configured symbols and timeframes sequentially.
 5. Validate closed OHLCV candles.
-6. Fuse technical and trained ML signals.
+6. Blend EMA 50/200 trend, Fibonacci retracement confluence, supporting
+   technical signals, and trained ML predictions.
 7. Apply risk, loss, drawdown, position-count, and exposure controls.
 8. Submit a market entry.
 9. Submit reduce-only stop-loss and take-profit protection.

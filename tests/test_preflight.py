@@ -40,6 +40,11 @@ def test_settings_rejects_invalid_timeframes():
         make_settings(timeframes="1h,13m")
 
 
+def test_settings_requires_ema_200_warmup():
+    with pytest.raises(ValidationError):
+        make_settings(min_ohlcv_candles=199)
+
+
 def test_settings_reads_secret_files(tmp_path):
     key_file = tmp_path / "key.txt"
     secret_file = tmp_path / "secret.txt"

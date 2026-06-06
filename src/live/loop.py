@@ -145,7 +145,7 @@ class LiveTradingLoop:
         try:
             from src.indicators.compute import compute_all_indicators
 
-            limit = max(200, settings.min_ohlcv_candles + 1)
+            limit = settings.min_ohlcv_candles + 1
             df = await self.client.fetch_ohlcv(symbol, timeframe, limit=limit)
             quality = self.data_quality.validate(df, timeframe)
             if not quality.valid:

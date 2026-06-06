@@ -59,6 +59,43 @@ def test_compute_all_indicators_is_idempotent():
     assert "bb_percent_b" in twice.columns
 
 
+def test_technical_signal_blends_bullish_ema_and_fibonacci_confluence():
+    row = {
+        "open": 109.0,
+        "high": 111.0,
+        "low": 107.8,
+        "close": 110.0,
+        "volume": 1000.0,
+        "ema_50": 105.0,
+        "ema_200": 100.0,
+        "ema_50_slope": 0.01,
+        "macd_hist": 1.0,
+        "adx": 30.0,
+        "plus_di": 30.0,
+        "minus_di": 15.0,
+        "trend_regime": 1,
+        "rsi_14": 55.0,
+        "vol_ratio": 1.2,
+        "atr": 4.0,
+        "fib_382": 115.0,
+        "fib_500": 110.0,
+        "fib_618": 105.0,
+    }
+    previous = {
+        **row,
+        "high": 109.0,
+        "low": 106.0,
+        "close": 108.0,
+        "macd_hist": 0.5,
+        "fib_500": 110.0,
+    }
+
+    signal = TechnicalSignal().generate(pd.DataFrame([previous, row]))
+
+    assert signal.direction == 1
+    assert signal.strength > 0
+
+
 class FakeXgbModel:
     def __init__(self, direction: int, confidence: float):
         self.direction = direction

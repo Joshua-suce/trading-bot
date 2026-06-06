@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     position_scope: str = "symbol"
     scan_sleep_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
     reconciliation_interval_seconds: float = Field(default=300.0, ge=30.0, le=3600.0)
-    min_ohlcv_candles: int = Field(default=50, ge=2, le=1000)
+    min_ohlcv_candles: int = Field(default=200, ge=200, le=1000)
     max_candle_delay_multiplier: float = Field(default=3.0, ge=1.0, le=20.0)
     allow_zero_volume_candles: bool = False
     max_entry_slippage_bps: float = Field(default=25.0, ge=0.0, le=1000.0)

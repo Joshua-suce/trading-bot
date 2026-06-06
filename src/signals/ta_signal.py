@@ -28,35 +28,45 @@ class TechnicalSignal:
         rsi = self._safe_float(last.get("rsi_14"), 50.0)
         vol_conf = min(self._safe_float(last.get("vol_ratio"), 1.0) / 2, 1.0)
 
-        if self._has(last, "ema_9", "ema_21") and self._has(prev, "ema_9", "ema_21"):
-            if prev["ema_9"] <= prev["ema_21"] and last["ema_9"] > last["ema_21"]:
-                signals.append(TASignal(1, 0.6, "ema_cross_bull"))
-            elif prev["ema_9"] >= prev["ema_21"] and last["ema_9"] < last["ema_21"]:
-                signals.append(TASignal(-1, 0.6, "ema_cross_bear"))
+        if self._has(last, "ema_50", "ema_200") and self._has(
+            prev, "ema_50", "ema_200"
+        ):
+            if prev["ema_50"] <= prev["ema_200"] and last["ema_50"] > last["ema_200"]:
+                signals.append(TASignal(1, 0.75, "golden_cross"))
+            elif prev["ema_50"] >= prev["ema_200"] and last["ema_50"] < last["ema_200"]:
+                signals.append(TASignal(-1, 0.75, "death_cross"))
 
-        if self._has(last, "ema_9", "ema_21", "macd_hist", "ema_21_slope"):
+        if self._has(last, "ema_50", "ema_200", "macd_hist", "ema_50_slope"):
             macd_prev = self._safe_float(
                 prev.get("macd_hist"), self._safe_float(last["macd_hist"])
             )
             macd_rising = last["macd_hist"] > macd_prev
             macd_falling = last["macd_hist"] < macd_prev
             if (
-                last["ema_9"] > last["ema_21"]
-                and last["ema_21_slope"] > 0
+                last["close"] > last["ema_50"] > last["ema_200"]
+                and last["ema_50_slope"] > 0
                 and macd_rising
                 and 48 <= rsi <= 72
             ):
                 signals.append(
-                    TASignal(1, 0.5 + 0.2 * adx_strength, "trend_continuation_bull")
+                    TASignal(
+                        1,
+                        0.55 + 0.2 * adx_strength,
+                        "ema_50_200_continuation_bull",
+                    )
                 )
             elif (
-                last["ema_9"] < last["ema_21"]
-                and last["ema_21_slope"] < 0
+                last["close"] < last["ema_50"] < last["ema_200"]
+                and last["ema_50_slope"] < 0
                 and macd_falling
                 and 28 <= rsi <= 52
             ):
                 signals.append(
-                    TASignal(-1, 0.5 + 0.2 * adx_strength, "trend_continuation_bear")
+                    TASignal(
+                        -1,
+                        0.55 + 0.2 * adx_strength,
+                        "ema_50_200_continuation_bear",
+                    )
                 )
 
         if pd.notna(last.get("rsi_14")):
@@ -90,6 +100,10 @@ class TechnicalSignal:
                 signals.append(TASignal(1, 0.25, "bb_oversold"))
             elif last["bb_percent_b"] > 0.8 and not strong_trend:
                 signals.append(TASignal(-1, 0.25, "bb_overbought"))
+
+        fib_signal = self._fibonacci_signal(last, prev, trend_regime, adx_strength)
+        if fib_signal:
+            signals.append(fib_signal)
 
         if len(df) > 1 and self._has(last, "dc_upper", "dc_lower"):
             prev_upper = prev.get("dc_upper")
@@ -169,3 +183,56 @@ class TechnicalSignal:
             if row["minus_di"] > row["plus_di"]:
                 return -1
         return int(row.get("trend_regime", 0) or 0)
+
+    @classmethod
+    def _fibonacci_signal(
+        cls,
+        last: pd.Series,
+        prev: pd.Series,
+        trend_regime: int,
+        adx_strength: float,
+    ) -> TASignal | None:
+        levels = ("fib_382", "fib_500", "fib_618")
+        available = [
+            (name, cls._safe_float(last.get(name)))
+            for name in levels
+            if pd.notna(last.get(name)) and cls._safe_float(last.get(name)) > 0
+        ]
+        if not available or trend_regime == 0:
+            return None
+
+        close = cls._safe_float(last.get("close"))
+        previous_close = cls._safe_float(prev.get("close"), close)
+        atr = cls._safe_float(last.get("atr"), close * 0.01)
+        tolerance = max(atr * 0.25, close * 0.001)
+        level_name, level = min(available, key=lambda item: abs(close - item[1]))
+        previous_level = cls._safe_float(prev.get(level_name), level)
+
+        if trend_regime == 1:
+            reclaimed = previous_close <= previous_level and close > level
+            held_support = (
+                cls._safe_float(last.get("low"), close) <= level + tolerance
+                and close >= level
+                and close > previous_close
+            )
+            if reclaimed or held_support:
+                return TASignal(
+                    1,
+                    0.5 + 0.2 * adx_strength,
+                    f"{level_name}_bullish_confluence",
+                )
+
+        if trend_regime == -1:
+            rejected = previous_close >= previous_level and close < level
+            held_resistance = (
+                cls._safe_float(last.get("high"), close) >= level - tolerance
+                and close <= level
+                and close < previous_close
+            )
+            if rejected or held_resistance:
+                return TASignal(
+                    -1,
+                    0.5 + 0.2 * adx_strength,
+                    f"{level_name}_bearish_confluence",
+                )
+        return None

@@ -117,7 +117,7 @@ class FakeSequentialClient:
     def __init__(self):
         self.calls = []
         self.last_index = pd.date_range(
-            end=pd.Timestamp.now(tz="UTC"), periods=60, freq="5min"
+            end=pd.Timestamp.now(tz="UTC"), periods=201, freq="5min"
         )
 
     async def fetch_ohlcv(self, symbol, timeframe, limit=200):
@@ -171,9 +171,9 @@ async def test_scan_timeframes_runs_in_configured_sequence(monkeypatch):
     )
 
     assert fake_client.calls == [
-        ("BTCUSDT", "5m", 200),
-        ("BTCUSDT", "15m", 200),
-        ("BTCUSDT", "30m", 200),
+        ("BTCUSDT", "5m", 201),
+        ("BTCUSDT", "15m", 201),
+        ("BTCUSDT", "30m", 201),
     ]
     assert processed == [
         ("BTCUSDT", "5m"),
@@ -215,7 +215,7 @@ async def test_process_timeframe_uses_last_closed_candle(monkeypatch):
     await bot._process_timeframe("BTCUSDT", "5m")
 
     assert processed[0]["timestamp"] == bot.client.last_index[-2]
-    assert processed[0]["close"] == 100.5 + 58 * 0.1
+    assert processed[0]["close"] == 100.5 + 199 * 0.1
 
 
 @pytest.mark.asyncio

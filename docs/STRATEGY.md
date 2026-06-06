@@ -13,10 +13,35 @@ The bot uses a **hybrid signal fusion** strategy combining rule-based technical 
 
 ## 1. Technical Analysis Signals
 
-### EMA Crossover (Strength: 0.6)
-- **Bullish**: EMA 9 crosses above EMA 21
-- **Bearish**: EMA 9 crosses below EMA 21
-- Measures trend direction changes
+### EMA 50/200 Trend Framework
+- **Golden cross**: EMA 50 crosses above EMA 200 (bullish, strength 0.75)
+- **Death cross**: EMA 50 crosses below EMA 200 (bearish, strength 0.75)
+- **Bullish continuation**: price above EMA 50 above EMA 200, positive EMA 50
+  slope, rising MACD histogram, and RSI confirmation
+- **Bearish continuation**: price below EMA 50 below EMA 200, negative EMA 50
+  slope, falling MACD histogram, and RSI confirmation
+
+EMA 50/200 defines the primary trend regime. Short-term indicators cannot
+override the regime without enough opposing signal strength.
+
+### Fibonacci Confluence
+
+Fibonacci levels are calculated from the rolling 100-candle swing high and low:
+
+- 23.6%
+- 38.2%
+- 50.0%
+- 61.8%
+- 78.6%
+
+The strategy uses the nearest core retracement level (38.2%, 50%, or 61.8%):
+
+- In an EMA 50/200 bullish regime, a reclaim or support hold adds a bullish vote.
+- In an EMA 50/200 bearish regime, a rejection or resistance hold adds a bearish
+  vote.
+- ATR supplies a volatility-aware tolerance around each level.
+- Fibonacci does not trigger a trade independently; it blends with EMA, MACD,
+  RSI, Bollinger, Donchian, ADX, and volume votes.
 
 ### RSI (Strength: 0.3–0.5)
 - **Oversold** (RSI < 30): Bullish signal (strength 0.5)
@@ -65,13 +90,17 @@ direction = sign(weighted_dir) if |weighted_dir| > 0.15 else 0
 | **BB Derivatives** | Position within bands, breakout flags |
 | **Volatility** | ATR %, HV rank, volatility ratio |
 | **Volume** | OBV signal, VWAP distance, volume spike flag |
-| **Price vs MA** | Distance from EMA 9/21/50/200 |
-| **Crossover** | EMA 9/21 cross direction |
+| **Price vs MA** | Distance from EMA 50/200 |
+| **Crossover** | EMA 50/200 cross direction |
+| **Fibonacci** | Distance from 23.6/38.2/50/61.8/78.6 retracement levels |
 
 ### Target Definition
 - **+1** (Buy): Next-period price increases
 - **0** (Hold): Next-period price unchanged
 - **-1** (Sell): Next-period price decreases
+
+Because EMA 9/21 features were replaced with EMA 50/200 and Fibonacci features,
+existing saved ML models must be retrained before their predictions are used.
 
 ### XGBoost Classifier
 - 3-class classification: -1, 0, +1

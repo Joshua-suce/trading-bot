@@ -14,6 +14,29 @@ class TrendIndicators:
     def sma(close: pd.Series, period: int = 20) -> pd.Series:
         return close.rolling(window=period).mean()
 
+    @staticmethod
+    def fibonacci_retracement(
+        high: pd.Series,
+        low: pd.Series,
+        lookback: int = 100,
+    ) -> pd.DataFrame:
+        swing_high = high.rolling(window=lookback, min_periods=2).max()
+        swing_low = low.rolling(window=lookback, min_periods=2).min()
+        price_range = (swing_high - swing_low).clip(lower=0)
+
+        return pd.DataFrame(
+            {
+                "fib_swing_high": swing_high,
+                "fib_236": swing_high - price_range * 0.236,
+                "fib_382": swing_high - price_range * 0.382,
+                "fib_500": swing_high - price_range * 0.500,
+                "fib_618": swing_high - price_range * 0.618,
+                "fib_786": swing_high - price_range * 0.786,
+                "fib_swing_low": swing_low,
+            },
+            index=high.index,
+        )
+
     # MACD (Moving Average Convergence Divergence): momentum + trend
     # Returns MACD line, signal line, and histogram
     @staticmethod

@@ -62,7 +62,7 @@ class FeatureEngineer:
         result["volume_spike"] = (result["vol_ratio"] > 1.5).astype(int)
 
         # Price relative to moving averages
-        for period in [9, 21, 50, 200]:
+        for period in [50, 200]:
             col = f"ema_{period}"
             if col in result.columns:
                 result[f"price_vs_{col}"] = (
@@ -70,11 +70,18 @@ class FeatureEngineer:
                 )
 
         # Crossover signals
-        result["ema_9_21_cross"] = (
-            (result["ema_9"] - result["ema_21"])
+        result["ema_50_200_cross"] = (
+            (result["ema_50"] - result["ema_200"])
             .diff()
             .apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
         )
+
+        # Fibonacci confluence features
+        for level in ["fib_236", "fib_382", "fib_500", "fib_618", "fib_786"]:
+            if level in result.columns:
+                result[f"distance_to_{level}"] = (
+                    (result["close"] - result[level]) / result["close"] * 100
+                )
 
         # Target: next-period return direction (for classification)
         result["target"] = result["close"].shift(-1) - result["close"]

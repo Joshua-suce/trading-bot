@@ -33,14 +33,14 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     vol = result.get("volume", pd.Series(0, index=result.index))
 
     # Trend
-    result["ema_9"] = trend.ema(close, 9)
-    result["ema_21"] = trend.ema(close, 21)
     result["ema_50"] = trend.ema(close, 50)
     result["ema_200"] = trend.ema(close, 200)
-    result["ema_21_slope"] = result["ema_21"].pct_change(3)
     result["ema_50_slope"] = result["ema_50"].pct_change(5)
+    result["ema_200_slope"] = result["ema_200"].pct_change(10)
     result["sma_20"] = trend.sma(close, 20)
     result["sma_50"] = trend.sma(close, 50)
+    fib_df = trend.fibonacci_retracement(high, low)
+    result = _append_indicator_frame(result, fib_df)
     macd_df = trend.macd(close)
     result = _append_indicator_frame(result, macd_df)
     result["adx"] = trend.adx(high, low, close)

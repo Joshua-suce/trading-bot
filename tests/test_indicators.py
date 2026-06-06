@@ -43,6 +43,19 @@ class TestTrendIndicators:
         )
         assert len(result) == len(sample_df)
 
+    def test_fibonacci_retracement_levels_are_ordered(self, sample_df):
+        result = TrendIndicators.fibonacci_retracement(
+            sample_df["high"], sample_df["low"], lookback=100
+        ).dropna()
+
+        last = result.iloc[-1]
+        assert last["fib_swing_high"] >= last["fib_236"]
+        assert last["fib_236"] >= last["fib_382"]
+        assert last["fib_382"] >= last["fib_500"]
+        assert last["fib_500"] >= last["fib_618"]
+        assert last["fib_618"] >= last["fib_786"]
+        assert last["fib_786"] >= last["fib_swing_low"]
+
 
 class TestMomentumIndicators:
     def test_rsi(self, sample_df):
@@ -90,8 +103,11 @@ class TestComputeAll:
     def test_compute_all_indicators(self, sample_df):
         result = compute_all_indicators(sample_df)
         expected_cols = [
-            "ema_9",
-            "ema_21",
+            "ema_50",
+            "ema_200",
+            "fib_382",
+            "fib_500",
+            "fib_618",
             "macd",
             "rsi_14",
             "bb_upper",
