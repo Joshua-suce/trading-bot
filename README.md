@@ -67,24 +67,27 @@ Demo Trading orders.
 
 ```powershell
 # Unified trading
-.\.venv\Scripts\python.exe -m src.main --mode trade
+.\scripts\run_bot.cmd --mode trade
 
 # Train models
-.\.venv\Scripts\python.exe -m src.main --mode train --symbol BTCUSDT --timeframe 1h --limit 1000
+.\scripts\run_bot.cmd --mode train --symbol BTCUSDT --timeframe 1h --limit 1000
 
 # Health and monitoring
-.\.venv\Scripts\python.exe -m src.main --mode health
-.\.venv\Scripts\python.exe -m src.main --mode dashboard
+.\scripts\run_bot.cmd --mode health
+.\scripts\run_bot.cmd --mode dashboard
 
 # Offline operational soak
-.\.venv\Scripts\python.exe -m src.main --mode soak --soak-iterations 5
+.\scripts\run_bot.cmd --mode soak --soak-iterations 5
 
 # Controls
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action status
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action pause --reason "maintenance"
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action resume
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action emergency-stop --reason "risk event"
+.\scripts\run_bot.cmd --mode admin --admin-action status
+.\scripts\run_bot.cmd --mode admin --admin-action pause --reason "maintenance"
+.\scripts\run_bot.cmd --mode admin --admin-action resume
+.\scripts\run_bot.cmd --mode admin --admin-action emergency-stop --reason "risk event"
 ```
+
+The launcher always uses the project virtual environment. When invoking Python
+directly, use `.\.venv\Scripts\python.exe`, not the system `python`.
 
 ## Quality Gate
 

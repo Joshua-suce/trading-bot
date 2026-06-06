@@ -20,6 +20,7 @@ EXCLUDED_FILES = {
 }
 TEXT_EXTENSIONS = {
     ".py",
+    ".cmd",
     ".ps1",
     ".sh",
     ".md",
