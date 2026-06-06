@@ -157,10 +157,13 @@ class PositionManager:
                 levels.take_profit,
             )
             return True
-        await self._notify_trade_failed(symbol, "market buy order was not filled")
+        failure_reason = self._order_failure_reason(
+            symbol, "market buy order was not filled"
+        )
+        await self._notify_trade_failed(symbol, failure_reason)
         self._audit(
             "trade_failed",
-            "market buy order was not filled",
+            failure_reason,
             severity="error",
             symbol=symbol,
         )
@@ -283,10 +286,13 @@ class PositionManager:
                 levels.take_profit,
             )
             return True
-        await self._notify_trade_failed(symbol, "market sell order was not filled")
+        failure_reason = self._order_failure_reason(
+            symbol, "market sell order was not filled"
+        )
+        await self._notify_trade_failed(symbol, failure_reason)
         self._audit(
             "trade_failed",
-            "market sell order was not filled",
+            failure_reason,
             severity="error",
             symbol=symbol,
         )
@@ -553,6 +559,12 @@ class PositionManager:
     async def _notify_trade_failed(self, symbol: str, reason: str):
         if self.alerter:
             await self.alerter.trade_failed_alert(self.mode, symbol, reason)
+
+    def _order_failure_reason(self, symbol: str, fallback: str) -> str:
+        failure_reason = getattr(self.orders, "failure_reason", None)
+        if callable(failure_reason):
+            return str(failure_reason(symbol, fallback))
+        return fallback
 
     @staticmethod
     def _new_correlation_id() -> str:

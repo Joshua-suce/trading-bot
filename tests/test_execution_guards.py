@@ -56,6 +56,63 @@ async def test_execution_guard_rounds_amount_and_price():
 
 
 @pytest.mark.asyncio
+async def test_execution_guard_supports_ccxt_tick_size_precision():
+    client = FakeExchangeClient(
+        ticker={"last": 60_000.0, "bid": 59_999.0, "ask": 60_001.0},
+        market={
+            "precision": {"amount": 0.001, "price": 0.1},
+            "limits": {"amount": {"min": 0.001}, "cost": {"min": 50.0}},
+        },
+    )
+    guard = ExecutionGuard(max_slippage_bps=50.0, min_notional=5.0)
+
+    prepared = await guard.prepare(
+        client,
+        symbol="BTCUSDT",
+        order_type="limit",
+        side="buy",
+        quantity=0.001648,
+        price=60_000.19,
+        params={},
+    )
+
+    assert prepared.allowed is True
+    assert prepared.quantity == 0.001
+    assert prepared.price == 60_000.1
+    assert prepared.notional == pytest.approx(60.0001)
+
+
+@pytest.mark.asyncio
+async def test_execution_guard_never_increases_quantity_to_exchange_minimum():
+    client = FakeExchangeClient(
+        ticker={"last": 60_000.0, "bid": 59_999.0, "ask": 60_001.0},
+        market={
+            "precision": {"amount": 0.001, "price": 0.1},
+            "limits": {"amount": {"min": 0.001}, "cost": {"min": 50.0}},
+        },
+    )
+    guard = ExecutionGuard(max_slippage_bps=50.0, min_notional=5.0)
+
+    prepared = await guard.prepare(
+        client,
+        symbol="BTCUSDT",
+        order_type="market",
+        side="buy",
+        quantity=0.0005,
+        price=None,
+        params={},
+    )
+
+    assert prepared.allowed is False
+    assert prepared.quantity == 0.0
+    assert "amount below minimum" in prepared.reason
+
+
+def test_tick_size_of_one_rounds_to_whole_units():
+    assert ExecutionGuard._round_down(3.9, 1.0) == 3.0
+
+
+@pytest.mark.asyncio
 async def test_order_manager_blocks_small_notional(tmp_path):
     client = FakeExchangeClient()
     audit = AuditStore(str(tmp_path / "audit.db"))

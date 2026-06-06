@@ -49,6 +49,18 @@ class ExecutionGuard:
         reference_price = prepared_price or await self._reference_price(client, symbol)
         notional = prepared_quantity * reference_price
 
+        minimum_amount = self._market_min_amount(market)
+        if prepared_quantity <= 0 or prepared_quantity < minimum_amount:
+            return PreparedOrder(
+                False,
+                f"amount below minimum: {prepared_quantity:.8f} < "
+                f"{minimum_amount:.8f}",
+                quantity=prepared_quantity,
+                price=prepared_price,
+                reference_price=reference_price,
+                notional=notional,
+            )
+
         min_notional = self._market_min_notional(market)
         required_notional = max(self.min_notional, min_notional)
         if notional < required_notional:
@@ -87,9 +99,7 @@ class ExecutionGuard:
     @staticmethod
     def _amount_to_precision(market: dict, quantity: float) -> float:
         precision = market.get("precision", {}).get("amount")
-        minimum = market.get("limits", {}).get("amount", {}).get("min") or 0
-        normalized = ExecutionGuard._round_down(quantity, precision)
-        return max(normalized, float(minimum))
+        return ExecutionGuard._round_down(quantity, precision)
 
     @staticmethod
     def _price_to_precision(market: dict, price: float | None) -> float | None:
@@ -99,10 +109,19 @@ class ExecutionGuard:
         return ExecutionGuard._round_down(price, precision)
 
     @staticmethod
-    def _round_down(value: float, precision: int | None) -> float:
+    def _round_down(value: float, precision: int | float | None) -> float:
         if precision is None:
             return float(value)
-        quant = Decimal("1").scaleb(-int(precision))
+        decimal_precision = Decimal(str(precision))
+        if decimal_precision <= 0:
+            return float(value)
+        if isinstance(precision, float):
+            value_decimal = Decimal(str(value))
+            steps = (value_decimal / decimal_precision).to_integral_value(
+                rounding=ROUND_DOWN
+            )
+            return float(steps * decimal_precision)
+        quant = Decimal("1").scaleb(-int(decimal_precision))
         return float(Decimal(str(value)).quantize(quant, rounding=ROUND_DOWN))
 
     @staticmethod
@@ -110,6 +129,12 @@ class ExecutionGuard:
         limits = market.get("limits", {})
         cost = limits.get("cost", {}) if isinstance(limits, dict) else {}
         return float(cost.get("min") or 0)
+
+    @staticmethod
+    def _market_min_amount(market: dict) -> float:
+        limits = market.get("limits", {})
+        amount = limits.get("amount", {}) if isinstance(limits, dict) else {}
+        return float(amount.get("min") or 0)
 
     @staticmethod
     async def _reference_price(client: Any, symbol: str) -> float:

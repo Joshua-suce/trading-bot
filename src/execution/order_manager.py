@@ -19,11 +19,14 @@ class OrderManager:
         self.client = client
         self.audit_store = audit_store
         self.guard = guard or ExecutionGuard()
+        self._last_failure_reasons: dict[str, str] = {}
 
     async def market_order(
         self, symbol: str, side: str, quantity: float, reduce_only: bool = False
     ) -> Optional[dict]:
         if quantity <= 0:
+            reason = f"invalid quantity: {quantity}"
+            self._last_failure_reasons[symbol] = reason
             logger.warning(f"Invalid quantity for {symbol}: {quantity}")
             return None
         return await self._create_order_with_retries(
@@ -157,6 +160,7 @@ class OrderManager:
         params: dict | None = None,
         attempts: int = 3,
     ) -> Optional[dict]:
+        self._last_failure_reasons.pop(symbol, None)
         params = params or {}
         prepared = await self.guard.prepare(
             self.client,
@@ -168,6 +172,7 @@ class OrderManager:
             params=params,
         )
         if not prepared.allowed:
+            self._last_failure_reasons[symbol] = prepared.reason
             logger.warning(f"Order blocked for {symbol}: {prepared.reason}")
             self._audit(
                 "order_blocked",
@@ -224,6 +229,9 @@ class OrderManager:
                     await asyncio.sleep(0.5 * attempt)
 
         logger.error(f"{order_type} {side} {symbol} failed permanently: {last_error}")
+        self._last_failure_reasons[symbol] = (
+            f"{order_type} {side} order failed: {last_error}"
+        )
         self._audit(
             "order_failed",
             f"{order_type} {side} order failed",
@@ -239,6 +247,9 @@ class OrderManager:
             },
         )
         return None
+
+    def failure_reason(self, symbol: str, fallback: str) -> str:
+        return self._last_failure_reasons.get(symbol, fallback)
 
     def _audit(
         self,

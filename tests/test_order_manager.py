@@ -100,6 +100,7 @@ async def test_market_order_audits_permanent_failure(tmp_path, monkeypatch):
     assert event["event_type"] == "order_failed"
     assert event["severity"] == "error"
     assert "temporary exchange failure" in event["payload"]["error"]
+    assert "temporary exchange failure" in manager.failure_reason("BTCUSDT", "fallback")
 
 
 @pytest.mark.asyncio
