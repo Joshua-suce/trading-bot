@@ -1,4 +1,5 @@
 import json
+import threading
 from datetime import datetime, timezone
 
 from src.audit import AuditStore
@@ -27,6 +28,27 @@ def test_health_check_reports_degraded_when_trading_paused(tmp_path):
 
     assert report.status == "degraded"
     assert report.trading_allowed is False
+
+
+def test_concurrent_health_checks_share_audit_database(tmp_path):
+    db_path = str(tmp_path / "audit.db")
+    statuses = []
+    errors = []
+
+    def check_health():
+        try:
+            statuses.append(HealthChecker(AuditStore(db_path)).check().status)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=check_health) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert statuses == ["ok", "ok"]
 
 
 def test_dashboard_frames_read_audit_store(tmp_path):
