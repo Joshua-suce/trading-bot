@@ -33,9 +33,4 @@ jobs:
           BINANCE_API_KEY: "ci-key"
           BINANCE_API_SECRET: "ci-secret"
           AUDIT_DB_PATH: "data/audit/ci_audit.db"
-        run: python scripts/smoke_check.py --fast
-
-      - name: Offline backtest smoke
-        env:
-          BINANCE_TESTNET: "true"
-        run: python -m src.main --mode backtest --offline --limit 120
+        run: python scripts/smoke_check.py

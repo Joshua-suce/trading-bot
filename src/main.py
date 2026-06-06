@@ -17,9 +17,8 @@ def parse_args(argv: Optional[list[str]] = None):
     parser.add_argument(
         "--mode",
         type=str,
-        default="backtest",
+        default="paper",
         choices=[
-            "backtest",
             "paper",
             "live",
             "train",
@@ -45,18 +44,6 @@ def parse_args(argv: Optional[list[str]] = None):
         default=500,
         help="Number of candles to fetch (default: 500)",
     )
-    parser.add_argument(
-        "--initial-capital",
-        type=float,
-        default=10_000,
-        help="Initial capital for backtest",
-    )
-    parser.add_argument("--leverage", type=int, default=1, help="Leverage (default: 1)")
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="Run backtest using generated local data instead of the exchange",
-    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--admin-action",
@@ -68,7 +55,6 @@ def parse_args(argv: Optional[list[str]] = None):
             "resume",
             "emergency-stop",
             "clear-emergency",
-            "approve-strategy",
             "strategy-status",
             "revoke-strategy",
         ],
@@ -93,56 +79,6 @@ def parse_args(argv: Optional[list[str]] = None):
         help="Path for soak report JSON",
     )
     return parser.parse_args(argv)
-
-
-# Fetch OHLCV, compute indicators, run the backtest engine, log results
-async def run_backtest(
-    symbol: str,
-    timeframe: str,
-    limit: int,
-    capital: float,
-    leverage: int = 1,
-    offline: bool = False,
-):
-    from src.backtest.engine import BacktestEngine
-    from src.signals.ta_signal import TechnicalSignal
-
-    logger.info(f"Running backtest: {symbol} {timeframe} capital={capital}")
-
-    # Either generate mock data or fetch from exchange
-    if offline:
-        from src.utils.helpers import generate_mock_ohlcv
-
-        logger.info("Running offline mock backtest without exchange connectivity")
-        df = generate_mock_ohlcv(symbol, timeframe, limit=limit)
-    else:
-        from src.exchange.client import ExchangeClient
-
-        async with ExchangeClient() as client:
-            df = await client.fetch_ohlcv(symbol, timeframe, limit=limit)
-    logger.info(f"Fetched {len(df)} candles")
-
-    # Wrap the TA signal generator into the callback signature expected by the engine
-    ta = TechnicalSignal()
-
-    def signal_fn(data):
-        try:
-            result = ta.generate(data)
-            return {"direction": result.direction, "confidence": result.strength}
-        except Exception:
-            return {"direction": 0, "confidence": 0.0}
-
-    engine = BacktestEngine(initial_capital=capital, leverage=leverage)
-    result = engine.run(df, signal_fn)
-
-    logger.info("=" * 50)
-    logger.info("BACKTEST RESULTS")
-    logger.info("=" * 50)
-    for key, val in result.metrics.to_dict().items():
-        logger.info(f"  {key}: {val}")
-    logger.info("=" * 50)
-
-    return result
 
 
 # Fetch OHLCV and train ML models (XGBoost + optional LSTM ensemble)
@@ -227,43 +163,6 @@ def run_admin(action: str, reason: str = ""):
         )
 
 
-async def run_strategy_approval(
-    symbol: str,
-    timeframe: str,
-    limit: int,
-    capital: float,
-    leverage: int,
-    offline: bool,
-    reason: str,
-):
-    from src.audit import AuditStore
-    from src.governance import StrategyApprovalStore
-
-    result = await run_backtest(symbol, timeframe, limit, capital, leverage, offline)
-    approval = StrategyApprovalStore().write(
-        metrics=result.metrics,
-        symbol=symbol,
-        timeframe=timeframe,
-        approved_by="operator",
-        reason=reason or "strategy approval from backtest",
-    )
-    AuditStore().safe_record_event(
-        "strategy_approval_created",
-        "Strategy approval created from backtest",
-        payload={
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "approved_at": approval.approved_at,
-            "metrics": approval.metrics,
-        },
-    )
-    logger.warning(
-        f"Strategy approved for {symbol} {timeframe}; "
-        f"approval_path={StrategyApprovalStore().path}"
-    )
-    return approval
-
-
 def run_health() -> int:
     from src.monitoring.health import HealthChecker
 
@@ -293,43 +192,19 @@ def main():
 
     logger.info(f"Starting AI Trading Bot - Mode: {args.mode}")
     logger.info(f"Symbol: {args.symbol}, Timeframe: {args.timeframe}")
-    preflight = run_preflight(args.mode, offline=args.offline)
+    preflight = run_preflight(args.mode)
     logger.info(f"Preflight passed: environment={preflight.environment}")
 
     if args.mode == "soak":
         raise SystemExit(asyncio.run(run_soak(args.soak_iterations, args.soak_report)))
-    if args.mode == "backtest":
-        asyncio.run(
-            run_backtest(
-                args.symbol,
-                args.timeframe,
-                args.limit,
-                args.initial_capital,
-                args.leverage,
-                args.offline,
-            )
-        )
-    elif args.mode == "train":
+    if args.mode == "train":
         asyncio.run(run_train(args.symbol, args.timeframe, args.limit))
     elif args.mode in ("paper", "live"):
         asyncio.run(run_live(args.mode))
     elif args.mode == "dashboard":
         run_dashboard()
     elif args.mode == "admin":
-        if args.admin_action == "approve-strategy":
-            asyncio.run(
-                run_strategy_approval(
-                    args.symbol,
-                    args.timeframe,
-                    args.limit,
-                    args.initial_capital,
-                    args.leverage,
-                    args.offline,
-                    args.reason,
-                )
-            )
-        else:
-            run_admin(args.admin_action, args.reason)
+        run_admin(args.admin_action, args.reason)
     elif args.mode == "health":
         raise SystemExit(run_health())
     else:

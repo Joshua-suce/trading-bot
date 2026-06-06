@@ -53,7 +53,7 @@ python -m pytest
 python -m pytest --cov=src --cov-report=term-missing tests/
 
 # Run specific test
-python -m pytest tests/test_backtest.py -v
+python -m pytest tests/test_live_loop.py -v
 
 # Run tests matching pattern
 python -m pytest -k "indicator"
@@ -63,9 +63,9 @@ All new code must have tests. Test files go in `tests/` with `test_` prefix.
 
 ## Project Conventions
 
-- **Imports**: Use absolute imports (`from src.backtest.engine import BacktestEngine`)
+- **Imports**: Use absolute imports (`from src.live.loop import LiveTradingLoop`)
 - **Typing**: All function signatures must have type annotations
-- **Async**: Exchange calls must be async; CPU-bound work (indicators, backtesting) is sync
+- **Async**: Exchange calls must be async; CPU-bound indicator/model work is sync
 - **DataFrames**: Always pass DataFrames by copy; never mutate in place
 - **Exceptions**: Handle exceptions at module boundaries; log with `logger` instead of print
 - **Config**: New configuration values go in `src/config.py` with pydantic validation

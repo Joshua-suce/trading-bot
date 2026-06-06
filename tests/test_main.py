@@ -1,13 +1,14 @@
+import pytest
+
 from src.main import parse_args
 
 
 def test_parse_args_defaults():
     args = parse_args([])
-    assert args.mode == "backtest"
+    assert args.mode == "paper"
     assert args.symbol == "BTCUSDT"
     assert args.timeframe == "1h"
     assert args.limit == 500
-    assert args.initial_capital == 10_000
 
 
 def test_parse_args_custom_options():
@@ -21,21 +22,26 @@ def test_parse_args_custom_options():
             "4h",
             "--limit",
             "200",
-            "--initial-capital",
-            "15000",
         ]
     )
     assert args.mode == "train"
     assert args.symbol == "ETHUSDT"
     assert args.timeframe == "4h"
     assert args.limit == 200
-    assert args.initial_capital == 15000.0
 
 
-def test_parse_args_offline_flag():
-    args = parse_args(["--mode", "backtest", "--offline"])
-    assert args.mode == "backtest"
-    assert args.offline is True
+def test_parse_args_rejects_removed_backtest_mode():
+    with pytest.raises(SystemExit):
+        parse_args(["--mode", "backtest"])
+
+
+@pytest.mark.parametrize(
+    "removed_flag", ["--offline", "--initial-capital", "--leverage"]
+)
+def test_parse_args_rejects_removed_backtest_flags(removed_flag):
+    args = [removed_flag] if removed_flag == "--offline" else [removed_flag, "1"]
+    with pytest.raises(SystemExit):
+        parse_args(args)
 
 
 def test_parse_args_admin_controls():

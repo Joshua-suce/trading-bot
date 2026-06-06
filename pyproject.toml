@@ -39,7 +39,7 @@ authors = [
 ]
 readme-content-type = "text/markdown"
 license = {text = "MIT"}
-keywords = ["trading", "binance", "backtest", "machine-learning", "quant"]
+keywords = ["trading", "binance", "paper-trading", "machine-learning", "quant"]
 
 [project.optional-dependencies]
 dev = [

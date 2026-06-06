@@ -11,9 +11,7 @@ class PreflightResult:
     credentials_required: bool
 
 
-def run_preflight(
-    mode: str, *, offline: bool = False, cfg: Settings = settings
-) -> PreflightResult:
+def run_preflight(mode: str, *, cfg: Settings = settings) -> PreflightResult:
     environment = "demo" if cfg.binance_testnet else "mainnet"
 
     if mode in {"paper", "live"} and not cfg.has_exchange_credentials:
@@ -42,5 +40,5 @@ def run_preflight(
     return PreflightResult(
         mode=mode,
         environment=environment,
-        credentials_required=mode in {"paper", "live"} and not offline,
+        credentials_required=mode in {"paper", "live"},
     )

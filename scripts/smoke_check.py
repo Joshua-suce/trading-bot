@@ -1,17 +1,22 @@
 import argparse
+import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
 class Check:
     name: str
     command: list[str]
+    env: dict[str, str] | None = None
 
 
-def _checks(include_slow: bool) -> list[Check]:
+def _checks(audit_path: str, soak_report_path: str) -> list[Check]:
     python = sys.executable
+    isolated_env = {"AUDIT_DB_PATH": audit_path}
     checks = [
         Check("black", [python, "-m", "black", "--check", "src", "tests", "scripts"]),
         Check(
@@ -33,7 +38,11 @@ def _checks(include_slow: bool) -> list[Check]:
                 "--cov-fail-under=75",
             ],
         ),
-        Check("health", [python, "-m", "src.main", "--mode", "health"]),
+        Check(
+            "health",
+            [python, "-m", "src.main", "--mode", "health"],
+            env=isolated_env,
+        ),
         Check(
             "offline-soak",
             [
@@ -45,32 +54,19 @@ def _checks(include_slow: bool) -> list[Check]:
                 "--soak-iterations",
                 "2",
                 "--soak-report",
-                "data/reports/smoke_soak_report.json",
+                soak_report_path,
             ],
+            env=isolated_env,
         ),
     ]
-    if include_slow:
-        checks.append(
-            Check(
-                "offline-backtest",
-                [
-                    python,
-                    "-m",
-                    "src.main",
-                    "--mode",
-                    "backtest",
-                    "--offline",
-                    "--limit",
-                    "120",
-                ],
-            )
-        )
     return checks
 
 
 def run_check(check: Check) -> int:
     print(f"\n==> {check.name}: {' '.join(check.command)}", flush=True)
-    result = subprocess.run(check.command, check=False)
+    env = os.environ.copy()
+    env.update(check.env or {})
+    result = subprocess.run(check.command, check=False, env=env)
     if result.returncode:
         print(f"FAILED: {check.name} exited {result.returncode}", flush=True)
     return result.returncode
@@ -78,17 +74,18 @@ def run_check(check: Check) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run production readiness checks")
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help="Skip slower checks such as offline backtest",
-    )
-    args = parser.parse_args(argv)
+    parser.parse_args(argv)
 
-    for check in _checks(include_slow=not args.fast):
-        code = run_check(check)
-        if code:
-            return code
+    with tempfile.TemporaryDirectory(prefix="trading-bot-smoke-") as temp_dir:
+        temp_path = Path(temp_dir)
+        checks = _checks(
+            str(temp_path / "audit.db"),
+            str(temp_path / "soak_report.json"),
+        )
+        for check in checks:
+            code = run_check(check)
+            if code:
+                return code
     print("\nAll smoke checks passed.", flush=True)
     return 0
 

@@ -10,13 +10,7 @@ Run the full local gate before every deployment:
 python scripts/smoke_check.py
 ```
 
-The smoke gate fails if total test coverage drops below 70%.
-
-Fast local gate:
-
-```bash
-python scripts/smoke_check.py --fast
-```
+The smoke gate fails if total test coverage drops below 75%.
 
 Run the secret scanner before sharing logs, building images, or opening a pull request:
 
@@ -34,7 +28,6 @@ Windows PowerShell:
 
 ```powershell
 .\scripts\smoke_check.ps1
-.\scripts\smoke_check.ps1 -Fast
 ```
 
 ## Required Controls

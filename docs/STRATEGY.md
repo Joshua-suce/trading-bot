@@ -151,4 +151,4 @@ A position is exited when any condition is met:
 1. **Stop loss hit** — Price reaches SL level
 2. **Take profit hit** — Price reaches TP level
 3. **Signal reversal** — Opposite signal with confidence > 0.4
-4. **End of data** (backtest) — Position closed at last price
+4. **Controlled shutdown** - Open paper positions are closed and audited
