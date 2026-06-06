@@ -46,24 +46,33 @@ class FakeAlerter:
 
 
 class FakeOrderManager:
-    def __init__(self):
+    def __init__(self, *, null_exit_price=False):
         self.counter = 0
+        self.null_exit_price = null_exit_price
+        self.protective_quantities = []
 
     async def market_order(self, symbol, side, quantity, reduce_only=False):
         self.counter += 1
         return {
             "id": f"market-{self.counter}",
             "filled": quantity,
-            "average": 101.0 if reduce_only else 100.0,
+            "average": (
+                None
+                if reduce_only and self.null_exit_price
+                else (101.0 if reduce_only else 100.0)
+            ),
+            "price": None,
         }
 
     async def stop_loss_order(self, symbol, side, quantity, stop_price, price=None):
+        self.protective_quantities.append(quantity)
         return {"id": "stop-1"}
 
     async def take_profit_order(self, symbol, side, quantity, price):
+        self.protective_quantities.append(quantity)
         return {"id": "target-1"}
 
-    async def cancel_order(self, symbol, order_id):
+    async def cancel_order(self, symbol, order_id, conditional=False):
         return None
 
     async def cancel_all_orders(self, symbol):
@@ -74,8 +83,11 @@ class FakeClient:
     async def fetch_positions(self):
         return []
 
-    async def fetch_open_orders(self, symbol):
+    async def fetch_open_orders(self, symbol, conditional=False):
         return []
+
+    async def fetch_ticker(self, symbol):
+        return {"last": 102.0}
 
 
 def build_manager(alerter, tmp_path, *, with_account=True):
@@ -100,6 +112,34 @@ def build_manager(alerter, tmp_path, *, with_account=True):
         mode="trade",
         audit_store=AuditStore(str(tmp_path / "audit.db")),
     )
+
+
+@pytest.mark.asyncio
+async def test_entry_records_actual_fill_and_protects_filled_quantity(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    async def partially_filled_order(symbol, side, quantity, reduce_only=False):
+        return {"id": "market-fill", "filled": 0.75, "average": 100.0}
+
+    manager.orders.market_order = partially_filled_order
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert manager.open_trades["BTCUSDT"].quantity == 0.75
+    assert manager.orders.protective_quantities == [0.75, 0.75]
+    assert alerter.opened[0]["quantity"] == 0.75
+
+
+@pytest.mark.asyncio
+async def test_exit_uses_ticker_when_market_fill_has_null_prices(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+    manager.orders.null_exit_price = True
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    await manager.exit_position("BTCUSDT", reason="emergency")
+
+    assert alerter.completed[0]["exit_price"] == 102.0
 
 
 @pytest.mark.asyncio

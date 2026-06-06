@@ -93,33 +93,40 @@ class OrderManager:
         )
 
     async def cancel_all_orders(self, symbol: str):
-        try:
-            await self.client.rest.cancel_all_orders(symbol)
-            logger.info(f"Cancelled all orders for {symbol}")
-            self._audit(
-                "orders_cancelled",
-                f"Cancelled all open orders for {symbol}",
-                symbol=symbol,
-            )
-        except Exception as e:
-            logger.error(f"Cancel all orders failed: {e}")
-            self._audit(
-                "order_cancel_failed",
-                "Cancel all orders failed",
-                severity="error",
-                symbol=symbol,
-                payload={"error": str(e)},
-            )
+        for conditional in (False, True):
+            try:
+                await self.client.cancel_all_orders(symbol, conditional=conditional)
+                order_class = "conditional" if conditional else "standard"
+                logger.info(f"Cancelled all {order_class} orders for {symbol}")
+                self._audit(
+                    "orders_cancelled",
+                    f"Cancelled all {order_class} open orders for {symbol}",
+                    symbol=symbol,
+                    payload={"conditional": conditional},
+                )
+            except Exception as e:
+                order_class = "conditional" if conditional else "standard"
+                logger.error(f"Cancel all {order_class} orders failed: {e}")
+                self._audit(
+                    "order_cancel_failed",
+                    f"Cancel all {order_class} orders failed",
+                    severity="error",
+                    symbol=symbol,
+                    payload={"conditional": conditional, "error": str(e)},
+                )
 
-    async def cancel_order(self, symbol: str, order_id: str):
+    async def cancel_order(
+        self, symbol: str, order_id: str, *, conditional: bool = False
+    ):
         try:
-            await self.client.cancel_order(order_id, symbol)
+            params = {"trigger": True} if conditional else {}
+            await self.client.cancel_order(order_id, symbol, params=params)
             logger.info(f"Cancelled order {order_id} for {symbol}")
             self._audit(
                 "order_cancelled",
                 f"Cancelled order {order_id}",
                 symbol=symbol,
-                payload={"order_id": order_id},
+                payload={"order_id": order_id, "conditional": conditional},
             )
         except Exception as e:
             logger.error(f"Cancel order failed: {e}")
@@ -128,7 +135,11 @@ class OrderManager:
                 "Cancel order failed",
                 severity="error",
                 symbol=symbol,
-                payload={"order_id": order_id, "error": str(e)},
+                payload={
+                    "order_id": order_id,
+                    "conditional": conditional,
+                    "error": str(e),
+                },
             )
 
     @staticmethod

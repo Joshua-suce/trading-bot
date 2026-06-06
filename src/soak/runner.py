@@ -119,7 +119,9 @@ class SoakOrderManager:
     async def cancel_all_orders(self, symbol: str) -> None:
         return None
 
-    async def cancel_order(self, symbol: str, order_id: str) -> None:
+    async def cancel_order(
+        self, symbol: str, order_id: str, conditional: bool = False
+    ) -> None:
         return None
 
 

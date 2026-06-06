@@ -57,10 +57,15 @@ class FlakyClient:
         self.created_orders.append(order)
         return order
 
-    async def cancel_order(self, order_id, symbol):
+    async def cancel_order(self, order_id, symbol, params=None):
         if self.cancel_failure:
             raise RuntimeError("cancel rejected")
         self.cancelled_orders.append((symbol, order_id))
+
+    async def cancel_all_orders(self, symbol, conditional=False):
+        if self.rest.fail_cancel_all:
+            raise RuntimeError("cancel all rejected")
+        self.rest.cancelled_symbols.append((symbol, conditional))
 
 
 @pytest.mark.asyncio
@@ -125,12 +130,15 @@ async def test_cancel_paths_audit_success_and_failure(tmp_path):
     await manager.cancel_all_orders("BTCUSDT")
     await manager.cancel_order("BTCUSDT", "order-1")
 
-    events = audit.load_recent_events(2)
+    events = audit.load_recent_events(3)
     assert {event["event_type"] for event in events} == {
         "orders_cancelled",
         "order_cancelled",
     }
-    assert client.rest.cancelled_symbols == ["BTCUSDT"]
+    assert client.rest.cancelled_symbols == [
+        ("BTCUSDT", False),
+        ("BTCUSDT", True),
+    ]
     assert client.cancelled_orders == [("BTCUSDT", "order-1")]
 
     failing_client = FlakyClient(cancel_failure=True, fail_cancel_all=True)
@@ -140,8 +148,9 @@ async def test_cancel_paths_audit_success_and_failure(tmp_path):
     await failing_manager.cancel_all_orders("ETHUSDT")
     await failing_manager.cancel_order("ETHUSDT", "order-2")
 
-    failed_events = audit.load_recent_events(2)
+    failed_events = audit.load_recent_events(3)
     assert [event["event_type"] for event in failed_events] == [
+        "order_cancel_failed",
         "order_cancel_failed",
         "order_cancel_failed",
     ]

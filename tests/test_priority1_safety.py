@@ -50,20 +50,36 @@ class FakeOrderManager:
     async def cancel_all_orders(self, symbol):
         self.cancelled_all.append(symbol)
 
-    async def cancel_order(self, symbol, order_id):
+    async def cancel_order(self, symbol, order_id, conditional=False):
         return None
 
 
 class FakeClient:
-    def __init__(self, positions=None, open_orders=None):
+    def __init__(
+        self,
+        positions=None,
+        open_orders=None,
+        conditional_orders=None,
+        fetched_orders=None,
+    ):
         self.positions = positions or []
         self.open_orders = open_orders or {}
+        self.conditional_orders = conditional_orders or {}
+        self.fetched_orders = fetched_orders or {}
 
     async def fetch_positions(self):
         return self.positions
 
-    async def fetch_open_orders(self, symbol):
+    async def fetch_open_orders(self, symbol, conditional=False):
+        if conditional:
+            return self.conditional_orders.get(symbol, [])
         return self.open_orders.get(symbol, [])
+
+    async def fetch_order(self, order_id, symbol, conditional=False):
+        return self.fetched_orders[(order_id, conditional)]
+
+    async def fetch_ticker(self, symbol):
+        return {"last": 100.0}
 
 
 class FakeAlerter:
@@ -211,6 +227,7 @@ async def test_reconciliation_blocks_missing_protective_order(tmp_path):
     client = FakeClient(
         positions=[{"symbol": "BTCUSDT", "contracts": 1.0}],
         open_orders={"BTCUSDT": [{"id": "tp-2"}]},
+        conditional_orders={"BTCUSDT": []},
     )
     manager = build_manager(tmp_path, FakeOrderManager(), client=client)
     manager.audit_store = audit
@@ -222,3 +239,75 @@ async def test_reconciliation_blocks_missing_protective_order(tmp_path):
     allowed, reason = manager.audit_store.trading_allowed()
     assert allowed is False
     assert "emergency stop" in reason
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_accepts_standard_tp_and_conditional_stop(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(),
+    )
+    audit.record_open_trade(
+        trade,
+        mode="trade",
+        correlation_id="corr-protected",
+        stop_loss=95.0,
+        take_profit=110.0,
+        stop_order_id="sl-algo",
+        take_profit_order_id="tp-standard",
+    )
+    client = FakeClient(
+        positions=[{"symbol": "BTCUSDT", "contracts": 1.0}],
+        open_orders={"BTCUSDT": [{"id": "tp-standard"}]},
+        conditional_orders={"BTCUSDT": [{"id": "sl-algo"}]},
+    )
+    manager = build_manager(tmp_path, FakeOrderManager(), client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is True
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_finalizes_take_profit_closed_position(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(),
+    )
+    audit.record_open_trade(
+        trade,
+        mode="trade",
+        correlation_id="corr-tp",
+        stop_loss=95.0,
+        take_profit=110.0,
+        stop_order_id="sl-algo",
+        take_profit_order_id="tp-standard",
+    )
+    client = FakeClient(
+        positions=[],
+        fetched_orders={
+            ("tp-standard", False): {
+                "id": "tp-standard",
+                "status": "closed",
+                "average": None,
+                "price": 110.0,
+            }
+        },
+    )
+    orders = FakeOrderManager()
+    manager = build_manager(tmp_path, orders, client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is True
+    assert manager.open_trades == {}
+    assert audit.load_open_trades("trade") == []
+    assert orders.market_orders == []

@@ -149,12 +149,25 @@ class ExchangeClient:
         )
 
     # Cancel a specific order by ID
-    async def cancel_order(self, id: str, symbol: str):
-        return await self.rest.cancel_order(id, symbol)
+    async def cancel_order(self, id: str, symbol: str, params: Optional[dict] = None):
+        return await self.rest.cancel_order(id, symbol, params or {})
+
+    async def cancel_all_orders(self, symbol: str, *, conditional: bool = False):
+        params = {"trigger": True} if conditional else {}
+        return await self.rest.cancel_all_orders(symbol, params=params)
 
     # List all open orders, optionally for one symbol
-    async def fetch_open_orders(self, symbol: Optional[str] = None) -> List[dict]:
-        return await self.rest.fetch_open_orders(symbol)
+    async def fetch_open_orders(
+        self, symbol: Optional[str] = None, *, conditional: bool = False
+    ) -> List[dict]:
+        params = {"trigger": True} if conditional else {}
+        return await self.rest.fetch_open_orders(symbol, params=params)
+
+    async def fetch_order(
+        self, order_id: str, symbol: str, *, conditional: bool = False
+    ) -> dict:
+        params = {"trigger": True} if conditional else {}
+        return await self.rest.fetch_order(order_id, symbol, params=params)
 
     # Fetch current ticker (24hr stats) for a symbol
     async def fetch_ticker(self, symbol: str) -> dict:
