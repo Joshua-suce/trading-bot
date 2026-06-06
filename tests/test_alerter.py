@@ -4,12 +4,16 @@ from src.monitoring.alerter import Alerter
 
 
 class FakeResponse:
-    def __init__(self, *, should_fail=False):
+    def __init__(self, *, should_fail=False, body=None):
         self.should_fail = should_fail
+        self.body = body or {"ok": True, "result": {}}
 
     def raise_for_status(self):
         if self.should_fail:
             raise RuntimeError("HTTP rejected secret-token")
+
+    def json(self):
+        return self.body
 
 
 class FakeAsyncClient:
@@ -25,10 +29,13 @@ class FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def post(self, url, json):
+    async def post(self, url, json, timeout=None):
         self.posts.append((url, json, self.timeout))
         should_fail = len(self.posts) <= self.failures_before_success
         return FakeResponse(should_fail=should_fail)
+
+    async def aclose(self):
+        return None
 
 
 class CapturingAlerter(Alerter):
@@ -56,7 +63,12 @@ async def test_send_posts_to_enabled_channels(monkeypatch):
 
     assert len(FakeAsyncClient.posts) == 2
     assert FakeAsyncClient.posts[0][0].endswith("/botsecret-token/sendMessage")
-    assert FakeAsyncClient.posts[0][1] == {"chat_id": "chat-1", "text": "bot started"}
+    assert FakeAsyncClient.posts[0][1] == {
+        "chat_id": "chat-1",
+        "text": "bot started",
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     assert FakeAsyncClient.posts[1][1] == {"content": "```\nbot started\n```"}
 
 
@@ -109,3 +121,78 @@ async def test_alert_helpers_format_operational_notifications():
     ]
     assert "Trade Placed" in alerter.messages[1][1]
     assert "PnL: -1.50" in alerter.messages[4][1]
+
+
+@pytest.mark.asyncio
+async def test_started_alerter_queues_and_flushes_delivery(monkeypatch):
+    delivered = []
+    alerter = Alerter(discord_webhook="https://discord.example/webhook")
+
+    async def capture(message):
+        delivered.append(message)
+        return True
+
+    monkeypatch.setattr(alerter, "_deliver", capture)
+
+    await alerter.start()
+    assert await alerter.send("queued message")
+    await alerter.stop()
+
+    assert delivered == ["queued message"]
+    assert alerter.pending_messages == 0
+
+
+@pytest.mark.asyncio
+async def test_telegram_commands_require_authorized_chat_and_user():
+    responses = []
+
+    async def handler(command, arguments, user_id, update_id):
+        responses.append((command, arguments, user_id, update_id))
+        return "ack"
+
+    alerter = CapturingAlerter()
+    alerter.telegram_chat_id = "chat-1"
+    alerter.telegram_allowed_user_ids = {"42"}
+    alerter._command_handler = handler
+
+    unauthorized_chat = {
+        "message": {
+            "chat": {"id": "chat-2"},
+            "from": {"id": "42"},
+            "text": "/status",
+        }
+    }
+    unauthorized_user = {
+        "message": {
+            "chat": {"id": "chat-1"},
+            "from": {"id": "99"},
+            "text": "/status",
+        }
+    }
+    authorized = {
+        "update_id": 123,
+        "message": {
+            "chat": {"id": "chat-1"},
+            "from": {"id": "42"},
+            "text": "/pause maintenance",
+        },
+    }
+
+    assert not await alerter.process_telegram_update(unauthorized_chat)
+    assert not await alerter.process_telegram_update(unauthorized_user)
+    assert await alerter.process_telegram_update(authorized)
+    assert responses == [("/pause", "maintenance", "42", 123)]
+    assert alerter.messages == [("telegram_command", "ack")]
+
+
+@pytest.mark.asyncio
+async def test_telegram_api_level_rejection_is_delivery_failure(monkeypatch):
+    class RejectingClient(FakeAsyncClient):
+        async def post(self, url, json, timeout=None):
+            return FakeResponse(body={"ok": False, "description": "chat not found"})
+
+    monkeypatch.setattr("src.monitoring.alerter.httpx.AsyncClient", RejectingClient)
+    alerter = Alerter(telegram_token="secret-token", telegram_chat_id="missing")
+
+    assert not await alerter.send("test")
+    assert alerter.delivery_failures == 1

@@ -71,3 +71,38 @@ python -m src.main --mode trade
 - Risk and exposure limits reviewed
 
 Run on Binance Demo Trading first. Demo uses the same production execution path.
+
+## Telegram Operations
+
+Create a bot with `@BotFather`, send the bot a direct message, and configure:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=bot_token
+TELEGRAM_CHAT_ID=chat_id
+TELEGRAM_COMMANDS_ENABLED=false
+TELEGRAM_ALLOWED_USER_IDS=
+```
+
+Test delivery without starting trading:
+
+```powershell
+python -m src.main --mode admin --admin-action test-alert
+```
+
+Set `TELEGRAM_COMMANDS_ENABLED=true` to enable long-poll commands. Direct chats are
+restricted by `TELEGRAM_CHAT_ID`. For group chats, also set
+`TELEGRAM_ALLOWED_USER_IDS` to a comma-separated operator allowlist.
+
+Supported commands:
+
+- `/status`
+- `/positions`
+- `/pause [reason]`
+- `/resume [reason]`
+- `/emergency_stop [reason]`
+- `/clear_emergency CONFIRM`
+- `/help`
+
+Commands change the same durable controls used by the CLI and are recorded in the
+audit database. Process only one bot instance with Telegram commands enabled;
+Telegram long polling does not support multiple consumers for the same bot token.

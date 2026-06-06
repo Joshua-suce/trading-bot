@@ -18,6 +18,15 @@ from src.signals.aggregator import FinalSignal, SignalAggregator
 class SoakAlerter:
     def __init__(self) -> None:
         self.messages: list[dict] = []
+        self.pending_messages = 0
+
+    async def start(self, command_handler=None):
+        return None
+
+    async def initializing_alert(self, mode: str, environment: str):
+        self.messages.append(
+            {"type": "initializing", "mode": mode, "environment": environment}
+        )
 
     async def startup_alert(self, mode: str, environment: str, symbols: list[str]):
         self.messages.append(
@@ -37,6 +46,19 @@ class SoakAlerter:
 
     async def error_alert(self, error: str):
         self.messages.append({"type": "error", "error": error})
+
+    async def shutdown_alert(self, mode: str, environment: str, reason: str):
+        self.messages.append(
+            {
+                "type": "shutdown",
+                "mode": mode,
+                "environment": environment,
+                "reason": reason,
+            }
+        )
+
+    async def stop(self):
+        return None
 
 
 class SoakClient:

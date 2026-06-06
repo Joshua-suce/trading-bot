@@ -1,8 +1,10 @@
 import json
 
+import pytest
+
 from src.audit import AuditStore
 from src.governance import StrategyApprovalStore
-from src.main import run_admin, run_health
+from src.main import run_admin, run_alert_test, run_health
 
 
 def test_run_health_uses_configured_audit_store(tmp_path, monkeypatch, capsys):
@@ -46,3 +48,42 @@ def test_run_admin_updates_controls_and_strategy_state(tmp_path, monkeypatch):
     assert approval.approved is False
     assert approval.reason == "approval expired"
     assert audit.load_recent_events(1)[0]["event_type"] == "strategy_approval_revoked"
+
+
+@pytest.mark.asyncio
+async def test_run_alert_test_reports_success(monkeypatch):
+    class FakeAlerter:
+        delivery_successes = 0
+        delivery_failures = 0
+        enabled = True
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def start(self):
+            pass
+
+        async def send(self, message, level):
+            assert "Alert Test" in message
+            assert level == "test"
+
+        async def stop(self):
+            self.delivery_successes = 1
+
+    monkeypatch.setattr("src.monitoring.alerter.Alerter", FakeAlerter)
+
+    await run_alert_test()
+
+
+@pytest.mark.asyncio
+async def test_run_alert_test_rejects_missing_channels(monkeypatch):
+    class DisabledAlerter:
+        enabled = False
+
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr("src.monitoring.alerter.Alerter", DisabledAlerter)
+
+    with pytest.raises(RuntimeError, match="No alert channel configured"):
+        await run_alert_test()

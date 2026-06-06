@@ -56,6 +56,7 @@ def parse_args(argv: Optional[list[str]] = None):
             "clear-emergency",
             "strategy-status",
             "revoke-strategy",
+            "test-alert",
         ],
         help="Admin control action when --mode admin is used",
     )
@@ -118,6 +119,9 @@ def run_admin(action: str, reason: str = ""):
 
     audit_store = AuditStore()
     approval_store = StrategyApprovalStore()
+    if action == "test-alert":
+        asyncio.run(run_alert_test())
+        return
     if action == "pause":
         audit_store.pause_trading(reason or "manual pause")
         logger.warning("Trading manually paused")
@@ -160,6 +164,34 @@ def run_admin(action: str, reason: str = ""):
             f"  {trade['symbol']} {trade['side']} qty={trade['quantity']} "
             f"entry={trade['entry_price']} status={trade['status']}"
         )
+
+
+async def run_alert_test() -> None:
+    from src.config import settings
+    from src.monitoring.alerter import Alerter
+
+    alerter = Alerter(
+        telegram_token=settings.telegram_bot_token,
+        telegram_chat_id=settings.telegram_chat_id,
+        discord_webhook=settings.discord_webhook_url,
+        queue_size=settings.telegram_alert_queue_size,
+        delivery_timeout=settings.telegram_delivery_timeout_seconds,
+    )
+    if not alerter.enabled:
+        raise RuntimeError(
+            "No alert channel configured. Set Telegram credentials or Discord webhook."
+        )
+    await alerter.start()
+    await alerter.send(
+        "<b>Trading Bot Alert Test</b>\n"
+        f"Environment: {settings.binance_environment}\n"
+        "Status: delivery channel is operational",
+        "test",
+    )
+    await alerter.stop()
+    if not alerter.delivery_successes or alerter.delivery_failures:
+        raise RuntimeError("Alert test failed; inspect redacted logs for details")
+    logger.info("Alert test delivered successfully")
 
 
 def run_health() -> int:

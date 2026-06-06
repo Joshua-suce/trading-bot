@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -35,8 +36,20 @@ class AuditStore:
             conn.close()
 
     def _init_schema(self) -> None:
+        attempts = 5
+        for attempt in range(1, attempts + 1):
+            try:
+                self._init_schema_once()
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == attempts:
+                    raise
+                time.sleep(0.1 * attempt)
+
+    def _init_schema_once(self) -> None:
         with self._connection() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id TEXT PRIMARY KEY,
@@ -91,7 +104,19 @@ class AuditStore:
             for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
         if column not in columns:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            except sqlite3.OperationalError as exc:
+                # A second process may complete the same idempotent migration
+                # between table inspection and ALTER TABLE.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+                refreshed = {
+                    row["name"]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if column not in refreshed:
+                    raise
 
     @staticmethod
     def _now() -> str:

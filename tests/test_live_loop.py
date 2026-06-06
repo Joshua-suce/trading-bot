@@ -9,10 +9,27 @@ from src.live.loop import LiveTradingLoop
 
 
 class NoopAlerter:
+    pending_messages = 0
+
+    async def start(self, command_handler=None):
+        return None
+
+    async def initializing_alert(self, mode, environment):
+        return None
+
     async def startup_alert(self, mode, environment, symbols):
         return None
 
     async def trade_failed_alert(self, mode, symbol, reason):
+        return None
+
+    async def error_alert(self, error):
+        return None
+
+    async def shutdown_alert(self, mode, environment, reason):
+        return None
+
+    async def stop(self):
         return None
 
 
@@ -59,7 +76,7 @@ async def test_trade_start_stops_after_initial_account_refresh_failure(monkeypat
         reached.append("scan")
         raise asyncio.CancelledError
 
-    async def stop():
+    async def stop(reason):
         reached.append("stop")
 
     monkeypatch.setattr(live_loop_module, "get_account_info", fail_account)
@@ -74,6 +91,76 @@ async def test_trade_start_stops_after_initial_account_refresh_failure(monkeypat
     assert bot.portfolio.account is None
     assert bot._account_refresh_failures == 1
     assert "secret" not in bot._describe_exception(RuntimeError("signature=secret"))
+
+
+@pytest.mark.asyncio
+async def test_telegram_commands_update_durable_trading_controls(tmp_path):
+    from src.audit import AuditStore
+
+    bot = LiveTradingLoop()
+    bot.audit_store = AuditStore(tmp_path / "telegram-controls.db")
+    bot.alerter = NoopAlerter()
+
+    paused = await bot._handle_telegram_command("/pause", "maintenance", "42")
+    allowed, reason = bot.audit_store.trading_allowed()
+    assert not allowed
+    assert "pause" in reason
+    assert "Trading Paused" in paused
+
+    resumed = await bot._handle_telegram_command("/resume", "", "42")
+    assert bot.audit_store.trading_allowed() == (True, "ok")
+    assert "Trading Resumed" in resumed
+
+    await bot._handle_telegram_command("/emergency_stop", "incident", "42")
+    blocked, reason = bot.audit_store.trading_allowed()
+    assert not blocked
+    assert "emergency" in reason
+
+    confirmation = await bot._handle_telegram_command("/clear_emergency", "", "42")
+    assert "Confirmation Required" in confirmation
+    assert not bot.audit_store.trading_allowed()[0]
+
+    cleared = await bot._handle_telegram_command("/clear_emergency", "CONFIRM", "42")
+    assert bot.audit_store.trading_allowed() == (True, "ok")
+    assert "Emergency Stop Cleared" in cleared
+
+
+@pytest.mark.asyncio
+async def test_telegram_status_and_help_commands(tmp_path):
+    from src.audit import AuditStore
+
+    bot = LiveTradingLoop()
+    bot.audit_store = AuditStore(tmp_path / "telegram-status.db")
+    bot.alerter = NoopAlerter()
+
+    status = await bot._handle_telegram_command("/status", "", "42")
+    help_text = await bot._handle_telegram_command("/help", "", "42")
+    unknown = await bot._handle_telegram_command("/nope", "", "42")
+
+    assert "Trading: ENABLED" in status
+    assert "Open trades: 0" in status
+    assert "/emergency_stop" in help_text
+    assert "Unknown Command" in unknown
+
+
+@pytest.mark.asyncio
+async def test_telegram_command_replay_is_ignored(tmp_path):
+    from src.audit import AuditStore
+
+    bot = LiveTradingLoop()
+    bot.audit_store = AuditStore(tmp_path / "telegram-replay.db")
+    bot.alerter = NoopAlerter()
+
+    first = await bot._handle_telegram_command(
+        "/pause", "maintenance", "42", update_id=100
+    )
+    replay = await bot._handle_telegram_command(
+        "/resume", "stale replay", "42", update_id=100
+    )
+
+    assert "Trading Paused" in first
+    assert replay == ""
+    assert not bot.audit_store.trading_allowed()[0]
 
 
 @pytest.mark.asyncio

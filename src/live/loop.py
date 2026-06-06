@@ -1,5 +1,6 @@
 # Unified trading loop for Binance Demo Trading and mainnet.
 import asyncio
+import html
 import re
 import time
 from typing import Optional
@@ -35,6 +36,11 @@ class LiveTradingLoop:
             telegram_token=settings.telegram_bot_token,
             telegram_chat_id=settings.telegram_chat_id,
             discord_webhook=settings.discord_webhook_url,
+            telegram_commands_enabled=settings.telegram_commands_enabled,
+            telegram_allowed_user_ids=settings.telegram_allowed_user_ids_list,
+            telegram_poll_timeout=settings.telegram_poll_timeout_seconds,
+            queue_size=settings.telegram_alert_queue_size,
+            delivery_timeout=settings.telegram_delivery_timeout_seconds,
         )
         self.pos_mgr = PositionManager(
             self.client,
@@ -54,10 +60,15 @@ class LiveTradingLoop:
         self._account_refresh_failures = 0
         self._last_reconciliation_at = 0.0
         self._reconciliation_interval_seconds = settings.reconciliation_interval_seconds
+        self._stopped = False
 
     # Connect, fetch account, then scan every configured timeframe in sequence
     async def start(self):
         try:
+            await self.alerter.start(self._handle_telegram_command)
+            await self.alerter.initializing_alert(
+                self.mode, settings.binance_environment
+            )
             await self.client.connect()
             logger.info(
                 "Starting trading loop on Binance "
@@ -78,12 +89,6 @@ class LiveTradingLoop:
                 logger.info(
                     f"Account equity: {self.portfolio.account.total_equity:.2f}"
                 )
-            await self.alerter.startup_alert(
-                self.mode,
-                settings.binance_environment,
-                settings.symbols_list,
-            )
-
             self.pos_mgr.restore_open_trades_from_audit()
             reconciled = await self.pos_mgr.reconcile_exchange_state()
             if not reconciled:
@@ -95,23 +100,31 @@ class LiveTradingLoop:
             for symbol in settings.symbols_list:
                 await self.client.set_leverage(symbol, settings.max_leverage)
 
+            await self.alerter.startup_alert(
+                self.mode,
+                settings.binance_environment,
+                settings.symbols_list,
+            )
+
             while True:
                 await self._scan_due_timeframes_once()
                 await self._refresh_account()
                 await self._reconcile_if_due()
                 await asyncio.sleep(settings.scan_sleep_seconds)
         except asyncio.CancelledError:
-            await self.stop()
+            await self.stop("cancelled")
         except Exception as e:
-            logger.error(f"Trading loop error: {e}")
+            error = self._describe_exception(e)
+            logger.error(f"Trading loop error: {error}")
             self.audit_store.safe_record_event(
                 "bot_error",
                 "Live loop crashed",
                 severity="critical",
                 mode=self.mode,
-                payload={"error": str(e)},
+                payload={"error": error},
             )
-            await self.stop()
+            await self.alerter.error_alert(error)
+            await self.stop("fatal error")
 
     async def _scan_timeframes_once(
         self,
@@ -313,8 +326,128 @@ class LiveTradingLoop:
             logger.error(f"Trade execution error for {symbol}: {e}")
             await self.alerter.trade_failed_alert(self.mode, symbol, str(e))
 
+    async def _handle_telegram_command(
+        self, command: str, arguments: str, user_id: str, update_id: int = 0
+    ) -> str:
+        actor = f"telegram user {user_id or 'unknown'}"
+        if update_id:
+            last_update_id = int(
+                self.audit_store.get_control("telegram_last_update_id", "0")
+            )
+            if update_id <= last_update_id:
+                logger.warning(f"Ignored replayed Telegram update {update_id}")
+                return ""
+            self.audit_store.set_control(
+                "telegram_last_update_id", str(update_id), actor
+            )
+        self.audit_store.safe_record_event(
+            "telegram_command",
+            f"Telegram command {command}",
+            mode=self.mode,
+            payload={
+                "command": command,
+                "user_id": user_id,
+                "update_id": update_id,
+            },
+        )
+        if command == "/status":
+            return self._telegram_status()
+        if command == "/positions":
+            return self._telegram_positions()
+        if command in {
+            "/pause",
+            "/resume",
+            "/emergency_stop",
+            "/clear_emergency",
+        }:
+            return self._apply_telegram_control(command, arguments, actor)
+        if command == "/help":
+            return self._telegram_help()
+        return (
+            "<b>Unknown Command</b>\n"
+            "Use <code>/help</code> to list supported commands."
+        )
+
+    def _telegram_status(self) -> str:
+        allowed, allowed_reason = self.audit_store.trading_allowed()
+        equity = (
+            f"{self.portfolio.account.total_equity:.2f}"
+            if self.portfolio.account
+            else "unavailable"
+        )
+        return (
+            "<b>Bot Status</b>\n"
+            f"Environment: {html.escape(settings.binance_environment)}\n"
+            f"Trading: {'ENABLED' if allowed else 'BLOCKED'}\n"
+            f"Reason: {html.escape(allowed_reason)}\n"
+            f"Equity: {equity}\n"
+            f"Open trades: {len(self.pos_mgr.open_trades)}\n"
+            f"Alert queue: {self.alerter.pending_messages}"
+        )
+
+    def _telegram_positions(self) -> str:
+        if not self.pos_mgr.open_trades:
+            return "<b>Open Positions</b>\nNone"
+        lines = ["<b>Open Positions</b>"]
+        for key, trade in self.pos_mgr.open_trades.items():
+            lines.append(
+                f"{html.escape(key)}: {html.escape(trade.side.upper())} "
+                f"qty={trade.quantity:.6f} entry={trade.entry_price:.2f}"
+            )
+        return "\n".join(lines)
+
+    def _apply_telegram_control(self, command: str, arguments: str, actor: str) -> str:
+        reason = arguments or actor
+        if command == "/pause":
+            self.audit_store.pause_trading(reason)
+            return (
+                "<b>Trading Paused</b>\n"
+                f"Reason: {html.escape(reason)}\n"
+                "Existing positions retain their protective orders."
+            )
+        if command == "/resume":
+            self.audit_store.resume_trading(reason)
+            return "<b>Trading Resumed</b>"
+        if command == "/emergency_stop":
+            self.audit_store.activate_emergency_stop(reason)
+            return (
+                "<b>Emergency Stop Activated</b>\n"
+                "New entries are blocked. Existing positions retain their "
+                "protective orders."
+            )
+        if arguments != "CONFIRM":
+            return (
+                "<b>Confirmation Required</b>\n"
+                "Use <code>/clear_emergency CONFIRM</code>."
+            )
+        self.audit_store.clear_emergency_stop(actor)
+        return "<b>Emergency Stop Cleared</b>"
+
+    @staticmethod
+    def _telegram_help() -> str:
+        return (
+            "<b>Bot Commands</b>\n"
+            "<code>/status</code> - health and trading state\n"
+            "<code>/positions</code> - audited open positions\n"
+            "<code>/pause [reason]</code> - block new entries\n"
+            "<code>/resume [reason]</code> - remove manual pause\n"
+            "<code>/emergency_stop [reason]</code> - emergency block\n"
+            "<code>/clear_emergency CONFIRM</code> - clear emergency block"
+        )
+
     # Shut down streams, close positions, close connection
-    async def stop(self):
+    async def stop(self, reason: str = "normal shutdown"):
+        if self._stopped:
+            return
+        self._stopped = True
         logger.info("Stopping trading loop...")
-        await self.pos_mgr.close_all()
-        await self.client.close()
+        try:
+            await self.pos_mgr.close_all()
+        finally:
+            try:
+                await self.client.close()
+            finally:
+                await self.alerter.shutdown_alert(
+                    self.mode, settings.binance_environment, reason
+                )
+                await self.alerter.stop()

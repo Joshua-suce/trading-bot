@@ -64,3 +64,8 @@ def test_parse_args_admin_controls():
     assert args.mode == "admin"
     assert args.admin_action == "emergency-stop"
     assert args.reason == "test"
+
+
+def test_parse_args_admin_alert_test():
+    args = parse_args(["--mode", "admin", "--admin-action", "test-alert"])
+    assert args.admin_action == "test-alert"

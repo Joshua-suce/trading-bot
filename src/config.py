@@ -76,6 +76,11 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    telegram_commands_enabled: bool = False
+    telegram_allowed_user_ids: str = ""
+    telegram_poll_timeout_seconds: int = Field(default=20, ge=1, le=50)
+    telegram_alert_queue_size: int = Field(default=100, ge=10, le=10000)
+    telegram_delivery_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
     discord_webhook_url: str = ""
     telegram_bot_token_file: str = ""
     telegram_chat_id_file: str = ""
@@ -128,6 +133,21 @@ class Settings(BaseSettings):
             self.discord_webhook_url_file,
             "DISCORD_WEBHOOK_URL_FILE",
         )
+        if self.telegram_commands_enabled and not (
+            self.telegram_bot_token and self.telegram_chat_id
+        ):
+            raise ValueError(
+                "TELEGRAM_COMMANDS_ENABLED requires TELEGRAM_BOT_TOKEN "
+                "and TELEGRAM_CHAT_ID"
+            )
+        if (
+            self.telegram_commands_enabled
+            and self.telegram_chat_id.startswith("-")
+            and not self.telegram_allowed_user_ids
+        ):
+            raise ValueError(
+                "Group Telegram commands require TELEGRAM_ALLOWED_USER_IDS"
+            )
         return self
 
     @field_validator("symbols")
@@ -170,6 +190,15 @@ class Settings(BaseSettings):
             raise ValueError("LOG_LEVEL must be a valid loguru level")
         return normalized
 
+    @field_validator("telegram_allowed_user_ids")
+    @classmethod
+    def validate_telegram_user_ids(cls, value: str) -> str:
+        user_ids = cls._split_csv(value)
+        invalid = [user_id for user_id in user_ids if not user_id.isdigit()]
+        if invalid:
+            raise ValueError("TELEGRAM_ALLOWED_USER_IDS must contain numeric IDs")
+        return ",".join(user_ids)
+
     @staticmethod
     def _split_csv(value: str) -> List[str]:
         return [item.strip() for item in (value or "").split(",") if item.strip()]
@@ -198,6 +227,10 @@ class Settings(BaseSettings):
     @property
     def timeframes_list(self) -> List[str]:
         return [item.strip() for item in self.timeframes.split(",") if item.strip()]
+
+    @property
+    def telegram_allowed_user_ids_list(self) -> List[str]:
+        return self._split_csv(self.telegram_allowed_user_ids)
 
     @property
     def has_exchange_credentials(self) -> bool:
