@@ -163,7 +163,26 @@ class ExchangeClient:
     # Load all markets and return the market info for one symbol
     async def fetch_market(self, symbol: str) -> dict:
         markets = await self.rest.load_markets()
-        return markets[symbol]
+        if symbol in markets:
+            return markets[symbol]
+
+        normalized = self._normalize_market_symbol(symbol)
+        for market in markets.values():
+            market_id = self._normalize_market_symbol(market.get("id", ""))
+            unified_symbol = self._normalize_market_symbol(market.get("symbol", ""))
+            if normalized in {market_id, unified_symbol}:
+                return market
+
+        raise ValueError(
+            f"Market metadata not found for {symbol}; "
+            "verify the configured symbol is a Binance USD-M Futures market"
+        )
+
+    @staticmethod
+    def _normalize_market_symbol(symbol: object) -> str:
+        return (
+            str(symbol or "").split(":", 1)[0].replace("/", "").replace("-", "").upper()
+        )
 
     # Fetch the current funding rate for a perpetual contract
     async def fetch_funding_rate(self, symbol: str) -> float:

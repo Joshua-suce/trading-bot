@@ -323,8 +323,21 @@ class LiveTradingLoop:
                 )
 
         except Exception as e:
-            logger.error(f"Trade execution error for {symbol}: {e}")
-            await self.alerter.trade_failed_alert(self.mode, symbol, str(e))
+            error = self._describe_exception(e)
+            logger.exception(f"Trade execution error for {symbol}: {error}")
+            self.audit_store.safe_record_event(
+                "trade_execution_error",
+                f"Trade execution error for {symbol}",
+                severity="error",
+                symbol=symbol,
+                mode=self.mode,
+                payload={
+                    "error_type": type(e).__name__,
+                    "error": error,
+                    "timeframe": candle["timeframe"],
+                },
+            )
+            await self.alerter.trade_failed_alert(self.mode, symbol, error)
 
     async def _handle_telegram_command(
         self, command: str, arguments: str, user_id: str, update_id: int = 0
