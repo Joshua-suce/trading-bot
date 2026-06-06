@@ -25,6 +25,16 @@ def test_settings_normalizes_symbols_and_log_level():
     assert cfg.log_level == "WARNING"
 
 
+def test_default_timeframes_include_short_and_long_intervals():
+    cfg = Settings(
+        _env_file=None,
+        binance_api_key="key",
+        binance_api_secret="secret",
+    )
+
+    assert cfg.timeframes_list == ["5m", "15m", "30m", "1h", "4h", "1d"]
+
+
 def test_settings_rejects_invalid_timeframes():
     with pytest.raises(ValidationError):
         make_settings(timeframes="1h,13m")

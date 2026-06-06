@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     allow_mainnet_trading: bool = False
 
     symbols: str = "BTCUSDT,ETHUSDT"
-    timeframes: str = "1h,4h,1d"
+    timeframes: str = "5m,15m,30m,1h,4h,1d"
     position_scope: str = "symbol"
     scan_sleep_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
     reconciliation_interval_seconds: float = Field(default=300.0, ge=30.0, le=3600.0)
