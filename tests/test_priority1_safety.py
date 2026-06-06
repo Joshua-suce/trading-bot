@@ -84,7 +84,7 @@ class FakeAlerter:
         self.errors.append(error)
 
 
-def build_manager(tmp_path, order_mgr, client=None, paper=False):
+def build_manager(tmp_path, order_mgr, client=None):
     portfolio = PortfolioManager()
     portfolio.update_account(
         AccountInfo(
@@ -102,15 +102,14 @@ def build_manager(tmp_path, order_mgr, client=None, paper=False):
         pos_sizer=PositionSizer(portfolio),
         sl_mgr=StopLossManager(),
         portfolio=portfolio,
-        paper=paper,
         alerter=FakeAlerter(),
-        mode="live" if not paper else "paper",
+        mode="trade",
         audit_store=audit,
     )
 
 
 @pytest.mark.asyncio
-async def test_live_entry_flattens_and_fails_when_stop_loss_is_not_confirmed(tmp_path):
+async def test_trade_entry_flattens_and_fails_when_stop_loss_is_not_confirmed(tmp_path):
     orders = FakeOrderManager(stop_ok=False)
     manager = build_manager(tmp_path, orders)
 
@@ -137,7 +136,7 @@ async def test_failed_emergency_flatten_activates_kill_switch(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_blocks_unmanaged_live_position(tmp_path):
+async def test_reconciliation_blocks_unmanaged_exchange_position(tmp_path):
     orders = FakeOrderManager()
     client = FakeClient(positions=[{"symbol": "BTCUSDT", "contracts": 0.25}])
     manager = build_manager(tmp_path, orders, client=client)
@@ -172,7 +171,7 @@ def test_position_manager_restores_open_trades_from_audit(tmp_path):
     )
     audit.record_open_trade(
         trade,
-        mode="live",
+        mode="trade",
         correlation_id="corr-1",
         stop_loss=95.0,
         take_profit=110.0,
@@ -202,7 +201,7 @@ async def test_reconciliation_blocks_missing_protective_order(tmp_path):
     )
     audit.record_open_trade(
         trade,
-        mode="live",
+        mode="trade",
         correlation_id="corr-2",
         stop_loss=95.0,
         take_profit=110.0,

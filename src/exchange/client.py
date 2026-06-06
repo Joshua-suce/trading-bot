@@ -37,7 +37,7 @@ class ExchangeClient:
         self._ws = ccxt_pro.binanceusdm({**self.config, "session": self._ws_session})
 
         # Binance deprecated Futures testnet — use demo environment instead
-        if settings.binance_testnet:
+        if settings.binance_demo:
             self._enable_demo_trading(self._rest)
             self._enable_demo_trading(self._ws)
 
@@ -50,14 +50,14 @@ class ExchangeClient:
         except AuthenticationError as e:
             logger.error("Binance authentication failed: {}", e)
             await self.close()
-            environment = "Demo Trading" if settings.binance_testnet else "Mainnet"
+            environment = settings.binance_environment
             raise RuntimeError(
                 f"Binance API authentication failed for {environment}. "
                 "Check that BINANCE_API_KEY and BINANCE_API_SECRET were created "
                 "for this environment and have Futures permissions."
             ) from e
 
-        if settings.binance_testnet:
+        if settings.binance_demo:
             logger.info("Connected to Binance Futures DEMO")
         else:
             logger.warning("Connected to Binance Futures MAINNET")

@@ -40,7 +40,7 @@ def test_dashboard_frames_read_audit_store(tmp_path):
     )
     audit.record_open_trade(
         trade,
-        mode="paper",
+        mode="trade",
         correlation_id="dash-1",
         stop_loss=95.0,
         take_profit=110.0,

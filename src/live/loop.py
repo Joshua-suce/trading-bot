@@ -1,4 +1,4 @@
-# Live / paper trading loop — connects to exchange, streams candles, executes trades
+# Unified trading loop for Binance Demo Trading and mainnet.
 import asyncio
 import re
 import time
@@ -23,8 +23,8 @@ from src.signals.aggregator import SignalAggregator
 
 class LiveTradingLoop:
     # Initialise all components with optional pre-trained ensemble
-    def __init__(self, ensemble: Optional[ModelEnsemble] = None, mode: str = "paper"):
-        self.mode = mode
+    def __init__(self, ensemble: Optional[ModelEnsemble] = None):
+        self.mode = "trade"
         self.audit_store = AuditStore()
         self.client = ExchangeClient()
         self.order_mgr = OrderManager(self.client, audit_store=self.audit_store)
@@ -42,9 +42,8 @@ class LiveTradingLoop:
             self.sizer,
             self.sl_mgr,
             self.portfolio,
-            paper=(mode == "paper"),
             alerter=self.alerter,
-            mode=mode,
+            mode=self.mode,
             audit_store=self.audit_store,
         )
         self.ensemble = ensemble or ModelEnsemble()
@@ -58,47 +57,44 @@ class LiveTradingLoop:
 
     # Connect, fetch account, then scan every configured timeframe in sequence
     async def start(self):
-        await self.client.connect()
-        logger.info(f"Starting live trading loop in {self.mode.upper()} mode")
-        self.audit_store.safe_record_event(
-            "bot_started",
-            f"Trading loop started in {self.mode} mode",
-            mode=self.mode,
-            payload={
-                "symbols": settings.symbols_list,
-                "timeframes": settings.timeframes_list,
-            },
-        )
-
-        # Update account info
-        await self._refresh_account(required=(self.mode == "live"))
-        if self.portfolio.account:
-            logger.info(f"Account equity: {self.portfolio.account.total_equity:.2f}")
-        else:
-            logger.warning(
-                "Starting paper mode without an account snapshot; "
-                "trading will resume after a successful account refresh"
+        try:
+            await self.client.connect()
+            logger.info(
+                "Starting trading loop on Binance "
+                f"{settings.binance_environment.upper()}"
             )
-        await self.alerter.startup_alert(
-            self.mode,
-            "demo" if settings.binance_testnet else "mainnet",
-            settings.symbols_list,
-        )
-
-        self.pos_mgr.restore_open_trades_from_audit()
-        reconciled = await self.pos_mgr.reconcile_exchange_state()
-        if not reconciled:
-            raise RuntimeError(
-                "Startup reconciliation failed; emergency stop activated"
+            self.audit_store.safe_record_event(
+                "bot_started",
+                f"Trading loop started in {self.mode} mode",
+                mode=self.mode,
+                payload={
+                    "symbols": settings.symbols_list,
+                    "timeframes": settings.timeframes_list,
+                },
             )
-        self._last_reconciliation_at = time.monotonic()
 
-        for symbol in settings.symbols_list:
-            if self.mode == "live":
+            await self._refresh_account(required=True)
+            if self.portfolio.account:
+                logger.info(
+                    f"Account equity: {self.portfolio.account.total_equity:.2f}"
+                )
+            await self.alerter.startup_alert(
+                self.mode,
+                settings.binance_environment,
+                settings.symbols_list,
+            )
+
+            self.pos_mgr.restore_open_trades_from_audit()
+            reconciled = await self.pos_mgr.reconcile_exchange_state()
+            if not reconciled:
+                raise RuntimeError(
+                    "Startup reconciliation failed; emergency stop activated"
+                )
+            self._last_reconciliation_at = time.monotonic()
+
+            for symbol in settings.symbols_list:
                 await self.client.set_leverage(symbol, settings.max_leverage)
 
-        # Keep running
-        try:
             while True:
                 await self._scan_due_timeframes_once()
                 await self._refresh_account()
@@ -107,7 +103,7 @@ class LiveTradingLoop:
         except asyncio.CancelledError:
             await self.stop()
         except Exception as e:
-            logger.error(f"Live loop error: {e}")
+            logger.error(f"Trading loop error: {e}")
             self.audit_store.safe_record_event(
                 "bot_error",
                 "Live loop crashed",
@@ -202,11 +198,9 @@ class LiveTradingLoop:
                 self._account_refresh_failures,
                 self._describe_exception(e),
             )
-            if required or (
-                self.mode == "live" and self._account_refresh_failures >= 3
-            ):
+            if required or self._account_refresh_failures >= 3:
                 raise RuntimeError(
-                    "Account refresh failed repeatedly in live mode"
+                    "Account refresh failed repeatedly in trade mode"
                 ) from e
             return
 
@@ -235,8 +229,6 @@ class LiveTradingLoop:
         )
 
     async def _reconcile_if_due(self):
-        if self.mode != "live":
-            return
         elapsed = time.monotonic() - self._last_reconciliation_at
         if elapsed < self._reconciliation_interval_seconds:
             return
@@ -253,13 +245,12 @@ class LiveTradingLoop:
     def _timeframe_seconds(timeframe: str) -> int:
         return timeframe_seconds(timeframe)
 
-    # Called on each new candle — both paper and live modes execute trades
+    # Called on each new closed candle.
     async def _on_candle(self, candle: dict, df_ind=None):
-        if self.mode == "paper":
-            logger.info(
-                f"[Paper] Candle: {candle['symbol']} {candle['timeframe']} "
-                f"close={candle['close']:.2f}"
-            )
+        logger.info(
+            f"Candle: {candle['symbol']} {candle['timeframe']} "
+            f"close={candle['close']:.2f}"
+        )
         await self._execute_trade(candle, df_ind=df_ind)
 
     # Generate signal and enter position if criteria are met
@@ -324,6 +315,6 @@ class LiveTradingLoop:
 
     # Shut down streams, close positions, close connection
     async def stop(self):
-        logger.info("Stopping live trading loop...")
+        logger.info("Stopping trading loop...")
         await self.pos_mgr.close_all()
         await self.client.close()

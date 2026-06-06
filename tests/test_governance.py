@@ -38,7 +38,7 @@ def cfg(tmp_path, **overrides) -> Settings:
     defaults = {
         "binance_api_key": "key",
         "binance_api_secret": "secret",
-        "binance_testnet": True,
+        "binance_api_url": "https://demo-fapi.binance.com",
         "symbols": "BTCUSDT",
         "timeframes": "1h",
         "strategy_approval_path": str(tmp_path / "approval.json"),
@@ -59,7 +59,7 @@ def test_strategy_approval_store_writes_and_validates(tmp_path):
         reason="unit test",
     )
 
-    approved, reason = store.validate_for_live()
+    approved, reason = store.validate_for_mainnet()
     assert approved is True
     assert reason == "strategy approval valid"
 
@@ -75,7 +75,7 @@ def test_strategy_approval_rejects_weak_metrics(tmp_path):
         reason="weak",
     )
 
-    approved, reason = store.validate_for_live()
+    approved, reason = store.validate_for_mainnet()
     assert approved is False
     assert "too few trades" in reason
 
@@ -97,18 +97,29 @@ def test_strategy_approval_rejects_expired_artifact(tmp_path):
     }
     store.path.write_text(json.dumps(payload), encoding="utf-8")
 
-    approved, reason = store.validate_for_live()
+    approved, reason = store.validate_for_mainnet()
     assert approved is False
     assert "expired" in reason
 
 
-def test_live_preflight_requires_strategy_approval(tmp_path):
+def test_mainnet_preflight_requires_strategy_approval(tmp_path):
     with pytest.raises(RuntimeError, match="strategy governance"):
-        run_preflight("live", cfg=cfg(tmp_path))
+        run_preflight(
+            "trade",
+            cfg=cfg(
+                tmp_path,
+                binance_api_url="https://fapi.binance.com",
+                allow_mainnet_trading=True,
+            ),
+        )
 
 
-def test_live_preflight_accepts_valid_strategy_approval(tmp_path):
-    settings = cfg(tmp_path)
+def test_mainnet_preflight_accepts_valid_strategy_approval(tmp_path):
+    settings = cfg(
+        tmp_path,
+        binance_api_url="https://fapi.binance.com",
+        allow_mainnet_trading=True,
+    )
     StrategyApprovalStore(cfg=settings).write(
         metrics=metrics(),
         symbol="BTCUSDT",
@@ -117,6 +128,6 @@ def test_live_preflight_accepts_valid_strategy_approval(tmp_path):
         reason="valid",
     )
 
-    result = run_preflight("live", cfg=settings)
+    result = run_preflight("trade", cfg=settings)
 
-    assert result.mode == "live"
+    assert result.mode == "trade"

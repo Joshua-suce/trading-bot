@@ -23,9 +23,8 @@ class PositionManager:
         pos_sizer: PositionSizer,
         sl_mgr: StopLossManager,
         portfolio: PortfolioManager,
-        paper: bool = False,
         alerter: Alerter | None = None,
-        mode: str = "paper",
+        mode: str = "trade",
         audit_store: AuditStore | None = None,
     ):
         self.client = client
@@ -33,7 +32,6 @@ class PositionManager:
         self.sizer = pos_sizer
         self.sl_manager = sl_mgr
         self.portfolio = portfolio
-        self.paper = paper
         self.alerter = alerter
         self.mode = mode
         self.audit_store = audit_store or AuditStore()
@@ -97,40 +95,6 @@ class PositionManager:
                 },
             )
             return False
-
-        if self.paper:
-            correlation_id = self._new_correlation_id()
-            trade = TradeRecord(
-                symbol=symbol,
-                side="long",
-                entry_price=price,
-                quantity=pos_size.quantity,
-                timestamp=datetime.now(),
-                timeframe=timeframe,
-            )
-            self.open_trades[position_key] = trade
-            self.trade_correlation_ids[position_key] = correlation_id
-            self.portfolio.add_trade(trade)
-            self.audit_store.record_open_trade(
-                trade,
-                mode=self.mode,
-                correlation_id=correlation_id,
-                stop_loss=levels.stop_loss,
-                take_profit=levels.take_profit,
-            )
-            logger.info(
-                f"[Paper] Entered LONG {symbol} qty={pos_size.quantity} price={price} "
-                f"sl={levels.stop_loss} tp={levels.take_profit}"
-            )
-            await self._notify_trade_opened(
-                symbol,
-                "long",
-                price,
-                pos_size.quantity,
-                levels.stop_loss,
-                levels.take_profit,
-            )
-            return True
 
         order = await self.orders.market_order(symbol, "buy", pos_size.quantity)
         if order and order.get("filled", 0) > 0:
@@ -258,40 +222,6 @@ class PositionManager:
             )
             return False
 
-        if self.paper:
-            correlation_id = self._new_correlation_id()
-            trade = TradeRecord(
-                symbol=symbol,
-                side="short",
-                entry_price=price,
-                quantity=pos_size.quantity,
-                timestamp=datetime.now(),
-                timeframe=timeframe,
-            )
-            self.open_trades[position_key] = trade
-            self.trade_correlation_ids[position_key] = correlation_id
-            self.portfolio.add_trade(trade)
-            self.audit_store.record_open_trade(
-                trade,
-                mode=self.mode,
-                correlation_id=correlation_id,
-                stop_loss=levels.stop_loss,
-                take_profit=levels.take_profit,
-            )
-            logger.info(
-                f"[Paper] Entered SHORT {symbol} qty={pos_size.quantity} price={price} "
-                f"sl={levels.stop_loss} tp={levels.take_profit}"
-            )
-            await self._notify_trade_opened(
-                symbol,
-                "short",
-                price,
-                pos_size.quantity,
-                levels.stop_loss,
-                levels.take_profit,
-            )
-            return True
-
         order = await self.orders.market_order(symbol, "sell", pos_size.quantity)
         if order and order.get("filled", 0) > 0:
             correlation_id = self._new_correlation_id()
@@ -369,22 +299,6 @@ class PositionManager:
             return
         symbol = trade.symbol
 
-        if self.paper:
-            exit_price = (
-                trade.entry_price * 1.001
-                if trade.side == "long"
-                else trade.entry_price * 0.999
-            )
-            self.portfolio.close_trade(trade, exit_price, reason)
-            del self.open_trades[position_key]
-            correlation_id = self.trade_correlation_ids.pop(position_key, "")
-            if correlation_id:
-                self.audit_store.record_closed_trade(
-                    trade, mode=self.mode, correlation_id=correlation_id
-                )
-            await self._notify_trade_completed(trade, exit_price, reason)
-            return
-
         exit_side = "sell" if trade.side == "long" else "buy"
         order = await self.orders.market_order(
             symbol, exit_side, trade.quantity, reduce_only=True
@@ -417,9 +331,6 @@ class PositionManager:
             await self.exit_position(symbol, "close_all")
 
     async def reconcile_exchange_state(self) -> bool:
-        if self.paper:
-            return True
-
         positions = await self._fetch_positions_for_reconciliation()
         if positions is None:
             return False

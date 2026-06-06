@@ -1,1 +1,1 @@
-# Live / paper trading sub-package
+# Unified exchange trading runtime.

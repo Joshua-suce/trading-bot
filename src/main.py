@@ -17,10 +17,9 @@ def parse_args(argv: Optional[list[str]] = None):
     parser.add_argument(
         "--mode",
         type=str,
-        default="paper",
+        default="trade",
         choices=[
-            "paper",
-            "live",
+            "trade",
             "train",
             "dashboard",
             "admin",
@@ -96,11 +95,11 @@ async def run_train(symbol: str, timeframe: str, limit: int):
     return ensemble
 
 
-# Connect to exchange, stream candles, execute signals (paper or live)
-async def run_live(mode: str):
+# Connect to the configured exchange environment and execute signals.
+async def run_trade():
     from src.live.loop import LiveTradingLoop
 
-    loop = LiveTradingLoop(mode=mode)
+    loop = LiveTradingLoop()
     await loop.start()
 
 
@@ -142,7 +141,7 @@ def run_admin(action: str, reason: str = ""):
 
     allowed, allowed_reason = audit_store.trading_allowed()
     logger.info(f"Trading allowed: {allowed} ({allowed_reason})")
-    approved, approval_reason = approval_store.validate_for_live()
+    approved, approval_reason = approval_store.validate_for_mainnet()
     logger.info(f"Strategy approval valid: {approved} ({approval_reason})")
     approval = approval_store.load()
     if approval:
@@ -199,8 +198,8 @@ def main():
         raise SystemExit(asyncio.run(run_soak(args.soak_iterations, args.soak_report)))
     if args.mode == "train":
         asyncio.run(run_train(args.symbol, args.timeframe, args.limit))
-    elif args.mode in ("paper", "live"):
-        asyncio.run(run_live(args.mode))
+    elif args.mode == "trade":
+        asyncio.run(run_trade())
     elif args.mode == "dashboard":
         run_dashboard()
     elif args.mode == "admin":

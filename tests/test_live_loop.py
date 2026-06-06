@@ -25,8 +25,8 @@ class NoopClient:
 
 
 @pytest.mark.asyncio
-async def test_paper_account_refresh_failure_is_non_fatal(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+async def test_trade_account_refresh_failure_is_non_fatal_before_threshold(monkeypatch):
+    bot = LiveTradingLoop()
 
     async def fail_account(_client):
         raise RuntimeError("temporary demo account outage")
@@ -39,8 +39,8 @@ async def test_paper_account_refresh_failure_is_non_fatal(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_paper_start_survives_initial_account_refresh_failure(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+async def test_trade_start_stops_after_initial_account_refresh_failure(monkeypatch):
+    bot = LiveTradingLoop()
     bot.client = NoopClient()
     bot.alerter = NoopAlerter()
     reached = []
@@ -70,15 +70,15 @@ async def test_paper_start_survives_initial_account_refresh_failure(monkeypatch)
 
     await bot.start()
 
-    assert reached == ["reconcile", "scan", "stop"]
+    assert reached == ["stop"]
     assert bot.portfolio.account is None
     assert bot._account_refresh_failures == 1
     assert "secret" not in bot._describe_exception(RuntimeError("signature=secret"))
 
 
 @pytest.mark.asyncio
-async def test_live_account_refresh_fails_after_three_attempts(monkeypatch):
-    bot = LiveTradingLoop(mode="live")
+async def test_trade_account_refresh_fails_after_three_attempts(monkeypatch):
+    bot = LiveTradingLoop()
 
     async def fail_account(_client):
         raise RuntimeError("temporary demo account outage")
@@ -93,7 +93,7 @@ async def test_live_account_refresh_fails_after_three_attempts(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_account_refresh_updates_portfolio(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+    bot = LiveTradingLoop()
     account = AccountInfo(
         total_equity=1234.0,
         wallet_balance=1200.0,
@@ -136,7 +136,7 @@ class FakeSequentialClient:
 
 
 def test_due_scan_pairs_only_returns_due_items(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+    bot = LiveTradingLoop()
     monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT")
     monkeypatch.setattr(live_loop_module.settings, "timeframes", "5m,15m")
     bot._next_scan_due["BTCUSDT_15m"] = 999.0
@@ -154,7 +154,7 @@ def test_timeframe_seconds_parses_supported_units():
 
 @pytest.mark.asyncio
 async def test_scan_timeframes_runs_in_configured_sequence(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+    bot = LiveTradingLoop()
     bot.alerter = NoopAlerter()
     fake_client = FakeSequentialClient()
     bot.client = fake_client
@@ -184,7 +184,7 @@ async def test_scan_timeframes_runs_in_configured_sequence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_scan_timeframes_skips_duplicate_candle(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+    bot = LiveTradingLoop()
     bot.alerter = NoopAlerter()
     bot.client = FakeSequentialClient()
     processed = []
@@ -202,7 +202,7 @@ async def test_scan_timeframes_skips_duplicate_candle(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_process_timeframe_uses_last_closed_candle(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+    bot = LiveTradingLoop()
     bot.alerter = NoopAlerter()
     bot.client = FakeSequentialClient()
     processed = []
@@ -220,7 +220,7 @@ async def test_process_timeframe_uses_last_closed_candle(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_process_timeframe_rejects_bad_data(monkeypatch):
-    bot = LiveTradingLoop(mode="paper")
+    bot = LiveTradingLoop()
     bot.alerter = NoopAlerter()
     bot.client = FakeSequentialClient()
     processed = []

@@ -5,7 +5,7 @@ from src.main import parse_args
 
 def test_parse_args_defaults():
     args = parse_args([])
-    assert args.mode == "paper"
+    assert args.mode == "trade"
     assert args.symbol == "BTCUSDT"
     assert args.timeframe == "1h"
     assert args.limit == 500
@@ -33,6 +33,12 @@ def test_parse_args_custom_options():
 def test_parse_args_rejects_removed_backtest_mode():
     with pytest.raises(SystemExit):
         parse_args(["--mode", "backtest"])
+
+
+@pytest.mark.parametrize("removed_mode", ["paper", "live"])
+def test_parse_args_rejects_removed_split_trading_modes(removed_mode):
+    with pytest.raises(SystemExit):
+        parse_args(["--mode", removed_mode])
 
 
 @pytest.mark.parametrize(

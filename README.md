@@ -1,117 +1,90 @@
 # Binance Futures Trading Bot
 
-Enterprise-oriented Binance Futures trading bot with paper and live execution,
-multi-timeframe technical/ML signals, risk controls, auditing, health checks,
-alerts, and Docker support.
+Enterprise-oriented Binance Futures trading bot with one unified exchange
+execution path, multi-timeframe technical/ML signals, risk controls, auditing,
+health checks, alerts, and Docker support.
 
-## Supported Modes
+## Modes
 
 | Mode | Purpose |
 |---|---|
-| `paper` | Evaluate live market data and simulate execution without exchange orders |
-| `live` | Submit protected Binance Futures orders after all safety checks pass |
+| `trade` | Execute orders on the Binance environment selected by `BINANCE_API_URL` |
 | `train` | Train the machine-learning ensemble from exchange OHLCV data |
 | `dashboard` | Open the Streamlit monitoring dashboard |
 | `admin` | Inspect or change operational controls |
 | `health` | Report audit, control, event, and open-position health |
-| `soak` | Run a bounded offline reliability simulation |
+| `soak` | Run a bounded offline reliability simulation through fake adapters |
 
-The historical `backtest` command mode has been removed. Historical-analysis
-modules may remain as internal validation utilities, but they are not exposed as
-a bot operating mode.
+## One Trading Setup
 
-## Quick Start
+Demo and mainnet use the same command and execution code:
 
 ```powershell
-cd C:\trading-bot
-Copy-Item .env.example .env
-.\.venv\Scripts\python.exe -m src.main --mode health
-.\.venv\Scripts\python.exe -m src.main --mode paper
+.\.venv\Scripts\python.exe -m src.main --mode trade
 ```
 
-Paper mode is the default:
-
-```powershell
-.\.venv\Scripts\python.exe -m src.main
-```
-
-Paper and live modes require Binance API credentials. Keep
-`BINANCE_TESTNET=true` during validation.
-
-## Common Commands
-
-```powershell
-# Paper trading
-.\.venv\Scripts\python.exe -m src.main --mode paper
-
-# Model training
-.\.venv\Scripts\python.exe -m src.main --mode train --symbol BTCUSDT --timeframe 1h --limit 1000
-
-# Dashboard
-.\.venv\Scripts\python.exe -m src.main --mode dashboard
-
-# Health
-.\.venv\Scripts\python.exe -m src.main --mode health
-
-# Reliability soak
-.\.venv\Scripts\python.exe -m src.main --mode soak --soak-iterations 5
-
-# Administrative status
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action status
-```
-
-## Safety Controls
-
-```powershell
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action pause --reason "maintenance"
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action resume --reason "checks passed"
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action emergency-stop --reason "risk event"
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action clear-emergency --reason "exchange reconciled"
-.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action revoke-strategy --reason "approval withdrawn"
-```
-
-Live mode remains blocked when strategy approval is required but no valid
-approval artifact is deployed.
-
-## Trading Logic
-
-1. Scan configured symbols and timeframes sequentially.
-2. Validate OHLCV freshness, continuity, volume, and closed-candle state.
-3. Calculate technical indicators.
-4. Fuse technical and trained ML signals.
-5. Reject weak or neutral decisions.
-6. Apply pause, emergency, drawdown, loss, position-count, and exposure limits.
-7. Size the position from account equity and stop distance.
-8. Submit the entry and protective stop/target orders.
-9. Audit and alert every lifecycle event.
-10. Reconcile live exchange positions and protective orders periodically.
-
-## Configuration
-
-Important `.env` settings include:
+For Binance Demo Trading:
 
 ```dotenv
-BINANCE_TESTNET=true
-ALLOW_LIVE_TRADING=false
-ALLOW_MAINNET_PAPER=false
-TRADING_ENABLED=true
-
-SYMBOLS=BTCUSDT,ETHUSDT
-TIMEFRAMES=5m,15m,30m
-POSITION_SCOPE=symbol
-
-RISK_PER_TRADE=0.02
-MAX_LEVERAGE=3
-MAX_POSITION_SIZE=0.02
-MAX_OPEN_POSITIONS=3
-MAX_TOTAL_OPEN_NOTIONAL_PCT=0.20
-MAX_SYMBOL_OPEN_NOTIONAL_PCT=0.10
-DAILY_LOSS_LIMIT=0.05
-MAX_DRAWDOWN=0.15
+BINANCE_API_KEY=your_demo_key
+BINANCE_API_SECRET=your_demo_secret
+BINANCE_API_URL=https://demo-fapi.binance.com
 ```
 
-Use the `*_FILE` secret settings in managed environments when possible.
-Never commit `.env`.
+For Binance mainnet:
+
+```dotenv
+BINANCE_API_KEY=your_mainnet_key
+BINANCE_API_SECRET=your_mainnet_secret
+BINANCE_API_URL=https://fapi.binance.com
+ALLOW_MAINNET_TRADING=true
+```
+
+`ALLOW_MAINNET_TRADING` is a safety authorization, not a second execution mode.
+Mainnet may also require a valid strategy approval artifact. Demo and mainnet
+otherwise use the same order, protection, reconciliation, audit, and alert path.
+
+Only the two official HTTPS hosts above are accepted. This prevents credentials
+from being sent to an unknown endpoint.
+
+## Runtime Flow
+
+1. Validate endpoint, credentials, controls, and mainnet governance.
+2. Connect to Binance Futures.
+3. Restore and reconcile audited exchange positions.
+4. Scan configured symbols and timeframes sequentially.
+5. Validate closed OHLCV candles.
+6. Fuse technical and trained ML signals.
+7. Apply risk, loss, drawdown, position-count, and exposure controls.
+8. Submit a market entry.
+9. Submit reduce-only stop-loss and take-profit protection.
+10. Audit and alert every lifecycle event.
+
+There is no locally simulated paper-trading branch. Demo trading uses Binance
+Demo Trading orders.
+
+## Commands
+
+```powershell
+# Unified trading
+.\.venv\Scripts\python.exe -m src.main --mode trade
+
+# Train models
+.\.venv\Scripts\python.exe -m src.main --mode train --symbol BTCUSDT --timeframe 1h --limit 1000
+
+# Health and monitoring
+.\.venv\Scripts\python.exe -m src.main --mode health
+.\.venv\Scripts\python.exe -m src.main --mode dashboard
+
+# Offline operational soak
+.\.venv\Scripts\python.exe -m src.main --mode soak --soak-iterations 5
+
+# Controls
+.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action status
+.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action pause --reason "maintenance"
+.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action resume
+.\.venv\Scripts\python.exe -m src.main --mode admin --admin-action emergency-stop --reason "risk event"
+```
 
 ## Quality Gate
 
@@ -119,8 +92,8 @@ Never commit `.env`.
 .\scripts\smoke_check.ps1
 ```
 
-The gate runs formatting, import checks, linting, secret scanning, mypy,
-pytest with a 75% coverage floor, health checks, and an offline soak.
+The gate runs formatting, imports, lint, secret scanning, mypy, pytest with a
+75% coverage floor, an isolated health check, and an offline soak.
 
 ## Docker
 
@@ -129,20 +102,8 @@ docker build -t trading-bot:enterprise .
 docker run --rm --env-file .env -v ${PWD}\data:/app/data trading-bot:enterprise
 ```
 
-Or:
+The existing image must be rebuilt whenever source or environment contracts
+change.
 
-```powershell
-docker compose up -d
-docker compose logs -f trading-bot
-docker compose down
-```
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md)
-- [Deployment](docs/DEPLOYMENT.md)
-- [Production runbook](docs/PRODUCTION_RUNBOOK.md)
-- [Strategy](docs/STRATEGY.md)
-
-Trading involves financial risk. Paper-test, monitor, and approve the strategy
-before enabling live mainnet execution.
+Trading involves financial risk. Validate with Binance Demo Trading before
+authorizing mainnet.

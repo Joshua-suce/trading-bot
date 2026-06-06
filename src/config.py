@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 from typing import Any, ClassVar, List
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -35,9 +36,8 @@ class Settings(BaseSettings):
     binance_api_secret: str = ""
     binance_api_key_file: str = ""
     binance_api_secret_file: str = ""
-    binance_testnet: bool = True
-    allow_live_trading: bool = False
-    allow_mainnet_paper: bool = False
+    binance_api_url: str = "https://demo-fapi.binance.com"
+    allow_mainnet_trading: bool = False
 
     symbols: str = "BTCUSDT,ETHUSDT"
     timeframes: str = "1h,4h,1d"
@@ -87,6 +87,21 @@ class Settings(BaseSettings):
     @classmethod
     def strip_secret(cls, value: str) -> str:
         return (value or "").strip()
+
+    @field_validator("binance_api_url")
+    @classmethod
+    def validate_binance_api_url(cls, value: str) -> str:
+        normalized = (value or "").strip().rstrip("/")
+        parsed = urlparse(normalized)
+        allowed_hosts = {"demo-fapi.binance.com", "fapi.binance.com"}
+        if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
+            raise ValueError(
+                "BINANCE_API_URL must be https://demo-fapi.binance.com "
+                "or https://fapi.binance.com"
+            )
+        if parsed.path or parsed.params or parsed.query or parsed.fragment:
+            raise ValueError("BINANCE_API_URL must contain only the Binance host")
+        return normalized
 
     @model_validator(mode="after")
     def load_file_secrets(self):
@@ -189,6 +204,15 @@ class Settings(BaseSettings):
         return bool(self.binance_api_key and self.binance_api_secret)
 
     @property
+    def binance_environment(self) -> str:
+        host = urlparse(self.binance_api_url).hostname
+        return "demo" if host == "demo-fapi.binance.com" else "mainnet"
+
+    @property
+    def binance_demo(self) -> bool:
+        return self.binance_environment == "demo"
+
+    @property
     def exchange_id(self) -> str:
         return "binanceusdm"
 
@@ -203,7 +227,7 @@ class Settings(BaseSettings):
                 "adjustForTimeDifference": True,
             },
         }
-        if self.binance_testnet:
+        if self.binance_demo:
             config["options"]["fetchCurrencies"] = False
         return config
 

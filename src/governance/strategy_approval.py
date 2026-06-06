@@ -83,7 +83,7 @@ class StrategyApprovalStore:
             metrics=dict(data.get("metrics", {})),
         )
 
-    def validate_for_live(self) -> tuple[bool, str]:
+    def validate_for_mainnet(self) -> tuple[bool, str]:
         if not self.cfg.require_strategy_approval:
             return True, "strategy approval not required"
         approval = self.load()

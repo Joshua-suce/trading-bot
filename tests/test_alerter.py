@@ -87,12 +87,12 @@ async def test_post_with_retries_redacts_secret_after_failures(monkeypatch, capl
 async def test_alert_helpers_format_operational_notifications():
     alerter = CapturingAlerter()
 
-    await alerter.startup_alert("paper", "testnet", ["BTCUSDT", "ETHUSDT"])
+    await alerter.startup_alert("trade", "demo", ["BTCUSDT", "ETHUSDT"])
     await alerter.trade_opened_alert(
-        "paper", "BTCUSDT", "long", 100.0, 0.5, 95.0, 110.0
+        "trade", "BTCUSDT", "long", 100.0, 0.5, 95.0, 110.0
     )
-    await alerter.trade_completed_alert("paper", "BTCUSDT", "long", 108.0, 4.0, "tp")
-    await alerter.trade_failed_alert("paper", "ETHUSDT", "risk blocked")
+    await alerter.trade_completed_alert("trade", "BTCUSDT", "long", 108.0, 4.0, "tp")
+    await alerter.trade_failed_alert("trade", "ETHUSDT", "risk blocked")
     await alerter.trade_alert("SOLUSDT", "short", 50.0, 1.25, pnl=-1.5)
     await alerter.error_alert("exchange down")
     await alerter.daily_summary(12.5, 0.625, 8)

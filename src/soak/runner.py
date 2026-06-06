@@ -9,6 +9,7 @@ import pandas as pd
 from src.audit import AuditStore
 from src.exchange.account import AccountInfo
 from src.exchange.client import ExchangeClient
+from src.execution.order_manager import OrderManager
 from src.live.loop import LiveTradingLoop
 from src.monitoring.alerter import Alerter
 from src.signals.aggregator import FinalSignal, SignalAggregator
@@ -62,6 +63,44 @@ class SoakClient:
         )
 
 
+class SoakOrderManager:
+    def __init__(self) -> None:
+        self.counter = 0
+
+    async def market_order(
+        self, symbol: str, side: str, quantity: float, reduce_only: bool = False
+    ) -> dict:
+        self.counter += 1
+        return {
+            "id": f"soak-market-{self.counter}",
+            "filled": quantity,
+            "average": 110.5 if reduce_only else 110.4,
+        }
+
+    async def stop_loss_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        stop_price: float,
+        price: float | None = None,
+    ) -> dict:
+        self.counter += 1
+        return {"id": f"soak-stop-{self.counter}"}
+
+    async def take_profit_order(
+        self, symbol: str, side: str, quantity: float, price: float
+    ) -> dict:
+        self.counter += 1
+        return {"id": f"soak-target-{self.counter}"}
+
+    async def cancel_all_orders(self, symbol: str) -> None:
+        return None
+
+    async def cancel_order(self, symbol: str, order_id: str) -> None:
+        return None
+
+
 class SoakAggregator:
     def __init__(self) -> None:
         self.calls = 0
@@ -107,15 +146,20 @@ class SoakRunner:
         self.iterations = iterations
 
     async def run(self) -> SoakReport:
-        bot = LiveTradingLoop(mode="paper")
+        bot = LiveTradingLoop()
+        bot.mode = "soak"
         bot.audit_store = self.audit_store
         soak_alerter = SoakAlerter()
         bot.client = cast(ExchangeClient, SoakClient())
         bot.alerter = cast(Alerter, soak_alerter)
         bot.aggregator = cast(SignalAggregator, SoakAggregator())
+        soak_orders = SoakOrderManager()
+        bot.order_mgr = cast(OrderManager, soak_orders)
         bot.order_mgr.audit_store = self.audit_store
         bot.pos_mgr.audit_store = self.audit_store
         bot.pos_mgr.alerter = bot.alerter
+        bot.pos_mgr.orders = cast(OrderManager, soak_orders)
+        bot.pos_mgr.mode = "soak"
         bot.portfolio.update_account(
             AccountInfo(
                 total_equity=10_000.0,
@@ -126,11 +170,11 @@ class SoakRunner:
             )
         )
 
-        await bot.alerter.startup_alert("paper", "soak", ["BTCUSDT"])
+        await bot.alerter.startup_alert("soak", "offline", ["BTCUSDT"])
         self.audit_store.record_event(
             "soak_started",
-            "Offline paper soak started",
-            mode="paper",
+            "Offline trade-path soak started",
+            mode="soak",
             payload={"iterations": self.iterations},
         )
         for _ in range(self.iterations):
@@ -139,8 +183,8 @@ class SoakRunner:
         await bot.stop()
         self.audit_store.record_event(
             "soak_completed",
-            "Offline paper soak completed",
-            mode="paper",
+            "Offline trade-path soak completed",
+            mode="soak",
         )
         return self._build_report(bot, soak_alerter)
 
@@ -148,13 +192,13 @@ class SoakRunner:
         events = self.audit_store.load_recent_events(500)
         alert_types = [message["type"] for message in alerter.messages]
         report = SoakReport(
-            status="ok" if not self.audit_store.load_open_trades("paper") else "failed",
+            status="ok" if not self.audit_store.load_open_trades("soak") else "failed",
             iterations=self.iterations,
             opened_trades=alert_types.count("trade_opened"),
             completed_trades=alert_types.count("trade_completed"),
             failed_trades=alert_types.count("trade_failed"),
             audit_events=len(events),
-            open_trades_after_shutdown=len(self.audit_store.load_open_trades("paper")),
+            open_trades_after_shutdown=len(self.audit_store.load_open_trades("soak")),
             report_path=str(self.report_path),
         )
         self.report_path.parent.mkdir(parents=True, exist_ok=True)

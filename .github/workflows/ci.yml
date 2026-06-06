@@ -29,7 +29,7 @@ jobs:
 
       - name: Run smoke checks
         env:
-          BINANCE_TESTNET: "true"
+          BINANCE_API_URL: "https://demo-fapi.binance.com"
           BINANCE_API_KEY: "ci-key"
           BINANCE_API_SECRET: "ci-secret"
           AUDIT_DB_PATH: "data/audit/ci_audit.db"

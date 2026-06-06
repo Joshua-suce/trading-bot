@@ -9,7 +9,7 @@ def make_settings(**overrides) -> Settings:
     defaults = {
         "binance_api_key": "key",
         "binance_api_secret": "secret",
-        "binance_testnet": True,
+        "binance_api_url": "https://demo-fapi.binance.com",
         "symbols": "btcusdt, ethusdt",
         "timeframes": "1h,4h",
     }
@@ -55,29 +55,46 @@ def test_settings_validates_position_scope():
         make_settings(position_scope="account")
 
 
-def test_preflight_requires_credentials_for_paper_mode():
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://demo-fapi.binance.com",
+        "https://example.com",
+        "https://fapi.binance.com/fapi/v1",
+    ],
+)
+def test_settings_rejects_unsafe_or_unknown_exchange_urls(url):
+    with pytest.raises(ValidationError):
+        make_settings(binance_api_url=url)
+
+
+def test_exchange_url_selects_environment():
+    assert make_settings().binance_environment == "demo"
+    assert (
+        make_settings(binance_api_url="https://fapi.binance.com").binance_environment
+        == "mainnet"
+    )
+
+
+def test_preflight_requires_credentials_for_trade_mode():
     cfg = make_settings(binance_api_key="", binance_api_secret="")
 
     with pytest.raises(RuntimeError, match="requires BINANCE_API_KEY"):
-        run_preflight("paper", cfg=cfg)
+        run_preflight("trade", cfg=cfg)
 
 
-def test_preflight_blocks_mainnet_paper_without_opt_in():
-    cfg = make_settings(binance_testnet=False, allow_mainnet_paper=False)
+def test_preflight_blocks_mainnet_without_opt_in():
+    cfg = make_settings(
+        binance_api_url="https://fapi.binance.com",
+        allow_mainnet_trading=False,
+    )
 
-    with pytest.raises(RuntimeError, match="Paper mode is pointed at Binance mainnet"):
-        run_preflight("paper", cfg=cfg)
-
-
-def test_preflight_blocks_mainnet_live_without_opt_in():
-    cfg = make_settings(binance_testnet=False, allow_live_trading=False)
-
-    with pytest.raises(RuntimeError, match="Live mainnet trading is disabled"):
-        run_preflight("live", cfg=cfg)
+    with pytest.raises(RuntimeError, match="Mainnet trading is disabled"):
+        run_preflight("trade", cfg=cfg)
 
 
-def test_preflight_allows_demo_live_with_credentials():
-    result = run_preflight("live", cfg=make_settings(require_strategy_approval=False))
+def test_preflight_allows_demo_trade_with_credentials():
+    result = run_preflight("trade", cfg=make_settings())
 
     assert result.environment == "demo"
     assert result.credentials_required is True

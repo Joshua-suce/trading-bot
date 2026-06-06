@@ -9,7 +9,7 @@ from src.config import settings
 from src.exchange.account import AccountInfo
 
 
-# Record of a single trade (used by both live and backtest contexts)
+# Record of a single exchange trade.
 @dataclass
 class TradeRecord:
     symbol: str
