@@ -81,6 +81,9 @@ class FakeClient:
     async def fetch_ticker(self, symbol):
         return {"last": 100.0}
 
+    async def fetch_market(self, symbol):
+        return {"precision": {"amount": 0.001}}
+
 
 class FakeAlerter:
     def __init__(self):
@@ -261,7 +264,7 @@ async def test_reconciliation_accepts_standard_tp_and_conditional_stop(tmp_path)
         take_profit_order_id="tp-standard",
     )
     client = FakeClient(
-        positions=[{"symbol": "BTCUSDT", "contracts": 1.0}],
+        positions=[{"symbol": "BTCUSDT", "contracts": 1.0, "side": "long"}],
         open_orders={"BTCUSDT": [{"id": "tp-standard"}]},
         conditional_orders={"BTCUSDT": [{"id": "sl-algo"}]},
     )
@@ -270,6 +273,81 @@ async def test_reconciliation_accepts_standard_tp_and_conditional_stop(tmp_path)
     manager.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_blocks_exchange_side_mismatch(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(),
+    )
+    audit.record_open_trade(
+        trade,
+        mode="trade",
+        correlation_id="corr-side",
+        stop_loss=95.0,
+        take_profit=110.0,
+        stop_order_id="sl-side",
+        take_profit_order_id="tp-side",
+    )
+    client = FakeClient(
+        positions=[{"symbol": "BTCUSDT", "contracts": 1.0, "side": "short"}],
+    )
+    manager = build_manager(tmp_path, FakeOrderManager(), client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is False
+    assert not manager.audit_store.trading_allowed()[0]
+    assert manager.audit_store.load_recent_events(1)[0]["event_type"] == (
+        "position_side_mismatch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_blocks_exchange_quantity_mismatch(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    trade = TradeRecord(
+        symbol="ETHUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(),
+    )
+    audit.record_open_trade(
+        trade,
+        mode="trade",
+        correlation_id="corr-quantity",
+        stop_loss=95.0,
+        take_profit=110.0,
+        stop_order_id="sl-quantity",
+        take_profit_order_id="tp-quantity",
+    )
+    client = FakeClient(
+        positions=[{"symbol": "ETHUSDT", "contracts": 0.9, "side": "long"}],
+    )
+    manager = build_manager(tmp_path, FakeOrderManager(), client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is False
+    assert not manager.audit_store.trading_allowed()[0]
+    assert manager.audit_store.load_recent_events(1)[0]["event_type"] == (
+        "position_quantity_mismatch"
+    )
+
+
+def test_position_side_uses_signed_binance_position_amount():
+    position = {
+        "contracts": 1.0,
+        "info": {"positionSide": "BOTH", "positionAmt": "-1.0"},
+    }
+
+    assert PositionManager._position_side(position) == "short"
 
 
 @pytest.mark.asyncio

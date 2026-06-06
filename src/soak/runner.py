@@ -170,17 +170,14 @@ class SoakRunner:
         self.iterations = iterations
 
     async def run(self) -> SoakReport:
-        bot = LiveTradingLoop()
+        bot = LiveTradingLoop(audit_store=self.audit_store)
         bot.mode = "soak"
-        bot.audit_store = self.audit_store
         soak_alerter = SoakAlerter()
         bot.client = cast(ExchangeClient, SoakClient())
         bot.alerter = cast(Alerter, soak_alerter)
         bot.aggregator = cast(SignalAggregator, SoakAggregator())
         soak_orders = SoakOrderManager()
         bot.order_mgr = cast(OrderManager, soak_orders)
-        bot.order_mgr.audit_store = self.audit_store
-        bot.pos_mgr.audit_store = self.audit_store
         bot.pos_mgr.alerter = bot.alerter
         bot.pos_mgr.orders = cast(OrderManager, soak_orders)
         bot.pos_mgr.mode = "soak"
@@ -204,7 +201,7 @@ class SoakRunner:
         for _ in range(self.iterations):
             await bot._scan_timeframes_once(symbols=["BTCUSDT"], timeframes=["5m"])
 
-        await bot.stop()
+        await bot.stop("soak complete", close_positions=True)
         self.audit_store.record_event(
             "soak_completed",
             "Offline trade-path soak completed",

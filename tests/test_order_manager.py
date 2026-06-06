@@ -40,6 +40,7 @@ class FlakyClient:
         self.created_orders = []
         self.cancelled_orders = []
         self.missing_cancel = False
+        self.recovered_order = None
         self.rest = FakeRest(fail_cancel_all=fail_cancel_all)
 
     async def create_order(self, symbol, order_type, side, amount, price, params):
@@ -70,6 +71,13 @@ class FlakyClient:
         if self.rest.fail_cancel_all:
             raise RuntimeError("cancel all rejected")
         self.rest.cancelled_symbols.append((symbol, conditional))
+
+    async def fetch_order_by_client_id(
+        self, client_order_id, symbol, conditional=False
+    ):
+        if self.recovered_order is None:
+            raise OrderNotFound("not found")
+        return self.recovered_order
 
 
 @pytest.mark.asyncio
@@ -110,6 +118,24 @@ async def test_market_order_audits_permanent_failure(tmp_path, monkeypatch):
     assert event["severity"] == "error"
     assert "temporary exchange failure" in event["payload"]["error"]
     assert "temporary exchange failure" in manager.failure_reason("BTCUSDT", "fallback")
+
+
+@pytest.mark.asyncio
+async def test_market_order_recovers_accepted_order_after_timeout(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    client = FlakyClient(failures=1)
+    client.recovered_order = {
+        "id": "accepted-order",
+        "filled": 0.25,
+        "status": "closed",
+    }
+    manager = OrderManager(client, audit_store=audit, guard=AllowGuard())
+
+    order = await manager.market_order("BTCUSDT", "buy", 0.25)
+
+    assert order == client.recovered_order
+    assert len(client.created_orders) == 1
+    assert audit.load_recent_events(1)[0]["event_type"] == "order_recovered"
 
 
 @pytest.mark.asyncio

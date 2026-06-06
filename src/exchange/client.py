@@ -169,6 +169,16 @@ class ExchangeClient:
         params = {"trigger": True} if conditional else {}
         return await self.rest.fetch_order(order_id, symbol, params=params)
 
+    async def fetch_order_by_client_id(
+        self, client_order_id: str, symbol: str, *, conditional: bool = False
+    ) -> dict:
+        params = (
+            {"trigger": True, "clientAlgoId": client_order_id}
+            if conditional
+            else {"origClientOrderId": client_order_id}
+        )
+        return await self.rest.fetch_order("", symbol, params=params)
+
     # Fetch current ticker (24hr stats) for a symbol
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self.rest.fetch_ticker(symbol)

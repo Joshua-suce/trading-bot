@@ -349,7 +349,7 @@ class PositionManager:
         if positions is None:
             return False
 
-        exchange_symbols, unmanaged = self._classify_exchange_positions(positions)
+        exchange_positions, unmanaged = self._classify_exchange_positions(positions)
         if unmanaged:
             reason = f"unmanaged exchange positions detected: {unmanaged}"
             await self._fail_reconciliation(
@@ -359,7 +359,10 @@ class PositionManager:
             )
             return False
 
-        await self._clear_missing_exchange_positions(exchange_symbols)
+        await self._clear_missing_exchange_positions(set(exchange_positions))
+
+        if not await self._verify_exchange_position_details(exchange_positions):
+            return False
 
         if not await self._verify_all_protective_orders():
             return False
@@ -377,9 +380,9 @@ class PositionManager:
 
     def _classify_exchange_positions(
         self, positions: list[dict]
-    ) -> tuple[set[str], list[dict]]:
+    ) -> tuple[dict[str, dict], list[dict]]:
         unmanaged = []
-        exchange_symbols = set()
+        exchange_positions = {}
         for position in positions:
             symbol = self._normalize_symbol(
                 position.get("symbol") or position.get("info", {}).get("symbol")
@@ -387,10 +390,10 @@ class PositionManager:
             size = self._position_size(position)
             if abs(size) <= 0 or not symbol:
                 continue
-            exchange_symbols.add(symbol)
+            exchange_positions[symbol] = position
             if not self._has_open_trade_for_symbol(symbol):
                 unmanaged.append({"symbol": symbol, "size": size})
-        return exchange_symbols, unmanaged
+        return exchange_positions, unmanaged
 
     async def _clear_missing_exchange_positions(
         self, exchange_symbols: set[str]
@@ -421,6 +424,56 @@ class PositionManager:
             )
             return False
         return True
+
+    async def _verify_exchange_position_details(
+        self, exchange_positions: dict[str, dict]
+    ) -> bool:
+        for position_key, trade in self.open_trades.items():
+            position = exchange_positions.get(trade.symbol)
+            if position is None:
+                continue
+            exchange_side = self._position_side(position)
+            if exchange_side and exchange_side != trade.side:
+                reason = (
+                    f"exchange side mismatch for {trade.symbol}: "
+                    f"audit={trade.side} exchange={exchange_side}"
+                )
+                await self._fail_reconciliation(
+                    "position_side_mismatch",
+                    reason,
+                    symbol=trade.symbol,
+                    correlation_id=self.trade_correlation_ids.get(position_key),
+                )
+                return False
+
+            exchange_quantity = abs(self._position_size(position))
+            tolerance = await self._quantity_tolerance(trade.symbol)
+            if abs(exchange_quantity - trade.quantity) > tolerance:
+                reason = (
+                    f"exchange quantity mismatch for {trade.symbol}: "
+                    f"audit={trade.quantity} exchange={exchange_quantity} "
+                    f"tolerance={tolerance}"
+                )
+                await self._fail_reconciliation(
+                    "position_quantity_mismatch",
+                    reason,
+                    symbol=trade.symbol,
+                    correlation_id=self.trade_correlation_ids.get(position_key),
+                )
+                return False
+        return True
+
+    async def _quantity_tolerance(self, symbol: str) -> float:
+        try:
+            market = await self.client.fetch_market(symbol)
+            precision = market.get("precision", {}).get("amount")
+            if isinstance(precision, float) and precision > 0:
+                return precision / 2
+            if isinstance(precision, int) and precision >= 0:
+                return 10 ** (-precision) / 2
+        except Exception as exc:
+            logger.warning(f"Could not resolve quantity tolerance for {symbol}: {exc}")
+        return 1e-12
 
     async def _fail_reconciliation(
         self,
@@ -587,6 +640,29 @@ class PositionManager:
                 assert value is not None
                 return float(value)
         return 0.0
+
+    @staticmethod
+    def _position_side(position: dict) -> str | None:
+        side = str(position.get("side") or "").lower()
+        if side in {"long", "short"}:
+            return side
+        info = position.get("info", {})
+        position_side = str(info.get("positionSide") or "").lower()
+        if position_side in {"long", "short"}:
+            return position_side
+        position_amount = info.get("positionAmt")
+        if position_amount not in (None, ""):
+            signed_amount = float(position_amount)
+            if signed_amount > 0:
+                return "long"
+            if signed_amount < 0:
+                return "short"
+        size = PositionManager._position_size(position)
+        if size > 0:
+            return "long"
+        if size < 0:
+            return "short"
+        return None
 
     @staticmethod
     def _normalize_symbol(symbol: object) -> str:

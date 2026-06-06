@@ -24,9 +24,14 @@ from src.signals.aggregator import SignalAggregator
 
 class LiveTradingLoop:
     # Initialise all components with optional pre-trained ensemble
-    def __init__(self, ensemble: Optional[ModelEnsemble] = None):
+    def __init__(
+        self,
+        ensemble: Optional[ModelEnsemble] = None,
+        *,
+        audit_store: AuditStore | None = None,
+    ):
         self.mode = "trade"
-        self.audit_store = AuditStore()
+        self.audit_store = audit_store or AuditStore()
         self.client = ExchangeClient()
         self.order_mgr = OrderManager(self.client, audit_store=self.audit_store)
         self.portfolio = PortfolioManager()
@@ -449,13 +454,37 @@ class LiveTradingLoop:
         )
 
     # Shut down streams, close positions, close connection
-    async def stop(self, reason: str = "normal shutdown"):
+    async def stop(
+        self,
+        reason: str = "normal shutdown",
+        *,
+        close_positions: bool | None = None,
+    ):
         if self._stopped:
             return
         self._stopped = True
         logger.info("Stopping trading loop...")
+        should_close_positions = (
+            reason == "fatal error" if close_positions is None else close_positions
+        )
         try:
-            await self.pos_mgr.close_all()
+            if should_close_positions:
+                await self.pos_mgr.close_all()
+            elif self.pos_mgr.open_trades:
+                self.audit_store.safe_record_event(
+                    "positions_preserved_on_shutdown",
+                    "Protected positions preserved for restart reconciliation",
+                    severity="warning",
+                    mode=self.mode,
+                    payload={
+                        "reason": reason,
+                        "positions": list(self.pos_mgr.open_trades),
+                    },
+                )
+                logger.warning(
+                    f"Preserving {len(self.pos_mgr.open_trades)} protected "
+                    "position(s) on graceful shutdown"
+                )
         finally:
             try:
                 await self.client.close()

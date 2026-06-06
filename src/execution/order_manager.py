@@ -247,6 +247,30 @@ class OrderManager:
                     f"{order_type} {side} {symbol} failed "
                     f"attempt {attempt}/{attempts}: {last_error}"
                 )
+                recovered = await self._recover_order(
+                    symbol,
+                    str(params.get("newClientOrderId") or ""),
+                    conditional=order_type in {"stop_market", "stop_limit"},
+                )
+                if recovered is not None:
+                    logger.warning(
+                        f"Recovered accepted {order_type} {side} order for "
+                        f"{symbol} after ambiguous create failure"
+                    )
+                    self._audit(
+                        "order_recovered",
+                        f"{order_type} {side} order recovered by client ID",
+                        severity="warning",
+                        symbol=symbol,
+                        payload={
+                            "order_type": order_type,
+                            "side": side,
+                            "client_order_id": params.get("newClientOrderId"),
+                            "create_error": last_error,
+                            "order": recovered,
+                        },
+                    )
+                    return recovered
                 if attempt < attempts:
                     await asyncio.sleep(0.5 * attempt)
 
@@ -272,6 +296,22 @@ class OrderManager:
 
     def failure_reason(self, symbol: str, fallback: str) -> str:
         return self._last_failure_reasons.get(symbol, fallback)
+
+    async def _recover_order(
+        self, symbol: str, client_order_id: str, *, conditional: bool
+    ) -> dict | None:
+        fetch_by_client_id = getattr(self.client, "fetch_order_by_client_id", None)
+        if not client_order_id or not callable(fetch_by_client_id):
+            return None
+        try:
+            return await fetch_by_client_id(
+                client_order_id, symbol, conditional=conditional
+            )
+        except OrderNotFound:
+            return None
+        except Exception as exc:
+            logger.warning(f"Order recovery lookup failed for {symbol}: {exc}")
+            return None
 
     def _audit(
         self,

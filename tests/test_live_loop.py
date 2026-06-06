@@ -8,6 +8,26 @@ from src.live import loop as live_loop_module
 from src.live.loop import LiveTradingLoop
 
 
+@pytest.fixture(autouse=True)
+def isolate_live_loop_audit(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "audit_db_path",
+        str(tmp_path / "live-loop-audit.db"),
+    )
+
+
+def test_live_loop_uses_injected_audit_store(tmp_path):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "injected.db")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    assert bot.audit_store is audit
+    assert bot.order_mgr.audit_store is audit
+    assert bot.pos_mgr.audit_store is audit
+
+
 class NoopAlerter:
     pending_messages = 0
 
@@ -39,6 +59,14 @@ class NoopClient:
 
     async def close(self):
         return None
+
+
+class LifecycleAlerter(NoopAlerter):
+    def __init__(self):
+        self.shutdown_reasons = []
+
+    async def shutdown_alert(self, mode, environment, reason):
+        self.shutdown_reasons.append(reason)
 
 
 @pytest.mark.asyncio
@@ -94,11 +122,50 @@ async def test_trade_start_stops_after_initial_account_refresh_failure(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_graceful_shutdown_preserves_protected_positions(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.client = NoopClient()
+    bot.alerter = LifecycleAlerter()
+    bot.pos_mgr.open_trades["BTCUSDT"] = object()
+    closed = []
+
+    async def close_all():
+        closed.append(True)
+
+    monkeypatch.setattr(bot.pos_mgr, "close_all", close_all)
+
+    await bot.stop("cancelled")
+
+    assert closed == []
+    assert bot.pos_mgr.open_trades
+    events = bot.audit_store.load_recent_events(2)
+    assert any(
+        event["event_type"] == "positions_preserved_on_shutdown" for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_fatal_shutdown_flattens_positions(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.client = NoopClient()
+    bot.alerter = LifecycleAlerter()
+    closed = []
+
+    async def close_all():
+        closed.append(True)
+
+    monkeypatch.setattr(bot.pos_mgr, "close_all", close_all)
+
+    await bot.stop("fatal error")
+
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
 async def test_telegram_commands_update_durable_trading_controls(tmp_path):
     from src.audit import AuditStore
 
-    bot = LiveTradingLoop()
-    bot.audit_store = AuditStore(tmp_path / "telegram-controls.db")
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "telegram-controls.db"))
     bot.alerter = NoopAlerter()
 
     paused = await bot._handle_telegram_command("/pause", "maintenance", "42")
@@ -129,8 +196,7 @@ async def test_telegram_commands_update_durable_trading_controls(tmp_path):
 async def test_telegram_status_and_help_commands(tmp_path):
     from src.audit import AuditStore
 
-    bot = LiveTradingLoop()
-    bot.audit_store = AuditStore(tmp_path / "telegram-status.db")
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "telegram-status.db"))
     bot.alerter = NoopAlerter()
 
     status = await bot._handle_telegram_command("/status", "", "42")
@@ -147,8 +213,7 @@ async def test_telegram_status_and_help_commands(tmp_path):
 async def test_telegram_command_replay_is_ignored(tmp_path):
     from src.audit import AuditStore
 
-    bot = LiveTradingLoop()
-    bot.audit_store = AuditStore(tmp_path / "telegram-replay.db")
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "telegram-replay.db"))
     bot.alerter = NoopAlerter()
 
     first = await bot._handle_telegram_command(
