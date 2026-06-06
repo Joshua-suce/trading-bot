@@ -51,6 +51,37 @@ def test_concurrent_health_checks_share_audit_database(tmp_path):
     assert statuses == ["ok", "ok"]
 
 
+def test_audit_store_retires_open_trades_from_removed_modes(tmp_path):
+    db_path = str(tmp_path / "legacy.db")
+    audit = AuditStore(db_path)
+    with audit._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO trades (
+                correlation_id, symbol, side, mode, status, entry_price,
+                quantity, opened_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-paper",
+                "BTCUSDT",
+                "long",
+                "paper",
+                "open",
+                100.0,
+                1.0,
+                audit._now(),
+                audit._now(),
+            ),
+        )
+
+    reloaded = AuditStore(db_path)
+
+    assert reloaded.load_open_trades() == []
+    events = reloaded.load_recent_events(1)
+    assert events[0]["event_type"] == "legacy_open_trades_retired"
+
+
 def test_dashboard_frames_read_audit_store(tmp_path):
     audit = AuditStore(str(tmp_path / "audit.db"))
     trade = TradeRecord(

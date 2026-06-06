@@ -19,6 +19,7 @@ class AuditStore:
         self.db_path = Path(db_path or settings.audit_db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        self._retire_legacy_open_trades()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
@@ -121,6 +122,29 @@ class AuditStore:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _retire_legacy_open_trades(self) -> None:
+        legacy_modes = ("paper", "live", "backtest")
+        now = self._now()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE trades
+                SET status='legacy_mode_retired',
+                    exit_reason='execution mode removed',
+                    updated_at=?
+                WHERE status='open' AND mode IN (?, ?, ?)
+                """,
+                (now, *legacy_modes),
+            )
+            retired = cursor.rowcount
+        if retired:
+            self.record_event(
+                "legacy_open_trades_retired",
+                f"Retired {retired} open trade records from removed modes",
+                severity="warning",
+                payload={"count": retired, "modes": legacy_modes},
+            )
 
     def record_event(
         self,

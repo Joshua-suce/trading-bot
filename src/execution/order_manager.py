@@ -2,6 +2,7 @@ import asyncio
 import uuid
 from typing import Optional
 
+from ccxt.base.errors import OrderNotFound
 from loguru import logger
 
 from src.audit import AuditStore
@@ -125,6 +126,16 @@ class OrderManager:
             self._audit(
                 "order_cancelled",
                 f"Cancelled order {order_id}",
+                symbol=symbol,
+                payload={"order_id": order_id, "conditional": conditional},
+            )
+        except OrderNotFound:
+            logger.info(
+                f"Order {order_id} for {symbol} was already closed or cancelled"
+            )
+            self._audit(
+                "order_already_closed",
+                f"Order {order_id} already absent",
                 symbol=symbol,
                 payload={"order_id": order_id, "conditional": conditional},
             )

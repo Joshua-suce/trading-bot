@@ -1,4 +1,5 @@
 import pytest
+from ccxt.base.errors import OrderNotFound
 
 from src.audit import AuditStore
 from src.execution.guards import PreparedOrder
@@ -38,6 +39,7 @@ class FlakyClient:
         self.cancel_failure = cancel_failure
         self.created_orders = []
         self.cancelled_orders = []
+        self.missing_cancel = False
         self.rest = FakeRest(fail_cancel_all=fail_cancel_all)
 
     async def create_order(self, symbol, order_type, side, amount, price, params):
@@ -58,6 +60,8 @@ class FlakyClient:
         return order
 
     async def cancel_order(self, order_id, symbol, params=None):
+        if self.missing_cancel:
+            raise OrderNotFound("unknown order")
         if self.cancel_failure:
             raise RuntimeError("cancel rejected")
         self.cancelled_orders.append((symbol, order_id))
@@ -155,3 +159,17 @@ async def test_cancel_paths_audit_success_and_failure(tmp_path):
         "order_cancel_failed",
     ]
     assert all(event["severity"] == "error" for event in failed_events)
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_is_idempotent_when_order_is_already_gone(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    client = FlakyClient()
+    client.missing_cancel = True
+    manager = OrderManager(client, audit_store=audit, guard=AllowGuard())
+
+    await manager.cancel_order("BTCUSDT", "closed-order", conditional=True)
+
+    event = audit.load_recent_events(1)[0]
+    assert event["event_type"] == "order_already_closed"
+    assert event["severity"] == "info"
