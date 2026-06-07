@@ -255,8 +255,11 @@ async def test_telegram_command_replay_is_ignored(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_trade_account_refresh_fails_after_three_attempts(monkeypatch):
+async def test_trade_account_refresh_degrades_without_stopping_after_three_attempts(
+    monkeypatch,
+):
     bot = LiveTradingLoop()
+    bot.alerter = NoopAlerter()
 
     async def fail_account(_client):
         raise RuntimeError("temporary demo account outage")
@@ -265,8 +268,38 @@ async def test_trade_account_refresh_fails_after_three_attempts(monkeypatch):
 
     await bot._refresh_account()
     await bot._refresh_account()
-    with pytest.raises(RuntimeError, match="failed repeatedly"):
-        await bot._refresh_account()
+    await bot._refresh_account()
+
+    assert bot._account_refresh_failures == 3
+    assert bot._account_degradation_alerted is True
+    event = bot.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "account_refresh_degraded"
+
+
+@pytest.mark.asyncio
+async def test_account_refresh_recovery_clears_degraded_state(monkeypatch):
+    bot = LiveTradingLoop()
+    bot._account_refresh_failures = 3
+    bot._account_degradation_alerted = True
+    account = AccountInfo(
+        total_equity=1234.0,
+        wallet_balance=1200.0,
+        available_balance=1000.0,
+        unrealized_pnl=34.0,
+        margin_ratio=0.1,
+    )
+
+    async def get_account(_client):
+        return account
+
+    monkeypatch.setattr(live_loop_module, "get_account_info", get_account)
+
+    await bot._refresh_account()
+
+    assert bot._account_refresh_failures == 0
+    assert bot._account_degradation_alerted is False
+    event = bot.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "account_refresh_recovered"
 
 
 @pytest.mark.asyncio
@@ -290,6 +323,47 @@ async def test_account_refresh_updates_portfolio(monkeypatch):
     assert bot._account_refresh_failures == 0
     assert bot.portfolio.account == account
     assert bot.audit_store.get_control("peak_equity") == "1234.0"
+
+
+@pytest.mark.asyncio
+async def test_account_refresh_if_due_is_throttled(monkeypatch):
+    bot = LiveTradingLoop()
+    calls = []
+
+    async def refresh(required=False):
+        calls.append(required)
+        bot._last_account_refresh_at = 100.0
+
+    monkeypatch.setattr(bot, "_refresh_account", refresh)
+    monkeypatch.setattr(live_loop_module.time, "monotonic", lambda: 100.0)
+
+    await bot._refresh_account_if_due()
+    await bot._refresh_account_if_due()
+
+    assert calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_failed_account_refresh_blocks_new_entries(tmp_path):
+    from src.audit import AuditStore
+
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "stale-account.db"))
+    bot._account_refresh_failures = 1
+    generated = []
+
+    class Aggregator:
+        def generate(self, _df):
+            generated.append(True)
+
+    bot.aggregator = Aggregator()
+    await bot._execute_trade(
+        {"symbol": "BTCUSDT", "timeframe": "5m", "close": 100.0},
+        df_ind=pd.DataFrame({"close": [100.0]}),
+    )
+
+    assert generated == []
+    event = bot.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "entry_blocked_account_stale"
 
 
 def test_live_loop_restores_persisted_peak_equity(tmp_path):

@@ -63,6 +63,11 @@ class LiveTradingLoop:
         self._last_processed_candles: dict[str, object] = {}
         self._next_scan_due: dict[str, float] = {}
         self._account_refresh_failures = 0
+        self._account_degradation_alerted = False
+        self._last_account_refresh_at = 0.0
+        self._account_refresh_interval_seconds = (
+            settings.account_refresh_interval_seconds
+        )
         self._last_reconciliation_at = 0.0
         self._reconciliation_interval_seconds = settings.reconciliation_interval_seconds
         self._stopped = False
@@ -119,9 +124,9 @@ class LiveTradingLoop:
             )
 
             while True:
-                await self._scan_due_timeframes_once()
-                await self._refresh_account()
+                await self._refresh_account_if_due()
                 await self._reconcile_if_due()
+                await self._scan_due_timeframes_once()
                 await asyncio.sleep(settings.scan_sleep_seconds)
         except asyncio.CancelledError:
             await self.stop("cancelled")
@@ -215,6 +220,7 @@ class LiveTradingLoop:
             await self.alerter.trade_failed_alert(self.mode, symbol, error)
 
     async def _refresh_account(self, required: bool = False):
+        self._last_account_refresh_at = time.monotonic()
         try:
             account = await get_account_info(self.client)
         except Exception as e:
@@ -224,13 +230,43 @@ class LiveTradingLoop:
                 self._account_refresh_failures,
                 self._describe_exception(e),
             )
-            if required or self._account_refresh_failures >= 3:
+            if required:
                 raise RuntimeError(
-                    "Account refresh failed repeatedly in trade mode"
+                    "Initial account refresh failed in trade mode"
                 ) from e
+            if (
+                self._account_refresh_failures >= 3
+                and not self._account_degradation_alerted
+            ):
+                reason = (
+                    "Account data unavailable after three scheduled refreshes; "
+                    "new entries remain paused"
+                )
+                self._account_degradation_alerted = True
+                self.audit_store.safe_record_event(
+                    "account_refresh_degraded",
+                    reason,
+                    severity="critical",
+                    mode=self.mode,
+                    payload={
+                        "consecutive_failures": self._account_refresh_failures,
+                        "error": self._describe_exception(e),
+                    },
+                )
+                await self.alerter.error_alert(reason)
             return
 
+        if self._account_degradation_alerted:
+            self.audit_store.safe_record_event(
+                "account_refresh_recovered",
+                "Account data refresh recovered",
+                mode=self.mode,
+                payload={
+                    "previous_consecutive_failures": self._account_refresh_failures
+                },
+            )
         self._account_refresh_failures = 0
+        self._account_degradation_alerted = False
         previous_peak = self.portfolio.peak_equity
         self.portfolio.update_account(account)
         if self.portfolio.peak_equity > previous_peak:
@@ -240,6 +276,12 @@ class LiveTradingLoop:
                 "highest observed account equity",
             )
         logger.debug(f"Account equity refreshed: {account.total_equity:.2f}")
+
+    async def _refresh_account_if_due(self) -> None:
+        elapsed = time.monotonic() - self._last_account_refresh_at
+        if elapsed < self._account_refresh_interval_seconds:
+            return
+        await self._refresh_account()
 
     def _restore_persisted_risk_state(self) -> None:
         self.portfolio.restore_risk_state(self.audit_store.load_closed_trades())
@@ -303,6 +345,25 @@ class LiveTradingLoop:
         logger.debug(
             f"Evaluating {symbol} {candle['timeframe']} at {candle['close']:.2f}"
         )
+
+        if self._account_refresh_failures:
+            reason = (
+                "account snapshot unavailable; new entries paused until "
+                "the next successful refresh"
+            )
+            logger.warning(f"Skipping {symbol} entry: {reason}")
+            self.audit_store.safe_record_event(
+                "entry_blocked_account_stale",
+                reason,
+                severity="warning",
+                symbol=symbol,
+                mode=self.mode,
+                payload={
+                    "timeframe": candle["timeframe"],
+                    "consecutive_failures": self._account_refresh_failures,
+                },
+            )
+            return
 
         # Check if already in position
         position_key = self.pos_mgr.position_key(symbol, candle["timeframe"])
