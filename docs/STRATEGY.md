@@ -160,7 +160,7 @@ take_profit = entry_price ± (ATR × 1.0 × 2.0)  # 2:1 risk-reward
 |---|---|---|
 | Max Drawdown | 15% | Block new trades |
 | Daily Loss | 5% of equity | Block new trades |
-| Consecutive Losses | 3 | Block new trades for four hours |
+| Consecutive Losses | 3 | Block new trades for 30 minutes |
 
 The consecutive-loss circuit breaker is restored from the audit database after
 a restart. It resets immediately after a profitable close or automatically

@@ -115,8 +115,8 @@ def test_consecutive_loss_circuit_breaker_is_configurable():
     assert cfg.risk_block_alert_cooldown_seconds == 600
 
 
-def test_default_consecutive_loss_cooldown_is_four_hours():
-    assert make_settings().consecutive_loss_cooldown_seconds == 14_400
+def test_default_consecutive_loss_cooldown_is_thirty_minutes():
+    assert make_settings().consecutive_loss_cooldown_seconds == 1_800
 
 
 def test_preflight_requires_credentials_for_trade_mode():
