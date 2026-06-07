@@ -1,4 +1,5 @@
 # Position manager — manages position lifecycle: entry, SL/TP placement, exit
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -41,6 +42,7 @@ class PositionManager:
         self.active_tps: dict[str, str] = {}
         self.trade_correlation_ids: dict[str, str] = {}
         self.last_symbol_exit_at: dict[str, datetime] = {}
+        self._last_policy_alert_at: dict[str, float] = {}
 
     # Enter a long position: check limits, size, place market order + SL/TP
     async def enter_long(
@@ -974,8 +976,14 @@ class PositionManager:
         can_trade, reason = self.portfolio.can_trade()
         if not can_trade:
             logger.warning(f"Cannot enter {symbol}: {reason}")
-            await self._notify_trade_failed(symbol, reason)
-            self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
+            if self._policy_alert_due(reason):
+                await self._notify_trade_failed(symbol, reason)
+                self._audit(
+                    "trade_blocked",
+                    reason,
+                    severity="warning",
+                    symbol=symbol,
+                )
             return True
 
         reason = self._reentry_cooldown_reason(symbol)
@@ -988,6 +996,18 @@ class PositionManager:
             severity="warning",
             symbol=symbol,
         )
+        return True
+
+    def _policy_alert_due(self, reason: str) -> bool:
+        category = reason.split(":", 1)[0].strip().lower()
+        now = time.monotonic()
+        last_alert = self._last_policy_alert_at.get(category)
+        if (
+            last_alert is not None
+            and now - last_alert < settings.risk_block_alert_cooldown_seconds
+        ):
+            return False
+        self._last_policy_alert_at[category] = now
         return True
 
     @staticmethod

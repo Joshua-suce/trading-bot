@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     daily_loss_limit: float = Field(default=0.05, gt=0, le=0.20)
     max_drawdown: float = Field(default=0.15, gt=0, le=0.50)
     risk_per_trade: float = Field(default=0.02, gt=0, le=0.05)
+    max_consecutive_losses: int = Field(default=3, ge=1, le=20)
+    consecutive_loss_cooldown_seconds: int = Field(default=21_600, ge=60, le=604_800)
+    risk_block_alert_cooldown_seconds: int = Field(default=900, ge=60, le=86_400)
 
     model_update_interval_hours: int = Field(default=24, ge=1, le=168)
     feature_lookback: int = Field(default=100, ge=20, le=5000)

@@ -200,6 +200,28 @@ async def test_reentry_cooldown_blocks_same_symbol(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_portfolio_risk_block_alert_is_deduplicated(monkeypatch, tmp_path):
+    from src.execution import position_manager as position_manager_module
+
+    monkeypatch.setattr(
+        position_manager_module.settings,
+        "risk_block_alert_cooldown_seconds",
+        900,
+    )
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+    manager.portfolio.consecutive_losses = manager.portfolio.max_consecutive_losses
+    manager.portfolio.last_loss_at = datetime.now(timezone.utc)
+
+    assert not await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert not await manager.enter_long("ETHUSDT", price=100.0, atr=2.0)
+
+    assert len(alerter.failed) == 1
+    events = manager.audit_store.load_recent_events(10)
+    assert sum(event["event_type"] == "trade_blocked" for event in events) == 1
+
+
+@pytest.mark.asyncio
 async def test_exit_uses_ticker_when_market_fill_has_null_prices(tmp_path):
     alerter = FakeAlerter()
     manager = build_manager(alerter, tmp_path)

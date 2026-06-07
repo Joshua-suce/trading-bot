@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from src.exchange.account import AccountInfo
 from src.risk import portfolio as portfolio_module
@@ -62,3 +62,26 @@ def test_restore_risk_state_preserves_daily_loss_and_loss_streak(monkeypatch):
     assert stats.total_pnl == -3.0
     assert portfolio.daily_pnl == -3.0
     assert portfolio.consecutive_losses == 2
+
+
+def test_consecutive_loss_breaker_recovers_after_cooldown():
+    portfolio = PortfolioManager()
+    portfolio.consecutive_losses = portfolio.max_consecutive_losses
+    portfolio.last_loss_at = datetime.now(timezone.utc) - timedelta(
+        seconds=portfolio.consecutive_loss_cooldown_seconds + 1
+    )
+
+    assert portfolio.can_trade() == (True, "ok")
+    assert portfolio.consecutive_losses == 0
+    assert portfolio.last_loss_at is None
+
+
+def test_consecutive_loss_breaker_reports_remaining_cooldown():
+    portfolio = PortfolioManager()
+    portfolio.consecutive_losses = portfolio.max_consecutive_losses
+    portfolio.last_loss_at = datetime.now(timezone.utc)
+
+    allowed, reason = portfolio.can_trade()
+
+    assert allowed is False
+    assert "automatic retry in" in reason

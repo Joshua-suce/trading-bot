@@ -44,7 +44,11 @@ class PortfolioManager:
         self.current_drawdown: float = 0.0
         self.daily_pnl: float = 0.0
         self.consecutive_losses: int = 0
-        self.max_consecutive_losses: int = 3
+        self.last_loss_at: Optional[datetime] = None
+        self.max_consecutive_losses: int = settings.max_consecutive_losses
+        self.consecutive_loss_cooldown_seconds: int = (
+            settings.consecutive_loss_cooldown_seconds
+        )
         self.daily_loss_limit: float = settings.daily_loss_limit
         self.max_drawdown: float = settings.max_drawdown
         self._daily_reset()
@@ -64,6 +68,7 @@ class PortfolioManager:
         today = self._today()
         stats = DailyStats(date=today)
         self.consecutive_losses = 0
+        self.last_loss_at = None
 
         for row in closed_trades:
             pnl = float(row.get("pnl") or 0)
@@ -80,6 +85,11 @@ class PortfolioManager:
             if float(row.get("pnl") or 0) > 0:
                 break
             self.consecutive_losses += 1
+            if self.last_loss_at is None and row.get("closed_at"):
+                parsed = datetime.fromisoformat(str(row["closed_at"]))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                self.last_loss_at = parsed
 
         self.daily_stats[today] = stats
         self.daily_pnl = stats.total_pnl
@@ -109,7 +119,16 @@ class PortfolioManager:
             return False, f"Daily loss limit reached: {stats.total_pnl:.2f}"
 
         if self.consecutive_losses >= self.max_consecutive_losses:
-            return False, f"Max consecutive losses: {self.consecutive_losses}"
+            remaining = self._loss_cooldown_remaining()
+            if remaining <= 0:
+                self.consecutive_losses = 0
+                self.last_loss_at = None
+            else:
+                return (
+                    False,
+                    f"Max consecutive losses: {self.consecutive_losses}; "
+                    f"automatic retry in {remaining:.0f}s",
+                )
 
         return True, "ok"
 
@@ -139,11 +158,22 @@ class PortfolioManager:
         if trade.pnl and trade.pnl > 0:
             stats.wins += 1
             self.consecutive_losses = 0
+            self.last_loss_at = None
         else:
             stats.losses += 1
             self.consecutive_losses += 1
+            self.last_loss_at = datetime.now(timezone.utc)
 
         logger.info(
             f"Trade closed: {trade.symbol} {trade.side} "
             f"PnL={trade.pnl:.2f} ({trade.pnl_pct:.2%}) reason={reason}"
         )
+
+    def _loss_cooldown_remaining(self) -> float:
+        if self.last_loss_at is None:
+            return float(self.consecutive_loss_cooldown_seconds)
+        last_loss_at = self.last_loss_at
+        if last_loss_at.tzinfo is None:
+            last_loss_at = last_loss_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last_loss_at).total_seconds()
+        return max(self.consecutive_loss_cooldown_seconds - elapsed, 0.0)

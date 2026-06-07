@@ -103,6 +103,18 @@ def test_reentry_cooldown_is_bounded():
         make_settings(reentry_cooldown_seconds=86_401)
 
 
+def test_consecutive_loss_circuit_breaker_is_configurable():
+    cfg = make_settings(
+        max_consecutive_losses=4,
+        consecutive_loss_cooldown_seconds=3600,
+        risk_block_alert_cooldown_seconds=600,
+    )
+
+    assert cfg.max_consecutive_losses == 4
+    assert cfg.consecutive_loss_cooldown_seconds == 3600
+    assert cfg.risk_block_alert_cooldown_seconds == 600
+
+
 def test_preflight_requires_credentials_for_trade_mode():
     cfg = make_settings(binance_api_key="", binance_api_secret="")
 
