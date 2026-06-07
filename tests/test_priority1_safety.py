@@ -61,11 +61,15 @@ class FakeClient:
         open_orders=None,
         conditional_orders=None,
         fetched_orders=None,
+        order_history=None,
+        conditional_history=None,
     ):
         self.positions = positions or []
         self.open_orders = open_orders or {}
         self.conditional_orders = conditional_orders or {}
         self.fetched_orders = fetched_orders or {}
+        self.order_history = order_history or {}
+        self.conditional_history = conditional_history or {}
 
     async def fetch_positions(self):
         return self.positions
@@ -77,6 +81,11 @@ class FakeClient:
 
     async def fetch_order(self, order_id, symbol, conditional=False):
         return self.fetched_orders[(order_id, conditional)]
+
+    async def fetch_orders(self, symbol, conditional=False, limit=50):
+        if conditional:
+            return self.conditional_history.get(symbol, [])
+        return self.order_history.get(symbol, [])
 
     async def fetch_ticker(self, symbol):
         return {"last": 100.0}
@@ -389,3 +398,65 @@ async def test_reconciliation_finalizes_take_profit_closed_position(tmp_path):
     assert manager.open_trades == {}
     assert audit.load_open_trades("trade") == []
     assert orders.market_orders == []
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_finds_finished_stop_in_order_history(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    opened_at = datetime.now()
+    trade = TradeRecord(
+        symbol="ETHUSDT",
+        side="long",
+        entry_price=1566.86,
+        quantity=0.063,
+        timestamp=opened_at,
+    )
+    audit.record_open_trade(
+        trade,
+        mode="trade",
+        correlation_id="corr-stop-history",
+        stop_loss=1564.28,
+        take_profit=1572.01,
+        stop_order_id="stop-finished",
+        take_profit_order_id="tp-expired",
+    )
+    exit_timestamp = int(opened_at.timestamp() * 1000) + 60_000
+    client = FakeClient(
+        positions=[],
+        fetched_orders={
+            ("tp-expired", False): {
+                "id": "tp-expired",
+                "status": "expired",
+            }
+        },
+        conditional_history={
+            "ETHUSDT": [
+                {
+                    "id": "stop-finished",
+                    "status": "closed",
+                    "triggerPrice": 1564.28,
+                }
+            ]
+        },
+        order_history={
+            "ETHUSDT": [
+                {
+                    "id": "generated-market-exit",
+                    "status": "closed",
+                    "side": "sell",
+                    "filled": 0.063,
+                    "average": 1563.86,
+                    "timestamp": exit_timestamp,
+                }
+            ]
+        },
+    )
+    manager = build_manager(tmp_path, FakeOrderManager(), client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is True
+    closed = audit.load_trades(1)[0]
+    assert closed["status"] == "closed"
+    assert closed["exit_reason"] == "stop_loss"
+    assert closed["exit_price"] == pytest.approx(1563.86)

@@ -179,6 +179,12 @@ class ExchangeClient:
         )
         return await self.rest.fetch_order("", symbol, params=params)
 
+    async def fetch_orders(
+        self, symbol: str, *, conditional: bool = False, limit: int = 50
+    ) -> List[dict]:
+        params = {"trigger": True} if conditional else {}
+        return await self.rest.fetch_orders(symbol, limit=limit, params=params)
+
     # Fetch current ticker (24hr stats) for a symbol
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self.rest.fetch_ticker(symbol)

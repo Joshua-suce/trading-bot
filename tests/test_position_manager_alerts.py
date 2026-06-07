@@ -89,6 +89,9 @@ class FakeClient:
     async def fetch_ticker(self, symbol):
         return {"last": 102.0}
 
+    async def fetch_orders(self, symbol, conditional=False, limit=50):
+        return []
+
 
 def build_manager(alerter, tmp_path, *, with_account=True):
     portfolio = PortfolioManager()

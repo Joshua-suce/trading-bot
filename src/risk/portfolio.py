@@ -92,6 +92,7 @@ class PortfolioManager:
 
     # Close a trade: compute PnL, update daily stats, log the result
     def close_trade(self, trade: TradeRecord, exit_price: float, reason: str = "tp_sl"):
+        self._daily_reset()
         trade.exit_price = exit_price
         trade.exit_reason = reason
         self.add_trade(trade)

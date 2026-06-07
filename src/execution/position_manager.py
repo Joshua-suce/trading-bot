@@ -738,25 +738,105 @@ class PositionManager:
         for reason, order_id, conditional in candidates:
             if not order_id:
                 continue
-            try:
-                order = await self.client.fetch_order(
-                    order_id, trade.symbol, conditional=conditional
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"Could not fetch {reason} order {order_id} "
-                    f"for {trade.symbol}: {exc}"
-                )
+            order = await self._resolved_order(
+                trade.symbol,
+                order_id,
+                reason=reason,
+                conditional=conditional,
+            )
+            if not self._order_is_filled(order):
                 continue
-            if str(order.get("status", "")).lower() not in {"closed", "filled"}:
-                continue
+            assert order is not None
+            execution_order = await self._latest_exit_order(trade)
+            if execution_order is not None:
+                execution_price = self._positive_order_price(execution_order)
+                if execution_price is not None:
+                    return execution_price, reason
             price = self._positive_order_price(order)
             if price is None:
                 price = await self._market_price(trade.symbol, trade.entry_price)
             return price, reason
+
+        execution_order = await self._latest_exit_order(trade)
+        if execution_order is not None:
+            price = self._positive_order_price(execution_order)
+            if price is not None:
+                return price, "exchange_close"
         return (
             await self._market_price(trade.symbol, trade.entry_price),
             "exchange_close",
+        )
+
+    async def _resolved_order(
+        self,
+        symbol: str,
+        order_id: str,
+        *,
+        reason: str,
+        conditional: bool,
+    ) -> dict | None:
+        try:
+            return await self.client.fetch_order(
+                order_id, symbol, conditional=conditional
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Could not fetch {reason} order {order_id} for {symbol}: {exc}"
+            )
+            return await self._historical_order(
+                symbol, order_id, conditional=conditional
+            )
+
+    @staticmethod
+    def _order_is_filled(order: dict | None) -> bool:
+        if order is None:
+            return False
+        return str(order.get("status", "")).lower() in {"closed", "filled"}
+
+    async def _historical_order(
+        self, symbol: str, order_id: str, *, conditional: bool
+    ) -> dict | None:
+        try:
+            orders = await self.client.fetch_orders(symbol, conditional=conditional)
+        except Exception as exc:
+            logger.warning(f"Could not fetch order history for {symbol}: {exc}")
+            return None
+        return next(
+            (order for order in orders if str(order.get("id", "")) == str(order_id)),
+            None,
+        )
+
+    async def _latest_exit_order(self, trade: TradeRecord) -> dict | None:
+        try:
+            orders = await self.client.fetch_orders(trade.symbol)
+        except Exception as exc:
+            logger.warning(f"Could not fetch exit history for {trade.symbol}: {exc}")
+            return None
+        expected_side = "sell" if trade.side == "long" else "buy"
+        opened_ms = int(trade.timestamp.timestamp() * 1000)
+        tolerance = await self._quantity_tolerance(trade.symbol)
+        candidates = []
+        for order in orders:
+            if str(order.get("status", "")).lower() not in {"closed", "filled"}:
+                continue
+            if str(order.get("side", "")).lower() != expected_side:
+                continue
+            timestamp = int(order.get("timestamp") or 0)
+            if timestamp and timestamp < opened_ms:
+                continue
+            filled = float(order.get("filled") or 0)
+            if filled <= 0:
+                continue
+            if abs(filled - trade.quantity) > tolerance:
+                continue
+            candidates.append(order)
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda order: int(
+                order.get("lastUpdateTimestamp") or order.get("timestamp") or 0
+            ),
         )
 
     async def _resolve_exit_price(
