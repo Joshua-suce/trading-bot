@@ -84,6 +84,12 @@ class SoakClient:
             index=index,
         )
 
+    async def fetch_ticker(self, symbol: str) -> dict:
+        return {"last": 110.45, "bid": 110.4, "ask": 110.5}
+
+    async def fetch_market(self, symbol: str) -> dict:
+        return {"precision": {"amount": 0.001}}
+
 
 class SoakOrderManager:
     def __init__(self) -> None:
@@ -179,6 +185,7 @@ class SoakRunner:
         soak_orders = SoakOrderManager()
         bot.order_mgr = cast(OrderManager, soak_orders)
         bot.pos_mgr.alerter = bot.alerter
+        bot.pos_mgr.client = bot.client
         bot.pos_mgr.orders = cast(OrderManager, soak_orders)
         bot.pos_mgr.mode = "soak"
         bot.portfolio.update_account(

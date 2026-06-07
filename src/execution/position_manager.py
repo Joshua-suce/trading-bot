@@ -61,7 +61,7 @@ class PositionManager:
             self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
             return False
 
-        if await self._entry_policy_blocks(symbol):
+        if await self._entry_preflight_blocks(symbol, "long", price):
             return False
 
         levels = self.sl_manager.calculate(price, "long", atr)
@@ -99,23 +99,16 @@ class PositionManager:
         order = await self.orders.market_order(symbol, "buy", pos_size.quantity)
         if order and order.get("filled", 0) > 0:
             correlation_id = self._new_correlation_id()
-            entry_price = self._order_price(order, price)
             filled_quantity = float(order["filled"])
-            adverse_slippage = self._adverse_fill_slippage_bps(
-                "long", price, entry_price
+            entry_price = await self._validated_entry_fill_price(
+                order,
+                symbol,
+                price,
+                "sell",
+                filled_quantity,
+                correlation_id,
             )
-            if adverse_slippage > settings.max_entry_slippage_bps:
-                reason = (
-                    f"entry fill slippage above limit: {adverse_slippage:.2f}bps "
-                    f"> {settings.max_entry_slippage_bps:.2f}bps"
-                )
-                await self._handle_unprotected_entry(
-                    symbol,
-                    "sell",
-                    filled_quantity,
-                    reason,
-                    correlation_id,
-                )
+            if entry_price is None:
                 return False
             levels = self.sl_manager.calculate(entry_price, "long", atr)
             trade = TradeRecord(
@@ -209,7 +202,7 @@ class PositionManager:
             self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
             return False
 
-        if await self._entry_policy_blocks(symbol):
+        if await self._entry_preflight_blocks(symbol, "short", price):
             return False
 
         levels = self.sl_manager.calculate(price, "short", atr)
@@ -247,23 +240,16 @@ class PositionManager:
         order = await self.orders.market_order(symbol, "sell", pos_size.quantity)
         if order and order.get("filled", 0) > 0:
             correlation_id = self._new_correlation_id()
-            entry_price = self._order_price(order, price)
             filled_quantity = float(order["filled"])
-            adverse_slippage = self._adverse_fill_slippage_bps(
-                "short", price, entry_price
+            entry_price = await self._validated_entry_fill_price(
+                order,
+                symbol,
+                price,
+                "buy",
+                filled_quantity,
+                correlation_id,
             )
-            if adverse_slippage > settings.max_entry_slippage_bps:
-                reason = (
-                    f"entry fill slippage above limit: {adverse_slippage:.2f}bps "
-                    f"> {settings.max_entry_slippage_bps:.2f}bps"
-                )
-                await self._handle_unprotected_entry(
-                    symbol,
-                    "buy",
-                    filled_quantity,
-                    reason,
-                    correlation_id,
-                )
+            if entry_price is None:
                 return False
             levels = self.sl_manager.calculate(entry_price, "short", atr)
             trade = TradeRecord(
@@ -692,10 +678,6 @@ class PositionManager:
         return str(uuid4())
 
     @staticmethod
-    def _order_price(order: dict, fallback: float) -> float:
-        return float(order.get("average") or order.get("price") or fallback)
-
-    @staticmethod
     def _position_size(position: dict) -> float:
         for key in ("contracts",):
             value = position.get(key)
@@ -935,6 +917,52 @@ class PositionManager:
             logger.warning(f"Could not resolve market price for {symbol}: {exc}")
         return fallback
 
+    async def _resolve_entry_fill_price(self, order: dict, symbol: str) -> float | None:
+        price = self._positive_order_price(order)
+        if price is not None:
+            return price
+        order_id = str(order.get("id") or "")
+        if not order_id:
+            return None
+        resolved = await self._resolved_order(
+            symbol,
+            order_id,
+            reason="entry",
+            conditional=False,
+        )
+        if resolved is None:
+            return None
+        return self._positive_order_price(resolved)
+
+    async def _validated_entry_fill_price(
+        self,
+        order: dict,
+        symbol: str,
+        signal_price: float,
+        exit_side: str,
+        filled_quantity: float,
+        correlation_id: str,
+    ) -> float | None:
+        entry_price = await self._resolve_entry_fill_price(order, symbol)
+        if entry_price is None:
+            reason = "entry fill price unavailable from exchange"
+        else:
+            fill_slippage = self._entry_fill_slippage_bps(signal_price, entry_price)
+            if fill_slippage <= settings.max_entry_slippage_bps:
+                return entry_price
+            reason = (
+                f"entry fill slippage above limit: {fill_slippage:.2f}bps "
+                f"> {settings.max_entry_slippage_bps:.2f}bps"
+            )
+        await self._handle_unprotected_entry(
+            symbol,
+            exit_side,
+            filled_quantity,
+            reason,
+            correlation_id,
+        )
+        return None
+
     @staticmethod
     def _positive_order_price(order: dict) -> float | None:
         info = order.get("info") or {}
@@ -998,6 +1026,19 @@ class PositionManager:
         )
         return True
 
+    async def _entry_preflight_blocks(
+        self, symbol: str, side: str, signal_price: float
+    ) -> bool:
+        if await self._entry_policy_blocks(symbol):
+            return True
+        price_drift_reason = await self._entry_price_drift_reason(
+            symbol, side, signal_price
+        )
+        if not price_drift_reason:
+            return False
+        await self._block_stale_entry(symbol, price_drift_reason)
+        return True
+
     def _policy_alert_due(self, reason: str) -> bool:
         category = reason.split(":", 1)[0].strip().lower()
         now = time.monotonic()
@@ -1010,18 +1051,58 @@ class PositionManager:
         self._last_policy_alert_at[category] = now
         return True
 
+    async def _entry_price_drift_reason(
+        self, symbol: str, side: str, signal_price: float
+    ) -> str:
+        if signal_price <= 0:
+            return "entry signal price is invalid"
+        try:
+            ticker = await self.client.fetch_ticker(symbol)
+        except Exception as exc:
+            return redact_text(f"entry quote unavailable: {exc}")
+        quote_keys = (
+            ("ask", "last", "mark")
+            if side == "long"
+            else (
+                "bid",
+                "last",
+                "mark",
+            )
+        )
+        executable_price = next(
+            (
+                float(ticker[key])
+                for key in quote_keys
+                if ticker.get(key) is not None and float(ticker[key]) > 0
+            ),
+            None,
+        )
+        if executable_price is None:
+            return "entry quote unavailable: no positive executable price"
+        drift_bps = self._entry_fill_slippage_bps(signal_price, executable_price)
+        if drift_bps <= settings.max_entry_slippage_bps:
+            return ""
+        return (
+            f"signal price drift above limit: {drift_bps:.2f}bps "
+            f"> {settings.max_entry_slippage_bps:.2f}bps "
+            f"(signal={signal_price:.8f}, quote={executable_price:.8f})"
+        )
+
+    async def _block_stale_entry(self, symbol: str, reason: str) -> None:
+        logger.warning(f"Order blocked for {symbol}: {reason}")
+        self._audit(
+            "trade_blocked_price_drift",
+            reason,
+            severity="warning",
+            symbol=symbol,
+        )
+        await self._notify_trade_failed(symbol, reason)
+
     @staticmethod
-    def _adverse_fill_slippage_bps(
-        side: str, reference_price: float, fill_price: float
-    ) -> float:
+    def _entry_fill_slippage_bps(reference_price: float, fill_price: float) -> float:
         if reference_price <= 0 or fill_price <= 0:
             return float("inf")
-        adverse_move = (
-            fill_price - reference_price
-            if side == "long"
-            else reference_price - fill_price
-        )
-        return max(adverse_move, 0.0) / reference_price * 10_000
+        return abs(fill_price - reference_price) / reference_price * 10_000
 
     async def _handle_unprotected_entry(
         self,
@@ -1031,6 +1112,9 @@ class PositionManager:
         reason: str,
         correlation_id: str,
     ) -> None:
+        self.last_symbol_exit_at[self._normalize_symbol(symbol)] = datetime.now(
+            timezone.utc
+        )
         logger.critical(f"{reason}; attempting emergency flatten for {symbol}")
         self._audit(
             "unprotected_entry",

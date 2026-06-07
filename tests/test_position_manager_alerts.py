@@ -93,7 +93,10 @@ class FakeClient:
         return []
 
     async def fetch_ticker(self, symbol):
-        return {"last": 102.0}
+        return {"last": 100.0, "bid": 100.0, "ask": 100.0}
+
+    async def fetch_order(self, order_id, symbol, conditional=False):
+        raise LookupError(order_id)
 
     async def fetch_orders(self, symbol, conditional=False, limit=50):
         return []
@@ -145,14 +148,14 @@ async def test_protective_levels_are_recalculated_from_actual_fill(tmp_path):
     manager = build_manager(alerter, tmp_path)
 
     async def favorable_short_fill(symbol, side, quantity, reduce_only=False):
-        return {"id": "market-fill", "filled": quantity, "average": 101.0}
+        return {"id": "market-fill", "filled": quantity, "average": 100.2}
 
     manager.orders.market_order = favorable_short_fill
 
     assert await manager.enter_short("ETHUSDT", price=100.0, atr=2.0)
-    assert manager.open_trades["ETHUSDT"].entry_price == 101.0
-    assert manager.orders.stop_prices == [103.0]
-    assert manager.orders.target_prices == [97.0]
+    assert manager.open_trades["ETHUSDT"].entry_price == 100.2
+    assert manager.orders.stop_prices == [102.2]
+    assert manager.orders.target_prices == [96.2]
 
 
 @pytest.mark.asyncio
@@ -181,6 +184,77 @@ async def test_adverse_fill_slippage_is_immediately_flattened(monkeypatch, tmp_p
     assert manager.open_trades == {}
     assert manager.orders.protective_quantities == []
     assert "slippage above limit" in alerter.failed[-1]["reason"]
+    assert manager._reentry_cooldown_reason("BTCUSDT")
+
+
+@pytest.mark.asyncio
+async def test_signal_price_drift_blocks_before_market_order(monkeypatch, tmp_path):
+    from src.execution import position_manager as position_manager_module
+
+    monkeypatch.setattr(
+        position_manager_module.settings, "max_entry_slippage_bps", 25.0
+    )
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    async def stale_quote(symbol):
+        return {"last": 101.0, "bid": 101.0, "ask": 101.0}
+
+    manager.client.fetch_ticker = stale_quote
+
+    assert not await manager.enter_short("BTCUSDT", price=100.0, atr=2.0)
+    assert manager.orders.counter == 0
+    event = manager.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "trade_blocked_price_drift"
+    assert "signal price drift above limit" in alerter.failed[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_price_is_refetched_before_protection(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    async def fill_without_price(symbol, side, quantity, reduce_only=False):
+        return {
+            "id": "market-fill",
+            "filled": quantity,
+            "average": None,
+            "price": None,
+        }
+
+    async def resolved_fill(order_id, symbol, conditional=False):
+        return {"id": order_id, "filled": 1.0, "average": 100.2}
+
+    manager.orders.market_order = fill_without_price
+    manager.client.fetch_order = resolved_fill
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert manager.open_trades["BTCUSDT"].entry_price == 100.2
+    assert manager.orders.stop_prices == [98.2]
+    assert manager.orders.target_prices == [104.2]
+
+
+@pytest.mark.asyncio
+async def test_missing_entry_fill_price_is_immediately_flattened(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+    calls = []
+
+    async def fill_without_price(symbol, side, quantity, reduce_only=False):
+        calls.append((side, reduce_only))
+        return {
+            "id": "market-fill",
+            "filled": quantity,
+            "average": 100.0 if reduce_only else None,
+            "price": None,
+        }
+
+    manager.orders.market_order = fill_without_price
+
+    assert not await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert calls == [("buy", False), ("sell", True)]
+    assert manager.orders.protective_quantities == []
+    assert "fill price unavailable" in alerter.failed[-1]["reason"]
 
 
 @pytest.mark.asyncio
@@ -227,7 +301,11 @@ async def test_exit_uses_ticker_when_market_fill_has_null_prices(tmp_path):
     manager = build_manager(alerter, tmp_path)
     manager.orders.null_exit_price = True
 
+    async def exit_quote(symbol):
+        return {"last": 102.0}
+
     assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    manager.client.fetch_ticker = exit_quote
     await manager.exit_position("BTCUSDT", reason="emergency")
 
     assert alerter.completed[0]["exit_price"] == 102.0
