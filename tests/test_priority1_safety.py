@@ -94,6 +94,11 @@ class FakeClient:
         return {"precision": {"amount": 0.001}}
 
 
+class UnavailablePositionClient(FakeClient):
+    async def fetch_positions(self):
+        raise RuntimeError("positionRisk?timestamp=1&signature=" + ("a" * 64))
+
+
 class FakeAlerter:
     def __init__(self):
         self.failed = []
@@ -197,6 +202,23 @@ async def test_reconciliation_blocks_unmanaged_exchange_position(tmp_path):
     assert allowed is False
     assert "emergency stop" in reason
     assert manager.alerter.errors
+
+
+@pytest.mark.asyncio
+async def test_unavailable_reconciliation_does_not_activate_emergency_stop(tmp_path):
+    manager = build_manager(
+        tmp_path,
+        FakeOrderManager(),
+        client=UnavailablePositionClient(),
+    )
+
+    reconciled = await manager.reconcile_exchange_state()
+
+    assert reconciled is None
+    assert manager.audit_store.trading_allowed() == (True, "ok")
+    event = manager.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "reconciliation_unavailable"
+    assert "a" * 64 not in event["message"]
 
 
 def test_audit_store_persists_trade_events(tmp_path):

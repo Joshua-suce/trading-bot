@@ -19,6 +19,19 @@ def test_redact_text_hides_tokens_and_urls():
     assert "***" in redacted
 
 
+def test_redact_text_hides_binance_request_signature():
+    signature = "a" * 64
+    text = (
+        "https://demo-fapi.binance.com/fapi/v3/positionRisk?"
+        f"timestamp=1&signature={signature}"
+    )
+
+    redacted = redact_text(text)
+
+    assert signature not in redacted
+    assert "signature=<redacted>" in redacted
+
+
 def test_redact_mapping_hides_sensitive_keys():
     token = "123456:" + ("ABCdef" * 5)
     payload = {
@@ -63,3 +76,33 @@ def test_secret_scan_detects_hardcoded_secret(tmp_path):
 
     assert findings
     assert "hardcoded-secret" in findings[0]
+
+
+def test_audit_store_redacts_legacy_signed_urls_on_open(tmp_path):
+    from src.audit import AuditStore
+
+    db_path = tmp_path / "legacy-signature.db"
+    audit = AuditStore(str(db_path))
+    signature = "b" * 64
+    with audit._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO audit_events (
+                id, ts_utc, event_type, severity, message, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-signed-event",
+                audit._now(),
+                "legacy",
+                "error",
+                f"request failed?signature={signature}",
+                f'{{"error": "request failed?signature={signature}"}}',
+            ),
+        )
+
+    reloaded = AuditStore(str(db_path))
+    event = reloaded.load_recent_events(1)[0]
+
+    assert signature not in event["message"]
+    assert signature not in event["payload"]["error"]

@@ -1,16 +1,19 @@
 # Async ccxt exchange client — wraps Binance Futures REST + WebSocket APIs
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from typing import List, Optional
+from typing import List, Optional, TypeVar
 
 import aiohttp
 import ccxt.async_support as ccxt
 import ccxt.pro as ccxt_pro
 import pandas as pd
-from ccxt.base.errors import AuthenticationError, NetworkError
+from ccxt.base.errors import AuthenticationError, InvalidNonce, NetworkError
 from loguru import logger
 
 from src.config import settings
+
+T = TypeVar("T")
 
 
 class ExchangeClient:
@@ -119,6 +122,49 @@ class ExchangeClient:
             with suppress(Exception):
                 await resource.close()
 
+    async def _read_with_retries(
+        self, operation: Callable[[], Awaitable[T]], label: str
+    ) -> T:
+        attempts = settings.exchange_read_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except InvalidNonce as exc:
+                if attempt == attempts:
+                    raise
+                await self._resync_time()
+                await self._read_retry_delay(label, exc, attempt, attempts)
+            except NetworkError as exc:
+                if attempt == attempts:
+                    raise
+                await self._read_retry_delay(label, exc, attempt, attempts)
+        raise RuntimeError(f"Unreachable retry state for {label}")
+
+    async def _resync_time(self) -> None:
+        try:
+            await self.rest.load_time_difference()
+            logger.warning("Resynchronized Binance server time after InvalidNonce")
+        except Exception as exc:
+            logger.warning(
+                "Binance time resynchronization failed: {}",
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    async def _read_retry_delay(
+        label: str, exc: Exception, attempt: int, attempts: int
+    ) -> None:
+        delay = settings.exchange_read_backoff_seconds * attempt
+        logger.warning(
+            "{} failed attempt {}/{}: {}. Retrying in {:.1f}s",
+            label,
+            attempt,
+            attempts,
+            type(exc).__name__,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
     # Lazy-accessor for the REST client (raises if not connected)
     @property
     def rest(self) -> ccxt.Exchange:
@@ -141,7 +187,10 @@ class ExchangeClient:
     async def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1h", limit: int = 500
     ) -> pd.DataFrame:
-        raw = await self.rest.fetch_ohlcv(symbol, timeframe, limit=limit)
+        raw = await self._read_with_retries(
+            lambda: self.rest.fetch_ohlcv(symbol, timeframe, limit=limit),
+            f"OHLCV {symbol} {timeframe}",
+        )
         df = pd.DataFrame(
             raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
@@ -151,16 +200,24 @@ class ExchangeClient:
 
     # Fetch wallet balance (all currencies)
     async def fetch_balance(self) -> dict:
-        return await self.rest.fetch_balance()
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_balance(), "account balance"
+        )
 
     # Fetch open positions, optionally filtered by symbol
     async def fetch_positions(self, symbol: Optional[str] = None) -> List[dict]:
-        positions = await self.rest.fetch_positions([symbol] if symbol else [])
+        positions = await self._read_with_retries(
+            lambda: self.rest.fetch_positions([symbol] if symbol else []),
+            "positions",
+        )
         return positions
 
     # Set leverage for a specific symbol
     async def set_leverage(self, symbol: str, leverage: int):
-        await self.rest.set_leverage(leverage, symbol)
+        await self._read_with_retries(
+            lambda: self.rest.set_leverage(leverage, symbol),
+            f"set leverage {symbol}",
+        )
 
     # Generic order-creation wrapper
     async def create_order(
@@ -172,30 +229,46 @@ class ExchangeClient:
         price: Optional[float] = None,
         params: Optional[dict] = None,
     ) -> dict:
-        return await self.rest.create_order(
-            symbol, order_type, side, amount, price, params or {}
-        )
+        try:
+            return await self.rest.create_order(
+                symbol, order_type, side, amount, price, params or {}
+            )
+        except InvalidNonce:
+            await self._resync_time()
+            raise
 
     # Cancel a specific order by ID
     async def cancel_order(self, id: str, symbol: str, params: Optional[dict] = None):
-        return await self.rest.cancel_order(id, symbol, params or {})
+        return await self._read_with_retries(
+            lambda: self.rest.cancel_order(id, symbol, params or {}),
+            f"cancel order {symbol}",
+        )
 
     async def cancel_all_orders(self, symbol: str, *, conditional: bool = False):
         params = {"trigger": True} if conditional else {}
-        return await self.rest.cancel_all_orders(symbol, params=params)
+        return await self._read_with_retries(
+            lambda: self.rest.cancel_all_orders(symbol, params=params),
+            f"cancel all orders {symbol}",
+        )
 
     # List all open orders, optionally for one symbol
     async def fetch_open_orders(
         self, symbol: Optional[str] = None, *, conditional: bool = False
     ) -> List[dict]:
         params = {"trigger": True} if conditional else {}
-        return await self.rest.fetch_open_orders(symbol, params=params)
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_open_orders(symbol, params=params),
+            f"open orders {symbol or 'all'}",
+        )
 
     async def fetch_order(
         self, order_id: str, symbol: str, *, conditional: bool = False
     ) -> dict:
         params = {"trigger": True} if conditional else {}
-        return await self.rest.fetch_order(order_id, symbol, params=params)
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_order(order_id, symbol, params=params),
+            f"order {symbol}",
+        )
 
     async def fetch_order_by_client_id(
         self, client_order_id: str, symbol: str, *, conditional: bool = False
@@ -205,21 +278,31 @@ class ExchangeClient:
             if conditional
             else {"origClientOrderId": client_order_id}
         )
-        return await self.rest.fetch_order("", symbol, params=params)
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_order("", symbol, params=params),
+            f"order by client ID {symbol}",
+        )
 
     async def fetch_orders(
         self, symbol: str, *, conditional: bool = False, limit: int = 50
     ) -> List[dict]:
         params = {"trigger": True} if conditional else {}
-        return await self.rest.fetch_orders(symbol, limit=limit, params=params)
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_orders(symbol, limit=limit, params=params),
+            f"order history {symbol}",
+        )
 
     # Fetch current ticker (24hr stats) for a symbol
     async def fetch_ticker(self, symbol: str) -> dict:
-        return await self.rest.fetch_ticker(symbol)
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_ticker(symbol), f"ticker {symbol}"
+        )
 
     # Load all markets and return the market info for one symbol
     async def fetch_market(self, symbol: str) -> dict:
-        markets = await self.rest.load_markets()
+        markets = await self._read_with_retries(
+            lambda: self.rest.load_markets(), "market metadata"
+        )
         if symbol in markets:
             return markets[symbol]
 

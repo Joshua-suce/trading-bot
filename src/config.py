@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     exchange_request_timeout_ms: int = Field(default=30_000, ge=5_000, le=120_000)
     exchange_connect_attempts: int = Field(default=3, ge=1, le=10)
     exchange_connect_backoff_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
+    exchange_read_attempts: int = Field(default=3, ge=1, le=10)
+    exchange_read_backoff_seconds: float = Field(default=1.0, ge=0.1, le=30.0)
 
     symbols: str = "BTCUSDT,ETHUSDT"
     timeframes: str = "5m,15m,30m,1h,4h,1d"

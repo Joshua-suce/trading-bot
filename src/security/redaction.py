@@ -15,6 +15,10 @@ SENSITIVE_KEYWORDS = (
 )
 
 SECRET_PATTERNS = (
+    (
+        re.compile(r"((?:[?&])?signature=)[A-Za-z0-9_-]+", re.IGNORECASE),
+        r"\1<redacted>",
+    ),
     (re.compile(r"(https://api\.telegram\.org/bot)[^/\s]+", re.IGNORECASE), r"\1***"),
     (re.compile(r"bot[0-9]{6,}:[A-Za-z0-9_-]{20,}", re.IGNORECASE), "bot***"),
     (

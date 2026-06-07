@@ -122,6 +122,32 @@ async def test_trade_start_stops_after_initial_account_refresh_failure(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_startup_reconciliation_unavailable_preserves_positions(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.client = NoopClient()
+    bot.alerter = NoopAlerter()
+    stopped = []
+
+    async def refresh_account(required=False):
+        return None
+
+    async def reconcile():
+        return None
+
+    async def stop(reason, close_positions=None):
+        stopped.append((reason, close_positions))
+
+    monkeypatch.setattr(bot, "_refresh_account", refresh_account)
+    monkeypatch.setattr(bot.pos_mgr, "restore_open_trades_from_audit", lambda: 1)
+    monkeypatch.setattr(bot.pos_mgr, "reconcile_exchange_state", reconcile)
+    monkeypatch.setattr(bot, "stop", stop)
+
+    await bot.start()
+
+    assert stopped == [("startup reconciliation unavailable", False)]
+
+
+@pytest.mark.asyncio
 async def test_graceful_shutdown_preserves_protected_positions(monkeypatch):
     bot = LiveTradingLoop()
     bot.client = NoopClient()

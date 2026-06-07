@@ -21,7 +21,7 @@ class AccountInfo:
 
 # Fetch and parse account info from the Binance REST API
 async def get_account_info(client: ExchangeClient) -> AccountInfo:
-    balance = await client.rest.fetch_balance()
+    balance = await client.fetch_balance()
     info = balance["info"]
     return AccountInfo(
         total_equity=float(info.get("totalWalletBalance", 0))

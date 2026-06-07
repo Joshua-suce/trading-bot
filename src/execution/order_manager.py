@@ -8,6 +8,7 @@ from loguru import logger
 from src.audit import AuditStore
 from src.exchange.client import ExchangeClient
 from src.execution.guards import ExecutionGuard
+from src.security import redact_text
 
 
 class OrderManager:
@@ -107,13 +108,14 @@ class OrderManager:
                 )
             except Exception as e:
                 order_class = "conditional" if conditional else "standard"
-                logger.error(f"Cancel all {order_class} orders failed: {e}")
+                error = redact_text(e)
+                logger.error(f"Cancel all {order_class} orders failed: {error}")
                 self._audit(
                     "order_cancel_failed",
                     f"Cancel all {order_class} orders failed",
                     severity="error",
                     symbol=symbol,
-                    payload={"conditional": conditional, "error": str(e)},
+                    payload={"conditional": conditional, "error": error},
                 )
 
     async def cancel_order(
@@ -140,7 +142,8 @@ class OrderManager:
                 payload={"order_id": order_id, "conditional": conditional},
             )
         except Exception as e:
-            logger.error(f"Cancel order failed: {e}")
+            error = redact_text(e)
+            logger.error(f"Cancel order failed: {error}")
             self._audit(
                 "order_cancel_failed",
                 "Cancel order failed",
@@ -149,7 +152,7 @@ class OrderManager:
                 payload={
                     "order_id": order_id,
                     "conditional": conditional,
-                    "error": str(e),
+                    "error": error,
                 },
             )
 
@@ -242,7 +245,7 @@ class OrderManager:
                 )
                 return order
             except Exception as e:
-                last_error = str(e)
+                last_error = redact_text(e)
                 logger.warning(
                     f"{order_type} {side} {symbol} failed "
                     f"attempt {attempt}/{attempts}: {last_error}"
@@ -310,7 +313,11 @@ class OrderManager:
         except OrderNotFound:
             return None
         except Exception as exc:
-            logger.warning(f"Order recovery lookup failed for {symbol}: {exc}")
+            logger.warning(
+                "Order recovery lookup failed for {}: {}",
+                symbol,
+                redact_text(exc),
+            )
             return None
 
     def _audit(

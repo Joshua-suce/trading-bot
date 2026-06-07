@@ -20,6 +20,7 @@ class AuditStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
         self._retire_legacy_open_trades()
+        self._redact_legacy_signed_urls()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
@@ -145,6 +146,38 @@ class AuditStore:
                 severity="warning",
                 payload={"count": retired, "modes": legacy_modes},
             )
+
+    def _redact_legacy_signed_urls(self) -> None:
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT id, message, payload_json
+                FROM audit_events
+                WHERE message LIKE '%signature=%'
+                   OR payload_json LIKE '%signature=%'
+                """).fetchall()
+            for row in rows:
+                message = redact_text(row["message"])
+                raw_payload = str(row["payload_json"] or "{}")
+                try:
+                    payload = json.loads(raw_payload)
+                    payload_json = json.dumps(
+                        redact_mapping(payload),
+                        sort_keys=True,
+                        default=str,
+                    )
+                except json.JSONDecodeError:
+                    payload_json = json.dumps(
+                        {"legacy_payload": redact_text(raw_payload)},
+                        sort_keys=True,
+                    )
+                conn.execute(
+                    """
+                    UPDATE audit_events
+                    SET message=?, payload_json=?
+                    WHERE id=?
+                    """,
+                    (message, payload_json, row["id"]),
+                )
 
     def record_event(
         self,

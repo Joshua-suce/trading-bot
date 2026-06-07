@@ -1,7 +1,6 @@
 # Unified trading loop for Binance Demo Trading and mainnet.
 import asyncio
 import html
-import re
 import time
 from typing import Optional
 
@@ -19,6 +18,7 @@ from src.monitoring.alerter import Alerter
 from src.risk.portfolio import PortfolioManager
 from src.risk.position_sizer import PositionSizer
 from src.risk.stop_loss import StopLossManager
+from src.security import redact_text
 from src.signals.aggregator import SignalAggregator
 
 
@@ -97,7 +97,13 @@ class LiveTradingLoop:
                 )
             self.pos_mgr.restore_open_trades_from_audit()
             reconciled = await self.pos_mgr.reconcile_exchange_state()
-            if not reconciled:
+            if reconciled is None:
+                await self.stop(
+                    "startup reconciliation unavailable",
+                    close_positions=False,
+                )
+                return
+            if reconciled is False:
                 raise RuntimeError(
                     "Startup reconciliation failed; emergency stop activated"
                 )
@@ -204,8 +210,9 @@ class LiveTradingLoop:
             }
             await self._on_candle(candle, df_ind=df_ind)
         except Exception as e:
-            logger.error(f"Timeframe scan error for {symbol} {timeframe}: {e}")
-            await self.alerter.trade_failed_alert(self.mode, symbol, str(e))
+            error = self._describe_exception(e)
+            logger.error(f"Timeframe scan error for {symbol} {timeframe}: {error}")
+            await self.alerter.trade_failed_alert(self.mode, symbol, error)
 
     async def _refresh_account(self, required: bool = False):
         try:
@@ -257,11 +264,7 @@ class LiveTradingLoop:
 
     @staticmethod
     def _redact_sensitive_url_parts(message: str) -> str:
-        return re.sub(
-            r"((?:[?&])?signature=)[^&\s]+",
-            r"\1<redacted>",
-            message,
-        )
+        return redact_text(message)
 
     async def _reconcile_if_due(self):
         elapsed = time.monotonic() - self._last_reconciliation_at
@@ -269,7 +272,13 @@ class LiveTradingLoop:
             return
         reconciled = await self.pos_mgr.reconcile_exchange_state()
         self._last_reconciliation_at = time.monotonic()
-        if not reconciled:
+        if reconciled is None:
+            logger.warning(
+                "Runtime reconciliation was inconclusive; keeping protected "
+                "positions and retrying at the next interval"
+            )
+            return
+        if reconciled is False:
             raise RuntimeError("Runtime reconciliation failed; emergency stop active")
 
     @staticmethod

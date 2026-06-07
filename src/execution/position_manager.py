@@ -12,6 +12,7 @@ from src.monitoring.alerter import Alerter
 from src.risk.portfolio import PortfolioManager, TradeRecord
 from src.risk.position_sizer import PositionSizer
 from src.risk.stop_loss import StopLossManager
+from src.security import redact_text
 
 
 class PositionManager:
@@ -372,10 +373,10 @@ class PositionManager:
         for symbol in list(self.open_trades.keys()):
             await self.exit_position(symbol, "close_all")
 
-    async def reconcile_exchange_state(self) -> bool:
+    async def reconcile_exchange_state(self) -> bool | None:
         positions = await self._fetch_positions_for_reconciliation()
         if positions is None:
-            return False
+            return None
 
         exchange_positions, unmanaged = self._classify_exchange_positions(positions)
         if unmanaged:
@@ -402,8 +403,15 @@ class PositionManager:
         try:
             return await self.client.fetch_positions()
         except Exception as exc:
-            reason = f"position reconciliation failed: {exc}"
-            await self._fail_reconciliation("reconciliation_failed", reason)
+            reason = redact_text(f"position reconciliation unavailable: {exc}")
+            logger.warning(reason)
+            self._audit(
+                "reconciliation_unavailable",
+                reason,
+                severity="warning",
+            )
+            if self.alerter:
+                await self.alerter.error_alert(reason)
             return None
 
     def _classify_exchange_positions(
@@ -500,7 +508,11 @@ class PositionManager:
             if isinstance(precision, int) and precision >= 0:
                 return 10 ** (-precision) / 2
         except Exception as exc:
-            logger.warning(f"Could not resolve quantity tolerance for {symbol}: {exc}")
+            logger.warning(
+                "Could not resolve quantity tolerance for {}: {}",
+                symbol,
+                redact_text(exc),
+            )
         return 1e-12
 
     async def _fail_reconciliation(
@@ -512,18 +524,19 @@ class PositionManager:
         correlation_id: str | None = None,
         payload: dict | None = None,
     ) -> None:
-        logger.critical(reason)
-        self.audit_store.activate_emergency_stop(reason)
+        safe_reason = redact_text(reason)
+        logger.critical(safe_reason)
+        self.audit_store.activate_emergency_stop(safe_reason)
         self._audit(
             event_type,
-            reason,
+            safe_reason,
             severity="critical",
             symbol=symbol,
             correlation_id=correlation_id,
             payload=payload,
         )
         if self.alerter:
-            await self.alerter.error_alert(reason)
+            await self.alerter.error_alert(safe_reason)
 
     def restore_open_trades_from_audit(self) -> int:
         restored = 0
