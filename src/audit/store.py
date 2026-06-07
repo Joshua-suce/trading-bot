@@ -348,6 +348,20 @@ class AuditStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def load_closed_trades(self, limit: int = 1000) -> list[dict[str, Any]]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM trades
+                WHERE status = 'closed'
+                ORDER BY closed_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def load_recent_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connection() as conn:
             rows = conn.execute(
@@ -369,6 +383,18 @@ class AuditStore:
                 event["payload"] = {}
             events.append(event)
         return events
+
+    def count_events_since(self, *, severity: str, since_utc: str) -> int:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS event_count
+                FROM audit_events
+                WHERE severity = ? AND ts_utc >= ?
+                """,
+                (severity, since_utc),
+            ).fetchone()
+        return int(row["event_count"]) if row else 0
 
     def mark_trade_status(
         self,

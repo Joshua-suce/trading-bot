@@ -129,21 +129,34 @@ class PositionManager:
                 )
                 return False
 
+            stop_order_id = sl_order.get("id", "")
+            take_profit_order_id = tp_order.get("id", "") if tp_order else None
+            try:
+                self.audit_store.record_open_trade(
+                    trade,
+                    mode=self.mode,
+                    correlation_id=correlation_id,
+                    stop_loss=levels.stop_loss,
+                    take_profit=levels.take_profit,
+                    stop_order_id=stop_order_id,
+                    take_profit_order_id=take_profit_order_id,
+                )
+            except Exception as exc:
+                await self._handle_unprotected_entry(
+                    symbol,
+                    "sell",
+                    filled_quantity,
+                    f"audit persistence failed after long entry: {exc}",
+                    correlation_id,
+                )
+                return False
+
             self.open_trades[position_key] = trade
             self.trade_correlation_ids[position_key] = correlation_id
-            self.active_stops[position_key] = sl_order.get("id", "")
-            if tp_order:
-                self.active_tps[position_key] = tp_order.get("id", "")
+            self.active_stops[position_key] = stop_order_id
+            if take_profit_order_id:
+                self.active_tps[position_key] = take_profit_order_id
             self.portfolio.add_trade(trade)
-            self.audit_store.record_open_trade(
-                trade,
-                mode=self.mode,
-                correlation_id=correlation_id,
-                stop_loss=levels.stop_loss,
-                take_profit=levels.take_profit,
-                stop_order_id=self.active_stops[position_key],
-                take_profit_order_id=self.active_tps.get(position_key),
-            )
 
             logger.info(
                 f"Entered LONG {symbol} qty={filled_quantity} price={entry_price} "
@@ -259,21 +272,34 @@ class PositionManager:
                 )
                 return False
 
+            stop_order_id = sl_order.get("id", "")
+            take_profit_order_id = tp_order.get("id", "") if tp_order else None
+            try:
+                self.audit_store.record_open_trade(
+                    trade,
+                    mode=self.mode,
+                    correlation_id=correlation_id,
+                    stop_loss=levels.stop_loss,
+                    take_profit=levels.take_profit,
+                    stop_order_id=stop_order_id,
+                    take_profit_order_id=take_profit_order_id,
+                )
+            except Exception as exc:
+                await self._handle_unprotected_entry(
+                    symbol,
+                    "buy",
+                    filled_quantity,
+                    f"audit persistence failed after short entry: {exc}",
+                    correlation_id,
+                )
+                return False
+
             self.open_trades[position_key] = trade
             self.trade_correlation_ids[position_key] = correlation_id
-            self.active_stops[position_key] = sl_order.get("id", "")
-            if tp_order:
-                self.active_tps[position_key] = tp_order.get("id", "")
+            self.active_stops[position_key] = stop_order_id
+            if take_profit_order_id:
+                self.active_tps[position_key] = take_profit_order_id
             self.portfolio.add_trade(trade)
-            self.audit_store.record_open_trade(
-                trade,
-                mode=self.mode,
-                correlation_id=correlation_id,
-                stop_loss=levels.stop_loss,
-                take_profit=levels.take_profit,
-                stop_order_id=self.active_stops[position_key],
-                take_profit_order_id=self.active_tps.get(position_key),
-            )
 
             logger.info(
                 f"Entered SHORT {symbol} qty={filled_quantity} price={entry_price} "
@@ -311,17 +337,19 @@ class PositionManager:
         order = await self.orders.market_order(
             symbol, exit_side, trade.quantity, reduce_only=True
         )
-        if order:
+        confirmed_order = await self._confirmed_full_fill(order, symbol, trade.quantity)
+        if confirmed_order:
             exit_price = await self._resolve_exit_price(
-                order, symbol, trade.entry_price
+                confirmed_order, symbol, trade.entry_price
             )
             self.portfolio.close_trade(trade, exit_price, reason)
-            del self.open_trades[position_key]
-            correlation_id = self.trade_correlation_ids.pop(position_key, "")
+            correlation_id = self.trade_correlation_ids.get(position_key, "")
             if correlation_id:
                 self.audit_store.record_closed_trade(
                     trade, mode=self.mode, correlation_id=correlation_id
                 )
+            del self.open_trades[position_key]
+            self.trade_correlation_ids.pop(position_key, None)
             await self._notify_trade_completed(trade, exit_price, reason)
             if position_key in self.active_stops:
                 await self.orders.cancel_order(
@@ -876,10 +904,7 @@ class PositionManager:
 
     @staticmethod
     def position_key(symbol: str, timeframe: str | None = None) -> str:
-        normalized_symbol = PositionManager._normalize_symbol(symbol)
-        if settings.position_scope == "symbol_timeframe" and timeframe:
-            return f"{normalized_symbol}:{timeframe}"
-        return normalized_symbol
+        return PositionManager._normalize_symbol(symbol)
 
     def _has_open_trade_for_symbol(self, symbol: str) -> bool:
         return any(trade.symbol == symbol for trade in self.open_trades.values())
@@ -905,14 +930,17 @@ class PositionManager:
         flatten_order = await self.orders.market_order(
             symbol, exit_side, quantity, reduce_only=True
         )
-        if flatten_order:
+        confirmed_order = await self._confirmed_full_fill(
+            flatten_order, symbol, quantity
+        )
+        if confirmed_order:
             self._audit(
                 "emergency_flattened",
                 f"Emergency flatten submitted for {symbol}",
                 severity="critical",
                 symbol=symbol,
                 correlation_id=correlation_id,
-                payload={"order": flatten_order},
+                payload={"order": confirmed_order},
             )
         else:
             self.audit_store.activate_emergency_stop(
@@ -926,6 +954,27 @@ class PositionManager:
                 correlation_id=correlation_id,
             )
         await self._notify_trade_failed(symbol, reason)
+
+    async def _confirmed_full_fill(
+        self, order: dict | None, symbol: str, expected_quantity: float
+    ) -> dict | None:
+        if not order:
+            return None
+        tolerance = await self._quantity_tolerance(symbol)
+        if float(order.get("filled") or 0) >= expected_quantity - tolerance:
+            return order
+
+        order_id = str(order.get("id") or "")
+        if not order_id:
+            return None
+        try:
+            refreshed = await self.client.fetch_order(order_id, symbol)
+        except Exception as exc:
+            logger.warning(f"Could not confirm exit fill for {symbol}: {exc}")
+            return None
+        if float(refreshed.get("filled") or 0) >= expected_quantity - tolerance:
+            return refreshed
+        return None
 
     def _audit(
         self,

@@ -143,7 +143,7 @@ direction = sign(combined / confidence) if |combined / confidence| > 0.15 else 0
 ### Position Sizing
 ```
 risk_amount        = equity * RISK_PER_TRADE (default 2%)
-sl_distance        = ATR * 1.5
+sl_distance        = ATR * 1.0
 base_quantity      = risk_amount / sl_distance
 max_quantity       = MAX_POSITION_SIZE * equity / entry_price
 quantity           = min(base_quantity, max_quantity)
@@ -151,13 +151,9 @@ quantity           = min(base_quantity, max_quantity)
 
 ### Stop Loss & Take Profit
 ```
-stop_loss   = entry_price ± (ATR × 1.5)
-take_profit = entry_price ± (ATR × 1.5 × 2.0)  # 2:1 risk-reward
+stop_loss   = entry_price ± (ATR × 1.0)
+take_profit = entry_price ± (ATR × 1.0 × 2.0)  # 2:1 risk-reward
 ```
-
-### Trailing Stop
-- Activates when price moves 1× ATR in profit direction
-- Updates stop on each candle to lock in profit
 
 ### Portfolio Guards
 | Guard | Threshold | Action |
@@ -171,7 +167,8 @@ take_profit = entry_price ± (ATR × 1.5 × 2.0)  # 2:1 risk-reward
 A trade is entered when all conditions are met:
 1. Final signal direction is non-zero
 2. Signal confidence ≥ 0.4
-3. No existing position on the symbol
+3. No existing position on the symbol; configured timeframes are scanned
+   sequentially, while exchange exposure is reconciled once per symbol
 4. Portfolio guards pass (drawdown, daily loss, consecutive losses)
 
 ## 6. Exit Criteria
@@ -179,5 +176,4 @@ A trade is entered when all conditions are met:
 A position is exited when any condition is met:
 1. **Stop loss hit** — Price reaches SL level
 2. **Take profit hit** — Price reaches TP level
-3. **Signal reversal** — Opposite signal with confidence > 0.4
-4. **Controlled shutdown** - Open exchange positions are closed and audited
+3. **Fatal shutdown** - Open exchange positions are closed and audited

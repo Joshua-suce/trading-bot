@@ -171,14 +171,28 @@ async def test_trade_failure_alert_when_sizing_rejects(tmp_path):
     assert alerter.failed[0]["symbol"] == "ETHUSDT"
 
 
-def test_position_key_respects_symbol_timeframe_scope(monkeypatch):
-    from src.execution import position_manager as position_manager_module
+def test_position_key_is_reconciled_per_symbol():
+    assert PositionManager.position_key("BTC/USDT:USDT", "5m") == "BTCUSDT"
 
-    monkeypatch.setattr(
-        position_manager_module.settings, "position_scope", "symbol_timeframe"
-    )
 
-    assert PositionManager.position_key("BTC/USDT:USDT", "5m") == "BTCUSDT:5m"
+@pytest.mark.asyncio
+async def test_exit_keeps_trade_open_when_fill_is_not_confirmed(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+
+    async def unfilled_exit(symbol, side, quantity, reduce_only=False):
+        return {"id": "unfilled-exit", "filled": 0.0, "status": "open"}
+
+    manager.orders.market_order = unfilled_exit
+    await manager.exit_position("BTCUSDT", reason="manual")
+
+    assert "BTCUSDT" in manager.open_trades
+    assert manager.active_stops["BTCUSDT"] == "stop-1"
+    assert manager.active_tps["BTCUSDT"] == "target-1"
+    assert alerter.completed == []
+    assert "exit order failed" in alerter.failed[-1]["reason"]
 
 
 @pytest.mark.asyncio

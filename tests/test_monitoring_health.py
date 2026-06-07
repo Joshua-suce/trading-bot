@@ -30,6 +30,18 @@ def test_health_check_reports_degraded_when_trading_paused(tmp_path):
     assert report.trading_allowed is False
 
 
+def test_health_counts_critical_events_beyond_recent_event_window(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    audit.record_event("incident", "critical incident", severity="critical")
+    for index in range(300):
+        audit.record_event("noise", f"debug event {index}", severity="debug")
+
+    report = HealthChecker(audit).check()
+
+    assert report.status == "degraded"
+    assert report.critical_events_24h == 1
+
+
 def test_concurrent_health_checks_share_audit_database(tmp_path):
     db_path = str(tmp_path / "audit.db")
     statuses = []

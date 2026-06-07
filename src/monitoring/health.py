@@ -1,6 +1,6 @@
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,8 +33,16 @@ class HealthChecker:
     def check(self) -> HealthReport:
         audit_ok = self._audit_db_writable()
         trading_allowed, reason = self.audit_store.trading_allowed()
-        events = self.audit_store.load_recent_events(250) if audit_ok else []
-        critical_events = self._critical_events_24h(events)
+        critical_events = (
+            self.audit_store.count_events_since(
+                severity="critical",
+                since_utc=(
+                    datetime.now(timezone.utc) - timedelta(hours=24)
+                ).isoformat(),
+            )
+            if audit_ok
+            else 0
+        )
         status = self._status(audit_ok, trading_allowed, critical_events)
 
         return HealthReport(
@@ -58,20 +66,6 @@ class HealthChecker:
             return True
         except Exception:
             return False
-
-    @staticmethod
-    def _critical_events_24h(events: list[dict[str, Any]]) -> int:
-        now = datetime.now(timezone.utc)
-        count = 0
-        for event in events:
-            if str(event.get("severity")) != "critical":
-                continue
-            ts = datetime.fromisoformat(str(event["ts_utc"]))
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            if (now - ts).total_seconds() <= 86_400:
-                count += 1
-        return count
 
     @staticmethod
     def _status(audit_ok: bool, trading_allowed: bool, critical_events_24h: int) -> str:

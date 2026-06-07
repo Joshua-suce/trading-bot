@@ -1,6 +1,6 @@
 # Portfolio manager — tracks account, trades, daily stats, and enforces risk limits
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from loguru import logger
@@ -51,10 +51,38 @@ class PortfolioManager:
 
     # Ensure today's DailyStats entry exists
     def _daily_reset(self) -> None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._today()
         if today not in self.daily_stats:
             self.daily_stats[today] = DailyStats(date=today)
             self.daily_pnl = 0.0
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def restore_risk_state(self, closed_trades: list[dict]) -> None:
+        today = self._today()
+        stats = DailyStats(date=today)
+        self.consecutive_losses = 0
+
+        for row in closed_trades:
+            pnl = float(row.get("pnl") or 0)
+            closed_at = str(row.get("closed_at") or "")
+            if closed_at.startswith(today):
+                stats.trades += 1
+                stats.total_pnl += pnl
+                if pnl > 0:
+                    stats.wins += 1
+                else:
+                    stats.losses += 1
+
+        for row in closed_trades:
+            if float(row.get("pnl") or 0) > 0:
+                break
+            self.consecutive_losses += 1
+
+        self.daily_stats[today] = stats
+        self.daily_pnl = stats.total_pnl
 
     # Update account info and recalculate peak equity / drawdown
     def update_account(self, account: AccountInfo) -> None:
@@ -69,7 +97,7 @@ class PortfolioManager:
     # Check whether new trades are allowed (drawdown, daily loss, consecutive losses)
     def can_trade(self) -> tuple[bool, str]:
         self._daily_reset()
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._today()
         stats = self.daily_stats[today]
 
         if self.account and self.current_drawdown >= self.max_drawdown:
@@ -104,7 +132,7 @@ class PortfolioManager:
             trade.pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
 
         self.daily_pnl += trade.pnl or 0
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._today()
         stats = self.daily_stats[today]
         stats.trades += 1
         stats.total_pnl += trade.pnl or 0

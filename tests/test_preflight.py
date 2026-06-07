@@ -63,9 +63,9 @@ def test_settings_reads_secret_files(tmp_path):
 
 
 def test_settings_validates_position_scope():
-    assert make_settings(position_scope="symbol_timeframe").position_scope == (
-        "symbol_timeframe"
-    )
+    assert make_settings(position_scope="symbol").position_scope == "symbol"
+    with pytest.raises(ValidationError):
+        make_settings(position_scope="symbol_timeframe")
     with pytest.raises(ValidationError):
         make_settings(position_scope="account")
 

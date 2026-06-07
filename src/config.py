@@ -178,8 +178,11 @@ class Settings(BaseSettings):
     @classmethod
     def validate_position_scope(cls, value: str) -> str:
         normalized = (value or "").strip().lower()
-        if normalized not in {"symbol", "symbol_timeframe"}:
-            raise ValueError("POSITION_SCOPE must be 'symbol' or 'symbol_timeframe'")
+        if normalized != "symbol":
+            raise ValueError(
+                "POSITION_SCOPE must be 'symbol'; Binance USD-M positions are "
+                "aggregated per symbol and cannot be reconciled safely per timeframe"
+            )
         return normalized
 
     @field_validator("log_level")

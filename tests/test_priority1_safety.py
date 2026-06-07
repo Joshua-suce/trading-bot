@@ -164,6 +164,27 @@ async def test_failed_emergency_flatten_activates_kill_switch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_audit_failure_after_entry_rolls_back_exchange_position(
+    tmp_path, monkeypatch
+):
+    orders = FakeOrderManager()
+    manager = build_manager(tmp_path, orders)
+
+    def fail_open_trade(*args, **kwargs):
+        raise sqlite3.OperationalError("disk unavailable")
+
+    monkeypatch.setattr(manager.audit_store, "record_open_trade", fail_open_trade)
+
+    opened = await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+
+    assert opened is False
+    assert manager.open_trades == {}
+    assert orders.cancelled_all == ["BTCUSDT"]
+    assert orders.market_orders[-1]["reduce_only"] is True
+    assert "audit persistence failed" in manager.alerter.failed[-1]["reason"]
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_blocks_unmanaged_exchange_position(tmp_path):
     orders = FakeOrderManager()
     client = FakeClient(positions=[{"symbol": "BTCUSDT", "contracts": 0.25}])

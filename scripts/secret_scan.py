@@ -1,4 +1,5 @@
 import argparse
+import os
 import re
 from pathlib import Path
 
@@ -71,19 +72,22 @@ def is_allowlisted(line: str) -> bool:
 
 def scan(root: Path, include_env: bool = False) -> list[str]:
     findings = []
-    for path in root.rglob("*"):
-        if not path.is_file() or not should_scan(path, include_env):
-            continue
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except UnicodeDecodeError:
-            continue
-        for line_no, line in enumerate(lines, start=1):
-            if is_allowlisted(line):
+    for current_root, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in EXCLUDED_DIRS]
+        for filename in files:
+            path = Path(current_root) / filename
+            if not should_scan(path, include_env):
                 continue
-            for name, pattern in SECRET_PATTERNS.items():
-                if pattern.search(line):
-                    findings.append(f"{path}:{line_no}: {name}")
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except UnicodeDecodeError:
+                continue
+            for line_no, line in enumerate(lines, start=1):
+                if is_allowlisted(line):
+                    continue
+                for name, pattern in SECRET_PATTERNS.items():
+                    if pattern.search(line):
+                        findings.append(f"{path}:{line_no}: {name}")
     return findings
 
 

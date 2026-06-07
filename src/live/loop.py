@@ -89,6 +89,7 @@ class LiveTradingLoop:
                 },
             )
 
+            self._restore_persisted_risk_state()
             await self._refresh_account(required=True)
             if self.portfolio.account:
                 logger.info(
@@ -223,8 +224,24 @@ class LiveTradingLoop:
             return
 
         self._account_refresh_failures = 0
+        previous_peak = self.portfolio.peak_equity
         self.portfolio.update_account(account)
+        if self.portfolio.peak_equity > previous_peak:
+            self.audit_store.set_control(
+                "peak_equity",
+                str(self.portfolio.peak_equity),
+                "highest observed account equity",
+            )
         logger.debug(f"Account equity refreshed: {account.total_equity:.2f}")
+
+    def _restore_persisted_risk_state(self) -> None:
+        self.portfolio.restore_risk_state(self.audit_store.load_closed_trades())
+        raw_peak = self.audit_store.get_control("peak_equity", "0")
+        try:
+            self.portfolio.peak_equity = max(float(raw_peak), 0.0)
+        except ValueError:
+            logger.warning("Ignoring invalid persisted peak_equity control")
+            self.portfolio.peak_equity = 0.0
 
     @classmethod
     def _describe_exception(cls, exc: Exception) -> str:

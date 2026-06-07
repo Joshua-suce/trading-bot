@@ -263,6 +263,19 @@ async def test_account_refresh_updates_portfolio(monkeypatch):
 
     assert bot._account_refresh_failures == 0
     assert bot.portfolio.account == account
+    assert bot.audit_store.get_control("peak_equity") == "1234.0"
+
+
+def test_live_loop_restores_persisted_peak_equity(tmp_path):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "risk-state.db")
+    audit.set_control("peak_equity", "6000.0", "test")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    bot._restore_persisted_risk_state()
+
+    assert bot.portfolio.peak_equity == 6000.0
 
 
 class FakeSequentialClient:

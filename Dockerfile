@@ -25,7 +25,7 @@ USER appworker
 
 EXPOSE 8501
 
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=60s --timeout=30s --start-period=30s --retries=3 \
     CMD python -m src.main --mode health
 
 CMD ["python", "-m", "src.main", "--mode", "trade"]
