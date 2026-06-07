@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     binance_api_secret_file: str = ""
     binance_api_url: str = "https://demo-fapi.binance.com"
     allow_mainnet_trading: bool = False
+    exchange_request_timeout_ms: int = Field(default=30_000, ge=5_000, le=120_000)
+    exchange_connect_attempts: int = Field(default=3, ge=1, le=10)
+    exchange_connect_backoff_seconds: float = Field(default=2.0, ge=0.1, le=30.0)
 
     symbols: str = "BTCUSDT,ETHUSDT"
     timeframes: str = "5m,15m,30m,1h,4h,1d"
@@ -258,6 +261,7 @@ class Settings(BaseSettings):
             "apiKey": self.binance_api_key or None,
             "secret": self.binance_api_secret or None,
             "enableRateLimit": True,
+            "timeout": self.exchange_request_timeout_ms,
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,

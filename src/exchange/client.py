@@ -1,11 +1,13 @@
 # Async ccxt exchange client — wraps Binance Futures REST + WebSocket APIs
+import asyncio
+from contextlib import suppress
 from typing import List, Optional
 
 import aiohttp
 import ccxt.async_support as ccxt
 import ccxt.pro as ccxt_pro
 import pandas as pd
-from ccxt.base.errors import AuthenticationError
+from ccxt.base.errors import AuthenticationError, NetworkError
 from loguru import logger
 
 from src.config import settings
@@ -31,6 +33,41 @@ class ExchangeClient:
 
     # Create REST + WebSocket clients and verify exchange connectivity/auth
     async def connect(self) -> None:
+        attempts = settings.exchange_connect_attempts
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._connect_once()
+                break
+            except AuthenticationError as exc:
+                await self.close()
+                environment = settings.binance_environment
+                logger.error("Binance authentication failed: {}", exc)
+                raise RuntimeError(
+                    f"Binance API authentication failed for {environment}. "
+                    "Check that BINANCE_API_KEY and BINANCE_API_SECRET were created "
+                    "for this environment and have Futures permissions."
+                ) from exc
+            except NetworkError as exc:
+                await self.close()
+                if attempt == attempts:
+                    raise
+                delay = settings.exchange_connect_backoff_seconds * attempt
+                logger.warning(
+                    "Binance connection failed attempt {}/{}: {}. "
+                    "Retrying in {:.1f}s",
+                    attempt,
+                    attempts,
+                    type(exc).__name__,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+        if settings.binance_demo:
+            logger.info("Connected to Binance Futures DEMO")
+        else:
+            logger.warning("Connected to Binance Futures MAINNET")
+
+    async def _connect_once(self) -> None:
         self._rest_session = self._create_aiohttp_session()
         self._ws_session = self._create_aiohttp_session()
         self._rest = ccxt.binanceusdm({**self.config, "session": self._rest_session})
@@ -41,26 +78,10 @@ class ExchangeClient:
             self._enable_demo_trading(self._rest)
             self._enable_demo_trading(self._ws)
 
-        # Quick authentication / permission check to fail fast with clear message
-        try:
-            # load_markets checks public connectivity; fetch_balance checks auth.
-            await self._rest.load_markets()
-            if self.config.get("apiKey") and self.config.get("secret"):
-                await self._rest.fetch_balance()
-        except AuthenticationError as e:
-            logger.error("Binance authentication failed: {}", e)
-            await self.close()
-            environment = settings.binance_environment
-            raise RuntimeError(
-                f"Binance API authentication failed for {environment}. "
-                "Check that BINANCE_API_KEY and BINANCE_API_SECRET were created "
-                "for this environment and have Futures permissions."
-            ) from e
-
-        if settings.binance_demo:
-            logger.info("Connected to Binance Futures DEMO")
-        else:
-            logger.warning("Connected to Binance Futures MAINNET")
+        # load_markets checks public connectivity; fetch_balance checks auth.
+        await self._rest.load_markets()
+        if self.config.get("apiKey") and self.config.get("secret"):
+            await self._rest.fetch_balance()
 
     @staticmethod
     def _enable_demo_trading(exchange):
@@ -82,14 +103,21 @@ class ExchangeClient:
 
     # Gracefully close both REST and WebSocket connections
     async def close(self):
-        if self._rest:
-            await self._rest.close()
-        if self._ws:
-            await self._ws.close()
-        if self._rest_session and not self._rest_session.closed:
-            await self._rest_session.close()
-        if self._ws_session and not self._ws_session.closed:
-            await self._ws_session.close()
+        resources = (
+            self._rest,
+            self._ws,
+            self._rest_session,
+            self._ws_session,
+        )
+        self._rest = None
+        self._ws = None
+        self._rest_session = None
+        self._ws_session = None
+        for resource in resources:
+            if resource is None:
+                continue
+            with suppress(Exception):
+                await resource.close()
 
     # Lazy-accessor for the REST client (raises if not connected)
     @property

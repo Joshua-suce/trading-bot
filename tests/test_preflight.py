@@ -91,6 +91,12 @@ def test_exchange_url_selects_environment():
     )
 
 
+def test_exchange_config_includes_request_timeout():
+    cfg = make_settings(exchange_request_timeout_ms=45_000)
+
+    assert cfg.exchange_config["timeout"] == 45_000
+
+
 def test_preflight_requires_credentials_for_trade_mode():
     cfg = make_settings(binance_api_key="", binance_api_secret="")
 
