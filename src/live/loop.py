@@ -101,6 +101,7 @@ class LiveTradingLoop:
                     f"Account equity: {self.portfolio.account.total_equity:.2f}"
                 )
             self.pos_mgr.restore_open_trades_from_audit()
+            self.pos_mgr.restore_recent_exit_cooldowns()
             reconciled = await self.pos_mgr.reconcile_exchange_state()
             if reconciled is None:
                 await self.stop(

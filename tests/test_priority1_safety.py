@@ -503,3 +503,9 @@ async def test_reconciliation_finds_finished_stop_in_order_history(tmp_path):
     assert closed["status"] == "closed"
     assert closed["exit_reason"] == "stop_loss"
     assert closed["exit_price"] == pytest.approx(1563.86)
+
+
+def test_finished_binance_algo_status_is_treated_as_filled():
+    assert PositionManager._order_is_filled(
+        {"status": "open", "info": {"algoStatus": "FINISHED"}}
+    )

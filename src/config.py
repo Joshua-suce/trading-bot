@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     max_candle_delay_multiplier: float = Field(default=3.0, ge=1.0, le=20.0)
     allow_zero_volume_candles: bool = False
     max_entry_slippage_bps: float = Field(default=25.0, ge=0.0, le=1000.0)
+    reentry_cooldown_seconds: int = Field(default=900, ge=0, le=86_400)
     min_order_notional: float = Field(default=5.0, ge=0.0, le=100000.0)
     max_leverage: int = Field(default=3, ge=1, le=20)
     max_position_size: float = Field(default=0.02, gt=0, le=0.10)

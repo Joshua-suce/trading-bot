@@ -1,5 +1,5 @@
 # Position manager — manages position lifecycle: entry, SL/TP placement, exit
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from loguru import logger
@@ -11,7 +11,7 @@ from src.execution.order_manager import OrderManager
 from src.monitoring.alerter import Alerter
 from src.risk.portfolio import PortfolioManager, TradeRecord
 from src.risk.position_sizer import PositionSizer
-from src.risk.stop_loss import StopLossManager
+from src.risk.stop_loss import StopLossLevels, StopLossManager
 from src.security import redact_text
 
 
@@ -40,6 +40,7 @@ class PositionManager:
         self.active_stops: dict[str, str] = {}
         self.active_tps: dict[str, str] = {}
         self.trade_correlation_ids: dict[str, str] = {}
+        self.last_symbol_exit_at: dict[str, datetime] = {}
 
     # Enter a long position: check limits, size, place market order + SL/TP
     async def enter_long(
@@ -58,11 +59,7 @@ class PositionManager:
             self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
             return False
 
-        can_trade, reason = self.portfolio.can_trade()
-        if not can_trade:
-            logger.warning(f"Cannot enter {symbol}: {reason}")
-            await self._notify_trade_failed(symbol, reason)
-            self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
+        if await self._entry_policy_blocks(symbol):
             return False
 
         levels = self.sl_manager.calculate(price, "long", atr)
@@ -102,6 +99,23 @@ class PositionManager:
             correlation_id = self._new_correlation_id()
             entry_price = self._order_price(order, price)
             filled_quantity = float(order["filled"])
+            adverse_slippage = self._adverse_fill_slippage_bps(
+                "long", price, entry_price
+            )
+            if adverse_slippage > settings.max_entry_slippage_bps:
+                reason = (
+                    f"entry fill slippage above limit: {adverse_slippage:.2f}bps "
+                    f"> {settings.max_entry_slippage_bps:.2f}bps"
+                )
+                await self._handle_unprotected_entry(
+                    symbol,
+                    "sell",
+                    filled_quantity,
+                    reason,
+                    correlation_id,
+                )
+                return False
+            levels = self.sl_manager.calculate(entry_price, "long", atr)
             trade = TradeRecord(
                 symbol=symbol,
                 side="long",
@@ -111,24 +125,16 @@ class PositionManager:
                 timeframe=timeframe,
             )
 
-            sl_order = await self.orders.stop_loss_order(
-                symbol, "sell", filled_quantity, levels.stop_loss
+            protection = await self._place_entry_protection(
+                symbol,
+                "long",
+                filled_quantity,
+                levels,
+                correlation_id,
             )
-            tp_order = None
-            if levels.take_profit is not None:
-                tp_order = await self.orders.take_profit_order(
-                    symbol, "sell", filled_quantity, levels.take_profit
-                )
-
-            if not sl_order or (levels.take_profit is not None and not tp_order):
-                await self._handle_unprotected_entry(
-                    symbol,
-                    "sell",
-                    filled_quantity,
-                    "protective order placement failed after long entry",
-                    correlation_id,
-                )
+            if protection is None:
                 return False
+            sl_order, tp_order = protection
 
             stop_order_id = sl_order.get("id", "")
             take_profit_order_id = tp_order.get("id", "") if tp_order else None
@@ -201,11 +207,7 @@ class PositionManager:
             self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
             return False
 
-        can_trade, reason = self.portfolio.can_trade()
-        if not can_trade:
-            logger.warning(f"Cannot enter {symbol}: {reason}")
-            await self._notify_trade_failed(symbol, reason)
-            self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
+        if await self._entry_policy_blocks(symbol):
             return False
 
         levels = self.sl_manager.calculate(price, "short", atr)
@@ -245,6 +247,23 @@ class PositionManager:
             correlation_id = self._new_correlation_id()
             entry_price = self._order_price(order, price)
             filled_quantity = float(order["filled"])
+            adverse_slippage = self._adverse_fill_slippage_bps(
+                "short", price, entry_price
+            )
+            if adverse_slippage > settings.max_entry_slippage_bps:
+                reason = (
+                    f"entry fill slippage above limit: {adverse_slippage:.2f}bps "
+                    f"> {settings.max_entry_slippage_bps:.2f}bps"
+                )
+                await self._handle_unprotected_entry(
+                    symbol,
+                    "buy",
+                    filled_quantity,
+                    reason,
+                    correlation_id,
+                )
+                return False
+            levels = self.sl_manager.calculate(entry_price, "short", atr)
             trade = TradeRecord(
                 symbol=symbol,
                 side="short",
@@ -254,24 +273,16 @@ class PositionManager:
                 timeframe=timeframe,
             )
 
-            sl_order = await self.orders.stop_loss_order(
-                symbol, "buy", filled_quantity, levels.stop_loss
+            protection = await self._place_entry_protection(
+                symbol,
+                "short",
+                filled_quantity,
+                levels,
+                correlation_id,
             )
-            tp_order = None
-            if levels.take_profit is not None:
-                tp_order = await self.orders.take_profit_order(
-                    symbol, "buy", filled_quantity, levels.take_profit
-                )
-
-            if not sl_order or (levels.take_profit is not None and not tp_order):
-                await self._handle_unprotected_entry(
-                    symbol,
-                    "buy",
-                    filled_quantity,
-                    "protective order placement failed after short entry",
-                    correlation_id,
-                )
+            if protection is None:
                 return False
+            sl_order, tp_order = protection
 
             stop_order_id = sl_order.get("id", "")
             take_profit_order_id = tp_order.get("id", "") if tp_order else None
@@ -351,6 +362,7 @@ class PositionManager:
                 )
             del self.open_trades[position_key]
             self.trade_correlation_ids.pop(position_key, None)
+            self.last_symbol_exit_at[symbol] = datetime.now(timezone.utc)
             await self._notify_trade_completed(trade, exit_price, reason)
             if position_key in self.active_stops:
                 await self.orders.cancel_order(
@@ -574,6 +586,20 @@ class PositionManager:
             )
         return restored
 
+    def restore_recent_exit_cooldowns(self) -> int:
+        restored = 0
+        for row in self.audit_store.load_closed_trades():
+            symbol = self._normalize_symbol(row.get("symbol"))
+            closed_at = row.get("closed_at")
+            if not symbol or not closed_at or symbol in self.last_symbol_exit_at:
+                continue
+            parsed = datetime.fromisoformat(str(closed_at))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            self.last_symbol_exit_at[symbol] = parsed
+            restored += 1
+        return restored
+
     def _check_exposure_limits(
         self, symbol: str, entry_price: float, quantity: float, position_key: str
     ) -> tuple[bool, str]:
@@ -769,6 +795,7 @@ class PositionManager:
             await self.orders.cancel_order(trade.symbol, take_profit_order_id)
         self.open_trades.pop(position_key, None)
         self.trade_correlation_ids.pop(position_key, None)
+        self.last_symbol_exit_at[trade.symbol] = datetime.now(timezone.utc)
 
     async def _protective_exit_details(self, position_key: str) -> tuple[float, str]:
         trade = self.open_trades[position_key]
@@ -832,7 +859,14 @@ class PositionManager:
     def _order_is_filled(order: dict | None) -> bool:
         if order is None:
             return False
-        return str(order.get("status", "")).lower() in {"closed", "filled"}
+        info = order.get("info") or {}
+        statuses = {
+            str(order.get("status", "")).lower(),
+            str(order.get("algoStatus", "")).lower(),
+            str(info.get("algoStatus", "")).lower(),
+            str(info.get("status", "")).lower(),
+        }
+        return bool(statuses & {"closed", "filled", "finished"})
 
     async def _historical_order(
         self, symbol: str, order_id: str, *, conditional: bool
@@ -922,6 +956,53 @@ class PositionManager:
     def _has_open_trade_for_symbol(self, symbol: str) -> bool:
         return any(trade.symbol == symbol for trade in self.open_trades.values())
 
+    def _reentry_cooldown_reason(self, symbol: str) -> str:
+        if settings.reentry_cooldown_seconds <= 0:
+            return ""
+        exited_at = self.last_symbol_exit_at.get(self._normalize_symbol(symbol))
+        if exited_at is None:
+            return ""
+        if exited_at.tzinfo is None:
+            exited_at = exited_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - exited_at).total_seconds()
+        remaining = settings.reentry_cooldown_seconds - elapsed
+        if remaining <= 0:
+            return ""
+        return f"re-entry cooldown active: {remaining:.0f}s remaining"
+
+    async def _entry_policy_blocks(self, symbol: str) -> bool:
+        can_trade, reason = self.portfolio.can_trade()
+        if not can_trade:
+            logger.warning(f"Cannot enter {symbol}: {reason}")
+            await self._notify_trade_failed(symbol, reason)
+            self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
+            return True
+
+        reason = self._reentry_cooldown_reason(symbol)
+        if not reason:
+            return False
+        logger.warning(f"Cannot enter {symbol}: {reason}")
+        self._audit(
+            "trade_blocked_cooldown",
+            reason,
+            severity="warning",
+            symbol=symbol,
+        )
+        return True
+
+    @staticmethod
+    def _adverse_fill_slippage_bps(
+        side: str, reference_price: float, fill_price: float
+    ) -> float:
+        if reference_price <= 0 or fill_price <= 0:
+            return float("inf")
+        adverse_move = (
+            fill_price - reference_price
+            if side == "long"
+            else reference_price - fill_price
+        )
+        return max(adverse_move, 0.0) / reference_price * 10_000
+
     async def _handle_unprotected_entry(
         self,
         symbol: str,
@@ -967,6 +1048,41 @@ class PositionManager:
                 correlation_id=correlation_id,
             )
         await self._notify_trade_failed(symbol, reason)
+
+    async def _place_entry_protection(
+        self,
+        symbol: str,
+        trade_side: str,
+        quantity: float,
+        levels: StopLossLevels,
+        correlation_id: str,
+    ) -> tuple[dict, dict | None] | None:
+        exit_side = "sell" if trade_side == "long" else "buy"
+        sl_order = await self.orders.stop_loss_order(
+            symbol,
+            exit_side,
+            quantity,
+            levels.stop_loss,
+        )
+        tp_order = None
+        if levels.take_profit is not None:
+            tp_order = await self.orders.take_profit_order(
+                symbol,
+                exit_side,
+                quantity,
+                levels.take_profit,
+            )
+        if sl_order and (levels.take_profit is None or tp_order):
+            return sl_order, tp_order
+
+        await self._handle_unprotected_entry(
+            symbol,
+            exit_side,
+            quantity,
+            f"protective order placement failed after {trade_side} entry",
+            correlation_id,
+        )
+        return None
 
     async def _confirmed_full_fill(
         self, order: dict | None, symbol: str, expected_quantity: float

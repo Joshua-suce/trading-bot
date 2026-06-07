@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from src.audit import AuditStore
@@ -50,6 +52,8 @@ class FakeOrderManager:
         self.counter = 0
         self.null_exit_price = null_exit_price
         self.protective_quantities = []
+        self.stop_prices = []
+        self.target_prices = []
 
     async def market_order(self, symbol, side, quantity, reduce_only=False):
         self.counter += 1
@@ -66,10 +70,12 @@ class FakeOrderManager:
 
     async def stop_loss_order(self, symbol, side, quantity, stop_price, price=None):
         self.protective_quantities.append(quantity)
+        self.stop_prices.append(stop_price)
         return {"id": "stop-1"}
 
     async def take_profit_order(self, symbol, side, quantity, price):
         self.protective_quantities.append(quantity)
+        self.target_prices.append(price)
         return {"id": "target-1"}
 
     async def cancel_order(self, symbol, order_id, conditional=False):
@@ -131,6 +137,66 @@ async def test_entry_records_actual_fill_and_protects_filled_quantity(tmp_path):
     assert manager.open_trades["BTCUSDT"].quantity == 0.75
     assert manager.orders.protective_quantities == [0.75, 0.75]
     assert alerter.opened[0]["quantity"] == 0.75
+
+
+@pytest.mark.asyncio
+async def test_protective_levels_are_recalculated_from_actual_fill(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    async def favorable_short_fill(symbol, side, quantity, reduce_only=False):
+        return {"id": "market-fill", "filled": quantity, "average": 101.0}
+
+    manager.orders.market_order = favorable_short_fill
+
+    assert await manager.enter_short("ETHUSDT", price=100.0, atr=2.0)
+    assert manager.open_trades["ETHUSDT"].entry_price == 101.0
+    assert manager.orders.stop_prices == [103.0]
+    assert manager.orders.target_prices == [97.0]
+
+
+@pytest.mark.asyncio
+async def test_adverse_fill_slippage_is_immediately_flattened(monkeypatch, tmp_path):
+    from src.execution import position_manager as position_manager_module
+
+    monkeypatch.setattr(
+        position_manager_module.settings, "max_entry_slippage_bps", 25.0
+    )
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+    calls = []
+
+    async def slipped_fill(symbol, side, quantity, reduce_only=False):
+        calls.append((side, reduce_only))
+        return {
+            "id": f"market-{len(calls)}",
+            "filled": quantity,
+            "average": 101.0,
+        }
+
+    manager.orders.market_order = slipped_fill
+
+    assert not await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert calls == [("buy", False), ("sell", True)]
+    assert manager.open_trades == {}
+    assert manager.orders.protective_quantities == []
+    assert "slippage above limit" in alerter.failed[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_reentry_cooldown_blocks_same_symbol(monkeypatch, tmp_path):
+    from src.execution import position_manager as position_manager_module
+
+    monkeypatch.setattr(
+        position_manager_module.settings, "reentry_cooldown_seconds", 900
+    )
+    manager = build_manager(FakeAlerter(), tmp_path)
+    manager.last_symbol_exit_at["BTCUSDT"] = datetime.now(timezone.utc)
+
+    assert not await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert manager.orders.counter == 0
+    event = manager.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "trade_blocked_cooldown"
 
 
 @pytest.mark.asyncio

@@ -97,6 +97,12 @@ def test_exchange_config_includes_request_timeout():
     assert cfg.exchange_config["timeout"] == 45_000
 
 
+def test_reentry_cooldown_is_bounded():
+    assert make_settings(reentry_cooldown_seconds=900).reentry_cooldown_seconds == 900
+    with pytest.raises(ValidationError):
+        make_settings(reentry_cooldown_seconds=86_401)
+
+
 def test_preflight_requires_credentials_for_trade_mode():
     cfg = make_settings(binance_api_key="", binance_api_secret="")
 
