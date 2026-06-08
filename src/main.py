@@ -122,7 +122,11 @@ async def run_train(symbol: str, timeframe: str, limit: int):
         df = await client.fetch_ohlcv(symbol, timeframe, limit=limit)
 
     trainer = ModelTrainer()
-    ensemble = trainer.train_ensemble(df)
+    ensemble = trainer.train_ensemble(
+        df,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
     logger.info("Training complete!")
     return ensemble
 

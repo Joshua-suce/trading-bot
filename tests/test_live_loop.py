@@ -436,22 +436,35 @@ def test_next_scan_aligns_to_exchange_candle_boundary(monkeypatch):
 
 
 def test_live_loop_loads_configured_xgboost_model(monkeypatch, tmp_path):
-    model_path = tmp_path / "xgb_classifier.json"
+    model_path = tmp_path / "xgb_BTCUSDT_5m.json"
     model_path.write_text("{}", encoding="utf-8")
 
     class FakeClassifier:
         def load(self, path):
             assert path == str(model_path)
+            self.metadata = {"symbol": "BTCUSDT", "timeframe": "5m"}
 
         def predict_with_confidence(self, X):
             return np.array([1]), np.array([0.9])
 
     monkeypatch.setattr(live_loop_module.settings, "model_dir", str(tmp_path))
+    monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT")
+    monkeypatch.setattr(live_loop_module.settings, "timeframes", "5m")
     monkeypatch.setattr(live_loop_module, "XGBoostClassifier", FakeClassifier)
 
-    ensemble = LiveTradingLoop._load_ensemble()
+    aggregators = LiveTradingLoop._load_scoped_aggregators()
 
-    assert ensemble.is_ready()
+    assert set(aggregators) == {"BTCUSDT:5m"}
+
+
+def test_scoped_model_is_not_reused_for_other_markets():
+    bot = LiveTradingLoop()
+    scoped = object()
+    bot._scoped_aggregators = {"BTCUSDT:5m": scoped}
+
+    assert bot._aggregator_for("BTCUSDT", "5m") is scoped
+    assert bot._aggregator_for("ETHUSDT", "5m") is bot.aggregator
+    assert bot._aggregator_for("BTCUSDT", "1h") is bot.aggregator
 
 
 @pytest.mark.asyncio

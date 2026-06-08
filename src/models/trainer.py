@@ -44,7 +44,14 @@ class ModelTrainer:
         return X, y
 
     # Train an XGBoost classifier and optionally save it to disk
-    def train_xgb(self, df: pd.DataFrame, save: bool = True):
+    def train_xgb(
+        self,
+        df: pd.DataFrame,
+        *,
+        symbol: str,
+        timeframe: str,
+        save: bool = True,
+    ):
         if not XGB_AVAILABLE:
             logger.warning("XGBoost not available, skipping XGB training")
             return None
@@ -54,15 +61,31 @@ class ModelTrainer:
             X, y, test_size=0.2, shuffle=False
         )
         model = XGBModel()
+        model.metadata = {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+        }
         model.train(X_train, y_train, eval_set=(X_test, y_test))
 
         if save:
-            path = str(self.model_dir / "xgb_classifier.json")
+            path = str(self.model_dir / f"xgb_{symbol.upper()}_{timeframe}.json")
             model.save(path)
         return model
 
     # Train the full ensemble (XGBoost + optional LSTM)
-    def train_ensemble(self, df: pd.DataFrame, save: bool = True) -> ModelEnsemble:
-        xgb = self.train_xgb(df, save=save)
+    def train_ensemble(
+        self,
+        df: pd.DataFrame,
+        *,
+        symbol: str,
+        timeframe: str,
+        save: bool = True,
+    ) -> ModelEnsemble:
+        xgb = self.train_xgb(
+            df,
+            symbol=symbol,
+            timeframe=timeframe,
+            save=save,
+        )
         ensemble = ModelEnsemble(xgb_model=xgb)
         return ensemble

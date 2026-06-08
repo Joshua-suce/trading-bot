@@ -59,8 +59,11 @@ class LiveTradingLoop:
             mode=self.mode,
             audit_store=self.audit_store,
         )
-        self.ensemble = ensemble if ensemble is not None else self._load_ensemble()
+        self.ensemble = ensemble or ModelEnsemble()
         self.aggregator = SignalAggregator(self.ensemble)
+        self._scoped_aggregators = (
+            {} if ensemble is not None else self._load_scoped_aggregators()
+        )
         self.data_quality = OHLCVQualityValidator()
         self._last_processed_candles: dict[str, object] = {}
         self._next_scan_due: dict[str, float] = {}
@@ -93,7 +96,9 @@ class LiveTradingLoop:
                 payload={
                     "symbols": settings.symbols_list,
                     "timeframes": settings.timeframes_list,
-                    "ml_model_ready": self.ensemble.is_ready(),
+                    "ml_model_ready": bool(self._scoped_aggregators)
+                    or self.ensemble.is_ready(),
+                    "ml_model_scopes": sorted(self._scoped_aggregators),
                 },
             )
 
@@ -353,30 +358,60 @@ class LiveTradingLoop:
         return monotonic_now + max(delay, settings.scan_sleep_seconds)
 
     @staticmethod
-    def _load_ensemble() -> ModelEnsemble:
+    def _load_scoped_aggregators() -> dict[str, SignalAggregator]:
         model_dir = Path(settings.model_dir).expanduser()
         if not model_dir.is_absolute():
             model_dir = Path(__file__).resolve().parents[2] / model_dir
-        model_path = model_dir / "xgb_classifier.json"
-        if not model_path.exists():
+        aggregators: dict[str, SignalAggregator] = {}
+        for symbol in settings.symbols_list:
+            for timeframe in settings.timeframes_list:
+                model_path = model_dir / f"xgb_{symbol}_{timeframe}.json"
+                if not model_path.exists():
+                    continue
+                try:
+                    model = XGBoostClassifier()
+                    model.load(str(model_path))
+                    expected_scope = {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                    }
+                    if model.metadata != expected_scope:
+                        raise ValueError(
+                            f"scope metadata {model.metadata} does not match "
+                            f"{expected_scope}"
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "Could not load XGBoost model from {}: {}",
+                        model_path,
+                        redact_text(exc),
+                    )
+                    continue
+                key = LiveTradingLoop._model_scope_key(symbol, timeframe)
+                aggregators[key] = SignalAggregator(ModelEnsemble(xgb_model=model))
+                logger.info(
+                    "Loaded XGBoost trading model for {} {} from {}",
+                    symbol,
+                    timeframe,
+                    model_path,
+                )
+        if not aggregators:
             logger.warning(
-                "No trained XGBoost model found at {}; TA-only signals are active",
-                model_path,
-            )
-            return ModelEnsemble()
-        try:
-            model = XGBoostClassifier()
-            model.load(str(model_path))
-        except Exception as exc:
-            logger.error(
-                "Could not load XGBoost model from {}: {}. "
+                "No compatible scoped XGBoost models found in {}; "
                 "TA-only signals are active",
-                model_path,
-                redact_text(exc),
+                model_dir,
             )
-            return ModelEnsemble()
-        logger.info("Loaded XGBoost trading model from {}", model_path)
-        return ModelEnsemble(xgb_model=model)
+        return aggregators
+
+    @staticmethod
+    def _model_scope_key(symbol: str, timeframe: str) -> str:
+        return f"{symbol.upper()}:{timeframe}"
+
+    def _aggregator_for(self, symbol: str, timeframe: str) -> SignalAggregator:
+        return self._scoped_aggregators.get(
+            self._model_scope_key(symbol, timeframe),
+            self.aggregator,
+        )
 
     # Called on each new closed candle.
     async def _on_candle(self, candle: dict, df_ind=None):
@@ -430,7 +465,10 @@ class LiveTradingLoop:
                     symbol, candle["timeframe"], limit=200
                 )
                 df_ind = compute_all_indicators(df)
-            signal = self.aggregator.generate(df_ind)
+            signal = self._aggregator_for(
+                symbol,
+                candle["timeframe"],
+            ).generate(df_ind)
 
             if signal.direction == 0 or signal.confidence < 0.4:
                 logger.debug(

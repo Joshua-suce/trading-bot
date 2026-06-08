@@ -31,6 +31,7 @@ class XGBoostClassifier:
         self.model_path = model_path
         self.is_trained = False
         self.classes_: np.ndarray = np.array([], dtype=int)
+        self.metadata: dict[str, str] = {}
 
     # Train on feature matrix X and labels y, optionally with a validation set
     def train(self, X: np.ndarray, y: np.ndarray, eval_set: Optional[Tuple] = None):
@@ -109,6 +110,7 @@ class XGBoostClassifier:
                 {
                     "schema_version": 1,
                     "classes": self.classes_.tolist(),
+                    "metadata": self.metadata,
                 },
                 sort_keys=True,
             ),
@@ -130,6 +132,10 @@ class XGBoostClassifier:
         if metadata.get("schema_version") != 1:
             raise ValueError("Unsupported XGBoost model metadata version")
         self.classes_ = np.asarray(metadata.get("classes", []), dtype=int)
+        raw_metadata = metadata.get("metadata") or {}
+        if not isinstance(raw_metadata, dict):
+            raise ValueError("Model artifact metadata is invalid")
+        self.metadata = {str(key): str(value) for key, value in raw_metadata.items()}
         if len(self.classes_) < 2:
             raise ValueError("Model artifact does not contain valid class metadata")
         self.model = XGBClassifier()

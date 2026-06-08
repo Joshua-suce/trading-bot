@@ -108,8 +108,9 @@ existing saved ML models must be retrained before their predictions are used.
 - Output: class prediction + confidence (max softmax probability)
 - Direction labels are encoded to contiguous XGBoost class IDs during training
   and decoded back to -1/0/+1 for live signals.
-- Trade mode loads `MODEL_DIR/xgb_classifier.json` automatically. If no
-  compatible artifact exists, startup logs that TA-only signals are active.
+- Training writes a scoped artifact such as
+  `MODEL_DIR/xgb_BTCUSDT_1h.json`. Trade mode loads it only for that exact
+  symbol/timeframe. Other scopes remain TA-only until separately trained.
 - Models use XGBoost's native JSON format plus JSON class metadata; pickle-based
   artifacts are rejected.
 

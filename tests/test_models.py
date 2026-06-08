@@ -70,6 +70,7 @@ def test_xgboost_classifier_encodes_direction_labels_and_round_trips(tmp_path):
     X = rng.normal(size=(40, 5))
     y = np.array([-1, 1] * 20)
     model = XGBoostClassifier(n_estimators=2, max_depth=2)
+    model.metadata = {"symbol": "BTCUSDT", "timeframe": "5m"}
 
     model.train(X, y)
     predictions, confidence = model.predict_with_confidence(X[:4])
@@ -84,5 +85,6 @@ def test_xgboost_classifier_encodes_direction_labels_and_round_trips(tmp_path):
     restored.load(str(path))
 
     restored_predictions, restored_confidence = restored.predict_with_confidence(X[:4])
+    assert restored.metadata == {"symbol": "BTCUSDT", "timeframe": "5m"}
     np.testing.assert_array_equal(restored_predictions, predictions)
     np.testing.assert_allclose(restored_confidence, confidence)
