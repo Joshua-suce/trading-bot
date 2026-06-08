@@ -10,7 +10,7 @@ def make_settings(**overrides) -> Settings:
         "binance_api_key": "key",
         "binance_api_secret": "secret",
         "binance_api_url": "https://demo-fapi.binance.com",
-        "symbols": "btcusdt, ethusdt",
+        "symbols": "btcusdt, ethusdt, bnbusdt",
         "timeframes": "1h,4h",
     }
     defaults.update(overrides)
@@ -20,8 +20,8 @@ def make_settings(**overrides) -> Settings:
 def test_settings_normalizes_symbols_and_log_level():
     cfg = make_settings(log_level="warning")
 
-    assert cfg.symbols == "BTCUSDT,ETHUSDT"
-    assert cfg.symbols_list == ["BTCUSDT", "ETHUSDT"]
+    assert cfg.symbols == "BTCUSDT,ETHUSDT,BNBUSDT"
+    assert cfg.symbols_list == ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
     assert cfg.log_level == "WARNING"
 
 

@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     exchange_read_attempts: int = Field(default=3, ge=1, le=10)
     exchange_read_backoff_seconds: float = Field(default=1.0, ge=0.1, le=30.0)
 
-    symbols: str = "BTCUSDT,ETHUSDT"
+    symbols: str = "BTCUSDT,ETHUSDT,BNBUSDT"
     timeframes: str = "5m,15m,30m,1h,4h,1d"
     position_scope: str = "symbol"
     scan_sleep_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
