@@ -1,5 +1,6 @@
 # Trend-following technical indicators — EMA, SMA, MACD, ADX, PSAR, Ichimoku
 
+import numpy as np
 import pandas as pd
 
 
@@ -77,7 +78,8 @@ class TrendIndicators:
         minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
         plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
         minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
-        dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA))
+        di_sum = (plus_di + minus_di).astype(float).replace(0.0, np.nan)
+        dx = 100 * ((plus_di - minus_di).abs().astype(float) / di_sum)
         adx = dx.rolling(window=period).mean()
         return adx
 

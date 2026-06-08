@@ -16,6 +16,11 @@ def isolate_live_loop_audit(tmp_path, monkeypatch):
         "audit_db_path",
         str(tmp_path / "live-loop-audit.db"),
     )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "model_dir",
+        str(tmp_path / "models"),
+    )
 
 
 def test_live_loop_uses_injected_audit_store(tmp_path):

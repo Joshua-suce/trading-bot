@@ -43,6 +43,16 @@ class TestTrendIndicators:
         )
         assert len(result) == len(sample_df)
 
+    def test_adx_preserves_numeric_dtype_when_directional_sum_is_zero(self):
+        close = pd.Series(np.full(250, 600.0), dtype=float)
+        high = close + 1.0
+        low = close - 1.0
+
+        result = TrendIndicators.adx(high, low, close)
+
+        assert pd.api.types.is_float_dtype(result.dtype)
+        assert result.isna().all()
+
     def test_fibonacci_retracement_levels_are_ordered(self, sample_df):
         result = TrendIndicators.fibonacci_retracement(
             sample_df["high"], sample_df["low"], lookback=100
@@ -120,3 +130,22 @@ class TestComputeAll:
         for col in expected_cols:
             assert col in result.columns, f"Missing column: {col}"
         assert len(result) == len(sample_df)
+
+    def test_flat_market_indicators_remain_numeric(self):
+        close = np.full(250, 600.0)
+        flat = pd.DataFrame(
+            {
+                "open": close,
+                "high": close + 1.0,
+                "low": close - 1.0,
+                "close": close,
+                "volume": np.full(250, 100.0),
+            }
+        )
+
+        result = compute_all_indicators(flat)
+
+        assert all(
+            pd.api.types.is_numeric_dtype(result[column])
+            for column in ("adx", "atr_pct", "vol_ratio")
+        )

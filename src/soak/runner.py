@@ -182,6 +182,7 @@ class SoakRunner:
         bot.client = cast(ExchangeClient, SoakClient())
         bot.alerter = cast(Alerter, soak_alerter)
         bot.aggregator = cast(SignalAggregator, SoakAggregator())
+        bot._scoped_aggregators = {}
         soak_orders = SoakOrderManager()
         bot.order_mgr = cast(OrderManager, soak_orders)
         bot.pos_mgr.alerter = bot.alerter

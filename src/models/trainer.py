@@ -40,7 +40,7 @@ class ModelTrainer:
         df_feat = self.feature_engineer.create_features(df_ind)
         df_feat = df_feat.dropna()
         X = self.feature_engineer.get_feature_matrix(df_feat)
-        y = df_feat["target_direction"].values
+        y = df_feat["target_direction"].astype(int).values
         return X, y
 
     # Train an XGBoost classifier and optionally save it to disk

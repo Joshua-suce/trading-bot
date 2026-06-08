@@ -39,6 +39,14 @@ class TestFeatureEngineer:
         assert X.shape[0] == len(df_feat)
         assert X.shape[1] == len(fe.feature_cols)
 
+    def test_final_candle_has_no_future_direction_label(self, sample_feature_df):
+        fe = FeatureEngineer(lookback=50)
+
+        result = fe.create_features(sample_feature_df)
+
+        assert pd.isna(result.iloc[-1]["target"])
+        assert pd.isna(result.iloc[-1]["target_direction"])
+
 
 def test_trainer_prepare_data_with_raw_ohlcv():
     from src.models.trainer import ModelTrainer
@@ -61,6 +69,7 @@ def test_trainer_prepare_data_with_raw_ohlcv():
     assert X.ndim == 2
     assert len(y) == X.shape[0]
     assert set(y).issubset({-1, 0, 1})
+    assert np.issubdtype(y.dtype, np.integer)
 
 
 def test_xgboost_classifier_encodes_direction_labels_and_round_trips(tmp_path):

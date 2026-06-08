@@ -61,7 +61,7 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     bb_df = volatility.bollinger_bands(close)
     result = _append_indicator_frame(result, bb_df)
     result["atr"] = volatility.atr(high, low, close)
-    result["atr_pct"] = result["atr"] / close.replace(0, pd.NA)
+    result["atr_pct"] = result["atr"] / close.astype(float).replace(0.0, np.nan)
     kc_df = volatility.keltner_channels(high, low, close)
     result = _append_indicator_frame(result, kc_df)
     result["hv"] = volatility.historical_volatility(close)
@@ -72,7 +72,7 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     result["obv"] = volume_inds.obv(close, vol)
     result["vwap"] = volume_inds.vwap(high, low, close, vol)
     result["vol_sma_20"] = volume_inds.volume_sma(vol, 20)
-    result["vol_ratio"] = vol / result["vol_sma_20"].replace(0, pd.NA)
+    result["vol_ratio"] = vol / result["vol_sma_20"].astype(float).replace(0.0, np.nan)
 
     # Regime features used by signal generation
     result["trend_regime"] = 0

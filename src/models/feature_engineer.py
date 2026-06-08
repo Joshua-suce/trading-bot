@@ -85,9 +85,10 @@ class FeatureEngineer:
 
         # Target: next-period return direction (for classification)
         result["target"] = result["close"].shift(-1) - result["close"]
-        result["target_direction"] = result["target"].apply(
-            lambda x: 1 if x > 0 else (0 if x == 0 else -1)
-        )
+        result["target_direction"] = np.nan
+        result.loc[result["target"] > 0, "target_direction"] = 1
+        result.loc[result["target"] == 0, "target_direction"] = 0
+        result.loc[result["target"] < 0, "target_direction"] = -1
 
         self.feature_cols = [
             c
