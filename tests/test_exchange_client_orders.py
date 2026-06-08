@@ -11,6 +11,10 @@ class FakeRest:
         self.calls.append((order_id, symbol, params))
         return {"id": "resolved"}
 
+    async def fetch_my_trades(self, symbol, since=None, limit=None, params=None):
+        self.calls.append((symbol, since, limit, params))
+        return [{"order": "123", "price": 100.0}]
+
 
 @pytest.mark.asyncio
 async def test_fetch_standard_order_by_client_id():
@@ -37,3 +41,14 @@ async def test_fetch_conditional_order_by_client_id():
             {"trigger": True, "clientAlgoId": "tb_sl_123"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_trade_executions_by_order_id():
+    client = ExchangeClient()
+    client._rest = FakeRest()
+
+    trades = await client.fetch_my_trades("BTCUSDT", order_id="123")
+
+    assert trades == [{"order": "123", "price": 100.0}]
+    assert client.rest.calls == [("BTCUSDT", None, 100, {"orderId": "123"})]

@@ -98,6 +98,9 @@ class FakeClient:
     async def fetch_order(self, order_id, symbol, conditional=False):
         raise LookupError(order_id)
 
+    async def fetch_my_trades(self, symbol, order_id=None, limit=100):
+        return []
+
     async def fetch_orders(self, symbol, conditional=False, limit=50):
         return []
 
@@ -232,6 +235,75 @@ async def test_entry_fill_price_is_refetched_before_protection(tmp_path):
     assert manager.open_trades["BTCUSDT"].entry_price == 100.2
     assert manager.orders.stop_prices == [98.2]
     assert manager.orders.target_prices == [104.2]
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_price_uses_weighted_trade_executions(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    async def fill_without_price(symbol, side, quantity, reduce_only=False):
+        return {
+            "id": "market-fill",
+            "filled": quantity,
+            "average": None,
+            "price": None,
+        }
+
+    async def execution_fills(symbol, order_id=None, limit=100):
+        return [
+            {
+                "order": order_id,
+                "amount": 0.4,
+                "price": 100.0,
+            },
+            {
+                "order": order_id,
+                "amount": 0.6,
+                "price": 100.2,
+            },
+        ]
+
+    manager.orders.market_order = fill_without_price
+    manager.client.fetch_my_trades = execution_fills
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert manager.open_trades["BTCUSDT"].entry_price == pytest.approx(100.12)
+    assert manager.orders.stop_prices == [pytest.approx(98.12)]
+    assert manager.orders.target_prices == [pytest.approx(104.12)]
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_price_retries_delayed_trade_executions(monkeypatch, tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+    calls = 0
+
+    async def fill_without_price(symbol, side, quantity, reduce_only=False):
+        return {
+            "id": "market-fill",
+            "filled": quantity,
+            "average": None,
+            "price": None,
+        }
+
+    async def delayed_execution(symbol, order_id=None, limit=100):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return []
+        return [{"order": order_id, "amount": 1.0, "price": 100.1}]
+
+    async def no_sleep(seconds):
+        return None
+
+    manager.orders.market_order = fill_without_price
+    manager.client.fetch_my_trades = delayed_execution
+    monkeypatch.setattr("src.execution.position_manager.asyncio.sleep", no_sleep)
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert calls == 2
+    assert manager.open_trades["BTCUSDT"].entry_price == 100.1
 
 
 @pytest.mark.asyncio

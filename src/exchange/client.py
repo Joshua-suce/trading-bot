@@ -292,6 +292,23 @@ class ExchangeClient:
             f"order history {symbol}",
         )
 
+    async def fetch_my_trades(
+        self,
+        symbol: str,
+        *,
+        order_id: str | None = None,
+        limit: int = 100,
+    ) -> List[dict]:
+        params = {"orderId": order_id} if order_id else {}
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_my_trades(
+                symbol,
+                limit=limit,
+                params=params,
+            ),
+            f"trade executions {symbol}",
+        )
+
     # Fetch current ticker (24hr stats) for a symbol
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self._read_with_retries(

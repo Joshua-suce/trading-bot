@@ -1,4 +1,5 @@
 # Position manager — manages position lifecycle: entry, SL/TP placement, exit
+import asyncio
 import time
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -1092,6 +1093,13 @@ class PositionManager:
         order_id = str(order.get("id") or "")
         if not order_id:
             return None
+        execution_price = await self._entry_execution_price(
+            symbol,
+            order_id,
+            float(order.get("filled") or 0),
+        )
+        if execution_price is not None:
+            return execution_price
         resolved = await self._resolved_order(
             symbol,
             order_id,
@@ -1101,6 +1109,72 @@ class PositionManager:
         if resolved is None:
             return None
         return self._positive_order_price(resolved)
+
+    async def _entry_execution_price(
+        self,
+        symbol: str,
+        order_id: str,
+        expected_quantity: float,
+    ) -> float | None:
+        fetch_my_trades = getattr(self.client, "fetch_my_trades", None)
+        if not callable(fetch_my_trades):
+            return None
+        matched: list[tuple[float, float]] = []
+        for attempt in range(1, 4):
+            try:
+                trades = await fetch_my_trades(symbol, order_id=order_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not fetch trade executions for {} order {}: {}",
+                    symbol,
+                    order_id,
+                    redact_text(exc),
+                )
+                return None
+
+            matched = self._matched_trade_executions(trades, order_id)
+            if matched:
+                filled_quantity = sum(amount for amount, _ in matched)
+                tolerance = await self._quantity_tolerance(symbol)
+                if (
+                    expected_quantity <= 0
+                    or filled_quantity >= expected_quantity - tolerance
+                ):
+                    return (
+                        sum(amount * price for amount, price in matched)
+                        / filled_quantity
+                    )
+            if attempt < 3:
+                await asyncio.sleep(0.25 * attempt)
+
+        if matched:
+            logger.warning(
+                "Incomplete trade executions for {} order {}: {} < {}",
+                symbol,
+                order_id,
+                sum(amount for amount, _ in matched),
+                expected_quantity,
+            )
+        return None
+
+    @staticmethod
+    def _matched_trade_executions(
+        trades: list[dict],
+        order_id: str,
+    ) -> list[tuple[float, float]]:
+        matched = []
+        for trade in trades:
+            info = trade.get("info") or {}
+            trade_order_id = str(trade.get("order") or info.get("orderId") or "")
+            if trade_order_id != order_id:
+                continue
+            amount = float(
+                trade.get("amount") or info.get("qty") or info.get("quantity") or 0
+            )
+            price = float(trade.get("price") or info.get("price") or 0)
+            if amount > 0 and price > 0:
+                matched.append((amount, price))
+        return matched
 
     async def _validated_entry_fill_price(
         self,
