@@ -72,6 +72,7 @@ class FakeClient:
         self.fetched_orders = fetched_orders or {}
         self.order_history = order_history or {}
         self.conditional_history = conditional_history or {}
+        self.fetch_order_calls = []
 
     async def fetch_positions(self):
         return self.positions
@@ -82,6 +83,7 @@ class FakeClient:
         return self.open_orders.get(symbol, [])
 
     async def fetch_order(self, order_id, symbol, conditional=False):
+        self.fetch_order_calls.append((order_id, symbol, conditional))
         return self.fetched_orders[(order_id, conditional)]
 
     async def fetch_orders(self, symbol, conditional=False, limit=50):
@@ -350,6 +352,7 @@ async def test_reconciliation_accepts_standard_tp_and_conditional_stop(tmp_path)
     manager.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
+    assert client.fetch_order_calls == []
 
 
 @pytest.mark.asyncio

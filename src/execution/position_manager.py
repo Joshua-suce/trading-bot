@@ -392,7 +392,11 @@ class PositionManager:
             )
             return False
 
-        if await self._finalize_filled_protective_legs():
+        order_snapshots = await self._protective_order_snapshots()
+        if order_snapshots is None:
+            return False
+
+        if await self._finalize_filled_protective_legs(order_snapshots):
             positions = await self._fetch_positions_for_reconciliation()
             if positions is None:
                 return None
@@ -405,12 +409,15 @@ class PositionManager:
                     payload={"positions": unmanaged},
                 )
                 return False
+            order_snapshots = await self._protective_order_snapshots()
+            if order_snapshots is None:
+                return False
         await self._clear_missing_exchange_positions(set(exchange_positions))
 
         if not await self._verify_exchange_position_details(exchange_positions):
             return False
 
-        if not await self._verify_all_protective_orders():
+        if not await self._verify_all_protective_orders(order_snapshots):
             return False
 
         self._audit("reconciliation_ok", "Exchange state reconciled")
@@ -459,9 +466,15 @@ class PositionManager:
         for position_key in missing_position_keys:
             await self._finalize_exchange_closed_position(position_key)
 
-    async def _verify_all_protective_orders(self) -> bool:
+    async def _verify_all_protective_orders(
+        self,
+        order_snapshots: dict[str, tuple[set[str], set[str]]],
+    ) -> bool:
         for position_key, trade in list(self.open_trades.items()):
-            if await self._verify_protective_orders(position_key):
+            if self._verify_protective_orders(
+                position_key,
+                order_snapshots.get(trade.symbol, (set(), set())),
+            ):
                 continue
             reason = f"missing protective orders for {trade.symbol}"
             await self._fail_reconciliation(
@@ -781,38 +794,48 @@ class PositionManager:
             raw = raw.split(":", 1)[0]
         return raw.replace("/", "").upper()
 
-    async def _verify_protective_orders(self, position_key: str) -> bool:
-        trade = self.open_trades[position_key]
+    def _verify_protective_orders(
+        self,
+        position_key: str,
+        order_ids: tuple[set[str], set[str]],
+    ) -> bool:
         stop_order_id = self.active_stops.get(position_key)
         take_profit_order_id = self.active_tps.get(position_key)
         if not stop_order_id:
             return False
 
-        try:
-            open_orders = await self.client.fetch_open_orders(trade.symbol)
-            conditional_orders = await self.client.fetch_open_orders(
-                trade.symbol, conditional=True
-            )
-        except Exception as exc:
-            reason = f"open order reconciliation failed for {trade.symbol}: {exc}"
-            logger.critical(reason)
-            self._audit(
-                "open_order_reconciliation_failed",
-                reason,
-                severity="critical",
-                symbol=trade.symbol,
-            )
-            return False
-
-        open_order_ids = {str(order.get("id", "")) for order in open_orders}
-        conditional_order_ids = {
-            str(order.get("id", "")) for order in conditional_orders
-        }
+        open_order_ids, conditional_order_ids = order_ids
         if stop_order_id not in conditional_order_ids:
             return False
         if take_profit_order_id and take_profit_order_id not in open_order_ids:
             return False
         return True
+
+    async def _protective_order_snapshots(
+        self,
+    ) -> dict[str, tuple[set[str], set[str]]] | None:
+        snapshots: dict[str, tuple[set[str], set[str]]] = {}
+        for symbol in {trade.symbol for trade in self.open_trades.values()}:
+            try:
+                open_orders = await self.client.fetch_open_orders(symbol)
+                conditional_orders = await self.client.fetch_open_orders(
+                    symbol, conditional=True
+                )
+            except Exception as exc:
+                reason = redact_text(
+                    f"open order reconciliation failed for {symbol}: {exc}"
+                )
+                await self._fail_reconciliation(
+                    "open_order_reconciliation_failed",
+                    reason,
+                    symbol=symbol,
+                )
+                return None
+            snapshots[symbol] = (
+                {str(order.get("id", "")) for order in open_orders},
+                {str(order.get("id", "")) for order in conditional_orders},
+            )
+        return snapshots
 
     async def _finalize_exchange_closed_position(self, position_key: str) -> None:
         correlation_id = self.trade_correlation_ids.get(position_key, "")
@@ -824,10 +847,17 @@ class PositionManager:
             correlation_id=correlation_id,
         )
 
-    async def _finalize_filled_protective_legs(self) -> bool:
+    async def _finalize_filled_protective_legs(
+        self,
+        order_snapshots: dict[str, tuple[set[str], set[str]]],
+    ) -> bool:
         finalized = False
         for position_key in list(self.open_trades):
-            details = await self._filled_protective_exit_details(position_key)
+            trade = self.open_trades[position_key]
+            details = await self._filled_protective_exit_details(
+                position_key,
+                open_order_ids=order_snapshots.get(trade.symbol, (set(), set())),
+            )
             if details is None:
                 continue
             exit_price, reason = details
@@ -888,15 +918,26 @@ class PositionManager:
         )
 
     async def _filled_protective_exit_details(
-        self, position_key: str
+        self,
+        position_key: str,
+        *,
+        open_order_ids: tuple[set[str], set[str]] | None = None,
     ) -> tuple[float, str] | None:
         trade = self.open_trades[position_key]
+        standard_open, conditional_open = open_order_ids or (set(), set())
         candidates = (
             ("take_profit", self.active_tps.get(position_key), False),
             ("stop_loss", self.active_stops.get(position_key), True),
         )
         for reason, order_id, conditional in candidates:
             if not order_id:
+                continue
+            currently_open = (
+                order_id in conditional_open
+                if conditional
+                else order_id in standard_open
+            )
+            if currently_open:
                 continue
             order = await self._resolved_order(
                 trade.symbol,
