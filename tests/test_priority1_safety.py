@@ -65,6 +65,7 @@ class FakeClient:
         fetched_orders=None,
         order_history=None,
         conditional_history=None,
+        my_trades=None,
     ):
         self.positions = positions or []
         self.open_orders = open_orders or {}
@@ -72,6 +73,7 @@ class FakeClient:
         self.fetched_orders = fetched_orders or {}
         self.order_history = order_history or {}
         self.conditional_history = conditional_history or {}
+        self.my_trades = my_trades or {}
         self.fetch_order_calls = []
 
     async def fetch_positions(self):
@@ -90,6 +92,12 @@ class FakeClient:
         if conditional:
             return self.conditional_history.get(symbol, [])
         return self.order_history.get(symbol, [])
+
+    async def fetch_my_trades(self, symbol, order_id=None, limit=100):
+        trades = self.my_trades.get(symbol, [])
+        if order_id is None:
+            return trades
+        return [trade for trade in trades if str(trade.get("order")) == str(order_id)]
 
     async def fetch_ticker(self, symbol):
         return {"last": 100.0}
@@ -214,6 +222,28 @@ async def test_failed_add_on_keeps_existing_leg_protected(tmp_path):
     assert ("BTCUSDT", "sl-2", True) in orders.cancelled_orders
     assert ("BTCUSDT", "sl-1", True) not in orders.cancelled_orders
     assert ("BTCUSDT", "tp-1", False) not in orders.cancelled_orders
+
+
+@pytest.mark.asyncio
+async def test_close_all_submits_one_aggregate_exit_per_symbol(tmp_path):
+    orders = FakeOrderManager()
+    manager = build_manager(tmp_path, orders)
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0, timeframe="5m")
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0, timeframe="15m")
+
+    await manager.close_all()
+
+    exits = [order for order in orders.market_orders if order["reduce_only"]]
+    assert exits == [
+        {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "quantity": 4.0,
+            "reduce_only": True,
+        }
+    ]
+    assert manager.open_trades == {}
 
 
 @pytest.mark.asyncio
@@ -451,6 +481,63 @@ async def test_reconciliation_finalizes_one_filled_leg_and_keeps_other(tmp_path)
     assert set(manager.open_trades) == {"BTCUSDT:15m"}
     assert audit.load_open_trades("trade")[0]["correlation_id"] == "corr-open"
     assert ("BTCUSDT", "sl-5m", True) in orders.cancelled_orders
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_maps_net_reduction_to_missing_leg(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    old_opened = datetime.fromisoformat("2026-06-08T07:00:00+00:00")
+    new_opened = datetime.fromisoformat("2026-06-08T07:27:00+00:00")
+    for timeframe, correlation_id, opened_at in (
+        ("1h", "corr-old", old_opened),
+        ("5m", "corr-new", new_opened),
+    ):
+        trade = TradeRecord(
+            symbol="BNBUSDT",
+            side="short",
+            entry_price=596.22,
+            quantity=0.16,
+            timestamp=opened_at,
+            timeframe=timeframe,
+        )
+        audit.record_open_trade(
+            trade,
+            mode="trade",
+            correlation_id=correlation_id,
+            stop_loss=597.22,
+            take_profit=594.21,
+            stop_order_id=f"sl-{timeframe}",
+            take_profit_order_id=f"tp-{timeframe}",
+        )
+    client = FakeClient(
+        positions=[{"symbol": "BNBUSDT", "contracts": 0.16, "side": "short"}],
+        open_orders={"BNBUSDT": [{"id": "tp-1h"}]},
+        conditional_orders={"BNBUSDT": [{"id": "sl-1h"}]},
+        my_trades={
+            "BNBUSDT": [
+                {
+                    "id": "exit-1",
+                    "order": "generated-stop-exit",
+                    "timestamp": 1780904896287,
+                    "side": "buy",
+                    "amount": 0.16,
+                    "price": 597.22,
+                }
+            ]
+        },
+    )
+    orders = FakeOrderManager()
+    manager = build_manager(tmp_path, orders, client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is True
+    assert set(manager.open_trades) == {"BNBUSDT:1h"}
+    closed = {row["correlation_id"]: row for row in audit.load_trades(10)}
+    assert closed["corr-new"]["status"] == "closed"
+    assert closed["corr-new"]["exit_reason"] == "stop_loss"
+    assert closed["corr-new"]["exit_price"] == pytest.approx(597.22)
+    assert ("BNBUSDT", "tp-5m", False) in orders.cancelled_orders
 
 
 @pytest.mark.asyncio

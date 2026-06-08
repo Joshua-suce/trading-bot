@@ -2,6 +2,7 @@
 import asyncio
 import time
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import uuid4
 
 from loguru import logger
@@ -367,10 +368,121 @@ class PositionManager:
 
     # Close every open position (e.g. on shutdown)
     async def close_all(self):
-        for symbol in list(self.open_trades.keys()):
-            await self.exit_position(symbol, "close_all")
+        symbols = {trade.symbol for trade in self.open_trades.values()}
+        for symbol in symbols:
+            await self._close_symbol_positions(symbol, "close_all")
+
+    async def _close_symbol_positions(
+        self,
+        symbol: str,
+        reason: str,
+    ) -> bool:
+        symbol_trades = self._trades_for_symbol(symbol)
+        if not symbol_trades:
+            return True
+        sides = {trade.side for _, trade in symbol_trades}
+        if len(sides) != 1:
+            message = f"cannot aggregate mixed-side exits for {symbol}"
+            await self._fail_reconciliation(
+                "aggregate_exit_side_mismatch",
+                message,
+                symbol=symbol,
+            )
+            return False
+
+        trade_side = next(iter(sides))
+        exit_side = "sell" if trade_side == "long" else "buy"
+        quantity = sum(trade.quantity for _, trade in symbol_trades)
+        order = await self.orders.market_order(
+            symbol,
+            exit_side,
+            quantity,
+            reduce_only=True,
+        )
+        confirmed_order = await self._confirmed_full_fill(
+            order,
+            symbol,
+            quantity,
+        )
+        if confirmed_order is None:
+            message = f"aggregate exit order failed for {symbol}"
+            logger.critical(message)
+            self.audit_store.activate_emergency_stop(message)
+            self._audit(
+                "aggregate_exit_failed",
+                message,
+                severity="critical",
+                symbol=symbol,
+                payload={
+                    "quantity": quantity,
+                    "position_keys": [key for key, _ in symbol_trades],
+                },
+            )
+            await self._notify_trade_failed(symbol, message)
+            return False
+
+        fallback_price = (
+            sum(trade.entry_price * trade.quantity for _, trade in symbol_trades)
+            / quantity
+        )
+        exit_price = await self._resolve_exit_price(
+            confirmed_order,
+            symbol,
+            fallback_price,
+        )
+        for position_key, _ in list(symbol_trades):
+            await self._finalize_trade_leg(
+                position_key,
+                exit_price=exit_price,
+                reason=reason,
+                correlation_id=self.trade_correlation_ids.get(position_key, ""),
+            )
+        return True
 
     async def reconcile_exchange_state(self) -> bool | None:
+        state = await self._reconciliation_state()
+        if state is None or state is False:
+            return state
+        exchange_positions, order_snapshots = state
+
+        changed = await self._reconcile_partial_exchange_exits(
+            exchange_positions,
+            order_snapshots,
+        )
+        if changed:
+            state = await self._reconciliation_state()
+            if state is None or state is False:
+                return state
+            exchange_positions, order_snapshots = state
+
+        changed = await self._finalize_filled_protective_legs(order_snapshots)
+        if changed:
+            state = await self._reconciliation_state()
+            if state is None or state is False:
+                return state
+            exchange_positions, order_snapshots = state
+
+        await self._clear_missing_exchange_positions(set(exchange_positions))
+
+        if not await self._verify_exchange_position_details(exchange_positions):
+            return False
+
+        if not await self._verify_all_protective_orders(order_snapshots):
+            return False
+
+        self._audit("reconciliation_ok", "Exchange state reconciled")
+        return True
+
+    async def _reconciliation_state(
+        self,
+    ) -> (
+        tuple[
+            dict[str, dict],
+            dict[str, tuple[set[str], set[str]]],
+        ]
+        | Literal[False]
+        | None
+    ):
         positions = await self._fetch_positions_for_reconciliation()
         if positions is None:
             return None
@@ -388,33 +500,7 @@ class PositionManager:
         order_snapshots = await self._protective_order_snapshots()
         if order_snapshots is None:
             return False
-
-        if await self._finalize_filled_protective_legs(order_snapshots):
-            positions = await self._fetch_positions_for_reconciliation()
-            if positions is None:
-                return None
-            exchange_positions, unmanaged = self._classify_exchange_positions(positions)
-            if unmanaged:
-                reason = f"unmanaged exchange positions detected: {unmanaged}"
-                await self._fail_reconciliation(
-                    "unmanaged_positions",
-                    reason,
-                    payload={"positions": unmanaged},
-                )
-                return False
-            order_snapshots = await self._protective_order_snapshots()
-            if order_snapshots is None:
-                return False
-        await self._clear_missing_exchange_positions(set(exchange_positions))
-
-        if not await self._verify_exchange_position_details(exchange_positions):
-            return False
-
-        if not await self._verify_all_protective_orders(order_snapshots):
-            return False
-
-        self._audit("reconciliation_ok", "Exchange state reconciled")
-        return True
+        return exchange_positions, order_snapshots
 
     async def _fetch_positions_for_reconciliation(self) -> list[dict] | None:
         try:
@@ -549,6 +635,157 @@ class PositionManager:
                 redact_text(exc),
             )
         return 1e-12
+
+    async def _reconcile_partial_exchange_exits(
+        self,
+        exchange_positions: dict[str, dict],
+        order_snapshots: dict[str, tuple[set[str], set[str]]],
+    ) -> bool:
+        finalized = False
+        for symbol in {trade.symbol for trade in self.open_trades.values()}:
+            symbol_trades = self._trades_for_symbol(symbol)
+            audited_quantity = sum(trade.quantity for _, trade in symbol_trades)
+            position = exchange_positions.get(symbol)
+            exchange_quantity = abs(self._position_size(position)) if position else 0.0
+            tolerance = await self._quantity_tolerance(symbol)
+            missing_quantity = audited_quantity - exchange_quantity
+            if missing_quantity <= tolerance:
+                continue
+
+            candidates = self._missing_protection_candidates(
+                symbol_trades,
+                order_snapshots.get(symbol, (set(), set())),
+            )
+            executions = await self._exit_execution_groups(symbol)
+            consumed_orders: set[str] = set()
+            for position_key, trade in candidates:
+                execution = next(
+                    (
+                        item
+                        for item in executions
+                        if item["order_id"] not in consumed_orders
+                        and item["timestamp"] >= int(trade.timestamp.timestamp() * 1000)
+                        and item["side"] == ("sell" if trade.side == "long" else "buy")
+                        and abs(item["quantity"] - trade.quantity) <= tolerance
+                    ),
+                    None,
+                )
+                if execution is None:
+                    continue
+                reason = self._inferred_protective_exit_reason(
+                    position_key,
+                    trade,
+                    execution["price"],
+                )
+                await self._finalize_trade_leg(
+                    position_key,
+                    exit_price=execution["price"],
+                    reason=reason,
+                    correlation_id=self.trade_correlation_ids.get(position_key, ""),
+                )
+                consumed_orders.add(execution["order_id"])
+                missing_quantity -= trade.quantity
+                finalized = True
+                if missing_quantity <= tolerance:
+                    break
+        return finalized
+
+    def _missing_protection_candidates(
+        self,
+        symbol_trades: list[tuple[str, TradeRecord]],
+        order_ids: tuple[set[str], set[str]],
+    ) -> list[tuple[str, TradeRecord]]:
+        standard_open, conditional_open = order_ids
+        candidates = []
+        for position_key, trade in symbol_trades:
+            stop_id = self.active_stops.get(position_key)
+            target_id = self.active_tps.get(position_key)
+            if stop_id not in conditional_open or (
+                target_id and target_id not in standard_open
+            ):
+                candidates.append((position_key, trade))
+        return sorted(
+            candidates,
+            key=lambda item: item[1].timestamp,
+            reverse=True,
+        )
+
+    async def _exit_execution_groups(self, symbol: str) -> list[dict]:
+        fetch_my_trades = getattr(self.client, "fetch_my_trades", None)
+        if not callable(fetch_my_trades):
+            return []
+        try:
+            trades = await fetch_my_trades(symbol, limit=100)
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch exit executions for {}: {}",
+                symbol,
+                redact_text(exc),
+            )
+            return []
+
+        groups: dict[str, dict] = {}
+        for trade in trades:
+            info = trade.get("info") or {}
+            order_id = str(trade.get("order") or info.get("orderId") or "")
+            amount = float(
+                trade.get("amount") or info.get("qty") or info.get("quantity") or 0
+            )
+            price = float(trade.get("price") or info.get("price") or 0)
+            if not order_id or amount <= 0 or price <= 0:
+                continue
+            group = groups.setdefault(
+                order_id,
+                {
+                    "order_id": order_id,
+                    "timestamp": int(trade.get("timestamp") or 0),
+                    "side": str(trade.get("side") or "").lower(),
+                    "quantity": 0.0,
+                    "notional": 0.0,
+                },
+            )
+            group["timestamp"] = min(
+                group["timestamp"],
+                int(trade.get("timestamp") or 0),
+            )
+            group["quantity"] += amount
+            group["notional"] += amount * price
+        executions = []
+        for group in groups.values():
+            quantity = group["quantity"]
+            executions.append(
+                {
+                    **group,
+                    "price": group["notional"] / quantity,
+                }
+            )
+        return sorted(executions, key=lambda item: item["timestamp"])
+
+    def _inferred_protective_exit_reason(
+        self,
+        position_key: str,
+        trade: TradeRecord,
+        exit_price: float,
+    ) -> str:
+        profitable = (
+            exit_price > trade.entry_price
+            if trade.side == "long"
+            else exit_price < trade.entry_price
+        )
+        reason = "take_profit" if profitable else "stop_loss"
+        self._audit(
+            "protective_exit_inferred",
+            f"Inferred {reason} execution for {position_key}",
+            severity="warning",
+            symbol=trade.symbol,
+            correlation_id=self.trade_correlation_ids.get(position_key),
+            payload={
+                "position_key": position_key,
+                "entry_price": trade.entry_price,
+                "exit_price": exit_price,
+            },
+        )
+        return reason
 
     async def _fail_reconciliation(
         self,
@@ -1120,7 +1357,8 @@ class PositionManager:
         if not callable(fetch_my_trades):
             return None
         matched: list[tuple[float, float]] = []
-        for attempt in range(1, 4):
+        attempts = settings.entry_fill_resolution_attempts
+        for attempt in range(1, attempts + 1):
             try:
                 trades = await fetch_my_trades(symbol, order_id=order_id)
             except Exception as exc:
@@ -1144,8 +1382,10 @@ class PositionManager:
                         sum(amount * price for amount, price in matched)
                         / filled_quantity
                     )
-            if attempt < 3:
-                await asyncio.sleep(0.25 * attempt)
+            if attempt < attempts:
+                await asyncio.sleep(
+                    settings.entry_fill_resolution_backoff_seconds * attempt
+                )
 
         if matched:
             logger.warning(

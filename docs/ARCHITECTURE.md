@@ -50,6 +50,10 @@ a valid strategy approval.
   symbol protection.
 - Reconciliation compares Binance's net symbol quantity with summed audit legs.
 - Completed leg protection is finalized before aggregate quantity validation.
+- Missing conditional history is recovered from private trade executions, so a
+  partial net-position reduction can be attributed to the correct audited leg.
+- Fatal shutdown submits one aggregate reduce-only exit per Binance symbol,
+  then closes the corresponding internal legs from the confirmed fill.
 - Failed emergency flattening activates emergency stop.
 - Unmanaged exchange positions block reconciliation.
 - Missing audited protection blocks reconciliation.
