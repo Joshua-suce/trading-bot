@@ -13,6 +13,7 @@ health checks, alerts, and Docker support.
 | `dashboard` | Open the Streamlit monitoring dashboard |
 | `admin` | Inspect or change operational controls |
 | `health` | Report audit, control, event, and open-position health |
+| `history` | View or export the durable trade recorder |
 | `soak` | Run a bounded offline reliability simulation through fake adapters |
 
 ## One Trading Setup
@@ -88,6 +89,11 @@ Demo Trading orders.
 # Health and monitoring
 .\scripts\run_bot.cmd --mode health
 .\scripts\run_bot.cmd --mode dashboard
+
+# Durable trade history
+.\scripts\run_bot.cmd --mode history --history-limit 50
+.\scripts\run_bot.cmd --mode history --history-symbol ETHUSDT --history-status closed
+.\scripts\run_bot.cmd --mode history --history-format csv --history-output data\reports\trade_history.csv
 
 # Offline operational soak
 .\scripts\run_bot.cmd --mode soak --soak-iterations 5

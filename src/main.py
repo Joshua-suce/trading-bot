@@ -24,6 +24,7 @@ def parse_args(argv: Optional[list[str]] = None):
             "dashboard",
             "admin",
             "health",
+            "history",
             "soak",
         ],
         help="Trading mode",
@@ -77,6 +78,36 @@ def parse_args(argv: Optional[list[str]] = None):
         type=str,
         default="data/reports/soak_report.json",
         help="Path for soak report JSON",
+    )
+    parser.add_argument(
+        "--history-limit",
+        type=int,
+        default=100,
+        help="Maximum trade-history records to return",
+    )
+    parser.add_argument(
+        "--history-status",
+        choices=["all", "open", "closed"],
+        default="all",
+        help="Filter trade history by lifecycle status",
+    )
+    parser.add_argument(
+        "--history-symbol",
+        type=str,
+        default="",
+        help="Optional symbol filter for trade history",
+    )
+    parser.add_argument(
+        "--history-format",
+        choices=["table", "json", "csv"],
+        default="table",
+        help="Trade-history output format",
+    )
+    parser.add_argument(
+        "--history-output",
+        type=str,
+        default="",
+        help="Optional file path for JSON or CSV history output",
     )
     return parser.parse_args(argv)
 
@@ -202,6 +233,37 @@ def run_health() -> int:
     return 1 if report.status == "critical" else 0
 
 
+def run_history(
+    *,
+    limit: int,
+    status: str,
+    output_format: str,
+    output_path: str = "",
+    symbol: str | None = None,
+) -> int:
+    from src.audit import AuditStore
+    from src.monitoring.history import (
+        history_payload,
+        render_history,
+        write_history_output,
+    )
+
+    audit_store = AuditStore()
+    payload = history_payload(
+        audit_store,
+        limit=limit,
+        status=status,
+        symbol=symbol,
+    )
+    content = render_history(payload, output_format)
+    if output_path:
+        path = write_history_output(content, output_path)
+        logger.info(f"Trade history written to {path}")
+    else:
+        print(content)
+    return 0
+
+
 async def run_soak(iterations: int, report_path: str) -> int:
     from src.config import settings
     from src.soak import SoakRunner
@@ -238,6 +300,16 @@ def main():
         run_admin(args.admin_action, args.reason)
     elif args.mode == "health":
         raise SystemExit(run_health())
+    elif args.mode == "history":
+        raise SystemExit(
+            run_history(
+                limit=args.history_limit,
+                status=args.history_status,
+                output_format=args.history_format,
+                output_path=args.history_output,
+                symbol=args.history_symbol or None,
+            )
+        )
     else:
         logger.error(f"Unknown mode: {args.mode}")
         sys.exit(2)

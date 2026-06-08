@@ -69,3 +69,28 @@ def test_parse_args_admin_controls():
 def test_parse_args_admin_alert_test():
     args = parse_args(["--mode", "admin", "--admin-action", "test-alert"])
     assert args.admin_action == "test-alert"
+
+
+def test_parse_args_history_options():
+    args = parse_args(
+        [
+            "--mode",
+            "history",
+            "--history-limit",
+            "25",
+            "--history-status",
+            "closed",
+            "--history-symbol",
+            "ETHUSDT",
+            "--history-format",
+            "csv",
+            "--history-output",
+            "history.csv",
+        ]
+    )
+    assert args.mode == "history"
+    assert args.history_limit == 25
+    assert args.history_status == "closed"
+    assert args.history_symbol == "ETHUSDT"
+    assert args.history_format == "csv"
+    assert args.history_output == "history.csv"

@@ -63,6 +63,7 @@ def render_dashboard(audit_store: AuditStore | None = None) -> None:
 
     st.set_page_config(page_title="AI Trading Bot", layout="wide")
     st.title("AI Trading Bot Dashboard")
+    st.caption(f"Trade recorder: {audit_store.db_path}")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:

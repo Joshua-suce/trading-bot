@@ -16,7 +16,10 @@ from src.security import redact_mapping, redact_text
 
 class AuditStore:
     def __init__(self, db_path: str | None = None) -> None:
-        self.db_path = Path(db_path or settings.audit_db_path)
+        configured_path = Path(db_path or settings.audit_db_path).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = Path(__file__).resolve().parents[2] / configured_path
+        self.db_path = configured_path.resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
         self._retire_legacy_open_trades()
@@ -96,6 +99,18 @@ class AuditStore:
             self._ensure_column(conn, "trades", "stop_order_id", "TEXT")
             self._ensure_column(conn, "trades", "take_profit_order_id", "TEXT")
             self._ensure_column(conn, "trades", "timeframe", "TEXT")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trades_status_updated
+                ON trades(status, updated_at DESC)
+                """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trades_symbol_closed
+                ON trades(symbol, closed_at DESC)
+                """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp
+                ON audit_events(ts_utc DESC)
+                """)
 
     @staticmethod
     def _ensure_column(
@@ -284,27 +299,48 @@ class AuditStore:
     def record_closed_trade(
         self, trade: TradeRecord, *, mode: str, correlation_id: str
     ) -> None:
+        if not correlation_id:
+            raise ValueError("correlation_id is required to record a closed trade")
+        closed_at = self._now()
         with self._connection() as conn:
             conn.execute(
                 """
-                UPDATE trades
-                SET status='closed',
+                INSERT INTO trades (
+                    correlation_id, symbol, side, mode, status, entry_price,
+                    quantity, opened_at, exit_price, pnl, pnl_pct, exit_reason,
+                    closed_at, updated_at, timeframe
+                )
+                VALUES (?, ?, ?, ?, 'closed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(correlation_id) DO UPDATE SET
+                    status='closed',
                     exit_price=?,
                     pnl=?,
                     pnl_pct=?,
                     exit_reason=?,
                     closed_at=?,
                     updated_at=?
-                WHERE correlation_id=?
                 """,
                 (
+                    correlation_id,
+                    trade.symbol,
+                    trade.side,
+                    mode,
+                    trade.entry_price,
+                    trade.quantity,
+                    trade.timestamp.isoformat(),
                     trade.exit_price,
                     trade.pnl,
                     trade.pnl_pct,
                     trade.exit_reason,
-                    self._now(),
-                    self._now(),
-                    correlation_id,
+                    closed_at,
+                    closed_at,
+                    trade.timeframe,
+                    trade.exit_price,
+                    trade.pnl,
+                    trade.pnl_pct,
+                    trade.exit_reason,
+                    closed_at,
+                    closed_at,
                 ),
             )
         self.record_event(
@@ -369,16 +405,32 @@ class AuditStore:
         return [dict(row) for row in rows]
 
     def load_trades(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.load_trade_history(limit=limit)
+
+    def load_trade_history(
+        self,
+        *,
+        limit: int = 100,
+        status: str | None = None,
+        symbol: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("history limit must be at least 1")
+        query = "SELECT * FROM trades"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status and status != "all":
+            clauses.append("status = ?")
+            params.append(status)
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
         with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM trades
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+            rows = conn.execute(query, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
     def load_closed_trades(self, limit: int = 1000) -> list[dict[str, Any]]:

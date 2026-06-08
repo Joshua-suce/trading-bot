@@ -1,11 +1,9 @@
 import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 from src.audit import AuditStore
-from src.config import settings
 
 
 @dataclass(frozen=True)
@@ -52,7 +50,7 @@ class HealthChecker:
             trading_state_reason=reason,
             open_trades=len(self.audit_store.load_open_trades()) if audit_ok else 0,
             critical_events_24h=critical_events,
-            audit_db_path=str(Path(settings.audit_db_path)),
+            audit_db_path=str(self.audit_store.db_path),
             checked_at=datetime.now(timezone.utc).isoformat(),
         )
 
