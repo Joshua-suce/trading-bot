@@ -2,6 +2,7 @@
 import asyncio
 import html
 import time
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -13,6 +14,7 @@ from src.exchange.client import ExchangeClient
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
 from src.live.data_quality import OHLCVQualityValidator, timeframe_seconds
+from src.models.classifier import XGBoostClassifier
 from src.models.ensemble import ModelEnsemble
 from src.monitoring.alerter import Alerter
 from src.risk.portfolio import PortfolioManager
@@ -57,7 +59,7 @@ class LiveTradingLoop:
             mode=self.mode,
             audit_store=self.audit_store,
         )
-        self.ensemble = ensemble or ModelEnsemble()
+        self.ensemble = ensemble if ensemble is not None else self._load_ensemble()
         self.aggregator = SignalAggregator(self.ensemble)
         self.data_quality = OHLCVQualityValidator()
         self._last_processed_candles: dict[str, object] = {}
@@ -91,6 +93,7 @@ class LiveTradingLoop:
                 payload={
                     "symbols": settings.symbols_list,
                     "timeframes": settings.timeframes_list,
+                    "ml_model_ready": self.ensemble.is_ready(),
                 },
             )
 
@@ -160,7 +163,11 @@ class LiveTradingLoop:
         for symbol, timeframe in self._due_scan_pairs(now):
             await self._process_timeframe(symbol, timeframe)
             self._next_scan_due[self._scan_key(symbol, timeframe)] = (
-                now + self._timeframe_seconds(timeframe)
+                self._next_candle_scan_due(
+                    timeframe,
+                    monotonic_now=time.monotonic(),
+                    epoch_now=time.time(),
+                )
             )
 
     def _due_scan_pairs(self, now: float) -> list[tuple[str, str]]:
@@ -331,6 +338,45 @@ class LiveTradingLoop:
     @staticmethod
     def _timeframe_seconds(timeframe: str) -> int:
         return timeframe_seconds(timeframe)
+
+    @classmethod
+    def _next_candle_scan_due(
+        cls,
+        timeframe: str,
+        *,
+        monotonic_now: float,
+        epoch_now: float,
+    ) -> float:
+        interval = cls._timeframe_seconds(timeframe)
+        next_boundary = (int(epoch_now) // interval + 1) * interval
+        delay = next_boundary - epoch_now + settings.candle_close_grace_seconds
+        return monotonic_now + max(delay, settings.scan_sleep_seconds)
+
+    @staticmethod
+    def _load_ensemble() -> ModelEnsemble:
+        model_dir = Path(settings.model_dir).expanduser()
+        if not model_dir.is_absolute():
+            model_dir = Path(__file__).resolve().parents[2] / model_dir
+        model_path = model_dir / "xgb_classifier.json"
+        if not model_path.exists():
+            logger.warning(
+                "No trained XGBoost model found at {}; TA-only signals are active",
+                model_path,
+            )
+            return ModelEnsemble()
+        try:
+            model = XGBoostClassifier()
+            model.load(str(model_path))
+        except Exception as exc:
+            logger.error(
+                "Could not load XGBoost model from {}: {}. "
+                "TA-only signals are active",
+                model_path,
+                redact_text(exc),
+            )
+            return ModelEnsemble()
+        logger.info("Loaded XGBoost trading model from {}", model_path)
+        return ModelEnsemble(xgb_model=model)
 
     # Called on each new closed candle.
     async def _on_candle(self, candle: dict, df_ind=None):

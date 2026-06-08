@@ -61,3 +61,28 @@ def test_trainer_prepare_data_with_raw_ohlcv():
     assert X.ndim == 2
     assert len(y) == X.shape[0]
     assert set(y).issubset({-1, 0, 1})
+
+
+def test_xgboost_classifier_encodes_direction_labels_and_round_trips(tmp_path):
+    from src.models.classifier import XGBoostClassifier
+
+    rng = np.random.default_rng(42)
+    X = rng.normal(size=(40, 5))
+    y = np.array([-1, 1] * 20)
+    model = XGBoostClassifier(n_estimators=2, max_depth=2)
+
+    model.train(X, y)
+    predictions, confidence = model.predict_with_confidence(X[:4])
+
+    assert set(predictions).issubset({-1, 1})
+    assert np.all((confidence >= 0) & (confidence <= 1))
+
+    path = tmp_path / "xgb.json"
+    model.save(str(path))
+    assert (tmp_path / "xgb.meta.json").exists()
+    restored = XGBoostClassifier()
+    restored.load(str(path))
+
+    restored_predictions, restored_confidence = restored.predict_with_confidence(X[:4])
+    np.testing.assert_array_equal(restored_predictions, predictions)
+    np.testing.assert_allclose(restored_confidence, confidence)

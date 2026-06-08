@@ -1,5 +1,6 @@
 import asyncio
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -415,6 +416,42 @@ def test_timeframe_seconds_parses_supported_units():
     assert LiveTradingLoop._timeframe_seconds("5m") == 300
     assert LiveTradingLoop._timeframe_seconds("1h") == 3600
     assert LiveTradingLoop._timeframe_seconds("1d") == 86_400
+
+
+def test_next_scan_aligns_to_exchange_candle_boundary(monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "candle_close_grace_seconds",
+        2.0,
+    )
+    monkeypatch.setattr(live_loop_module.settings, "scan_sleep_seconds", 5.0)
+
+    due = LiveTradingLoop._next_candle_scan_due(
+        "15m",
+        monotonic_now=100.0,
+        epoch_now=12 * 3600 + 7 * 60,
+    )
+
+    assert due == 100.0 + 8 * 60 + 2.0
+
+
+def test_live_loop_loads_configured_xgboost_model(monkeypatch, tmp_path):
+    model_path = tmp_path / "xgb_classifier.json"
+    model_path.write_text("{}", encoding="utf-8")
+
+    class FakeClassifier:
+        def load(self, path):
+            assert path == str(model_path)
+
+        def predict_with_confidence(self, X):
+            return np.array([1]), np.array([0.9])
+
+    monkeypatch.setattr(live_loop_module.settings, "model_dir", str(tmp_path))
+    monkeypatch.setattr(live_loop_module, "XGBoostClassifier", FakeClassifier)
+
+    ensemble = LiveTradingLoop._load_ensemble()
+
+    assert ensemble.is_ready()
 
 
 @pytest.mark.asyncio

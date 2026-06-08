@@ -7,6 +7,7 @@ import pandas as pd
 from loguru import logger
 from sklearn.model_selection import train_test_split
 
+from src.config import settings
 from src.models.ensemble import ModelEnsemble
 from src.models.feature_engineer import FeatureEngineer
 
@@ -21,10 +22,15 @@ except ImportError:
 
 
 class ModelTrainer:
-    def __init__(self, model_dir: str = "data/models", lookback: int = 100):
-        self.model_dir = Path(model_dir)
+    def __init__(self, model_dir: str | None = None, lookback: int | None = None):
+        configured_dir = Path(model_dir or settings.model_dir).expanduser()
+        if not configured_dir.is_absolute():
+            configured_dir = Path(__file__).resolve().parents[2] / configured_dir
+        self.model_dir = configured_dir.resolve()
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        self.feature_engineer = FeatureEngineer(lookback=lookback)
+        self.feature_engineer = FeatureEngineer(
+            lookback=lookback or settings.feature_lookback
+        )
 
     # Full pipeline: indicators → features → drop NaN → matrix + labels
     def prepare_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -51,7 +57,7 @@ class ModelTrainer:
         model.train(X_train, y_train, eval_set=(X_test, y_test))
 
         if save:
-            path = str(self.model_dir / "xgb_classifier.joblib")
+            path = str(self.model_dir / "xgb_classifier.json")
             model.save(path)
         return model
 

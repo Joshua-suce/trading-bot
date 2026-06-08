@@ -159,3 +159,27 @@ async def test_order_manager_allows_reduce_only_exit_despite_slippage(tmp_path):
 
     assert order is not None
     assert client.created_orders[0]["amount"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_order_manager_allows_reduce_only_exit_below_notional_minimum(tmp_path):
+    client = FakeExchangeClient(
+        market={
+            "precision": {"amount": 3, "price": 2},
+            "limits": {"amount": {"min": 0.001}, "cost": {"min": 50.0}},
+        }
+    )
+    orders = OrderManager(
+        client,
+        guard=ExecutionGuard(max_slippage_bps=1.0, min_notional=50.0),
+    )
+
+    order = await orders.market_order(
+        "BTCUSDT",
+        "sell",
+        0.01,
+        reduce_only=True,
+    )
+
+    assert order is not None
+    assert client.created_orders[0]["params"]["reduceOnly"] is True

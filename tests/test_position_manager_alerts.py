@@ -434,6 +434,37 @@ async def test_exit_keeps_trade_open_when_fill_is_not_confirmed(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_exit_confirmation_recovers_fill_from_private_executions(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+
+    async def ambiguous_exit(symbol, side, quantity, reduce_only=False):
+        return {
+            "id": "exit-ledger-1",
+            "filled": 0.0,
+            "average": None,
+            "status": "open",
+        }
+
+    async def execution_fills(symbol, order_id=None, limit=100):
+        if order_id != "exit-ledger-1":
+            return []
+        return [
+            {"order": order_id, "amount": 0.4, "price": 101.0},
+            {"order": order_id, "amount": 0.6, "price": 102.0},
+        ]
+
+    manager.orders.market_order = ambiguous_exit
+    manager.client.fetch_my_trades = execution_fills
+
+    await manager.exit_position("BTCUSDT", reason="manual")
+
+    assert manager.open_trades == {}
+    assert alerter.completed[0]["exit_price"] == pytest.approx(101.6)
+
+
+@pytest.mark.asyncio
 async def test_exposure_blocks_max_open_positions(monkeypatch, tmp_path):
     from src.execution import position_manager as position_manager_module
 

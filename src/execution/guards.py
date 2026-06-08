@@ -48,9 +48,20 @@ class ExecutionGuard:
         prepared_price = self._price_to_precision(market, price)
         reference_price = prepared_price or await self._reference_price(client, symbol)
         notional = prepared_quantity * reference_price
+        reduce_only = bool(params.get("reduceOnly"))
 
         minimum_amount = self._market_min_amount(market)
-        if prepared_quantity <= 0 or prepared_quantity < minimum_amount:
+        if prepared_quantity <= 0:
+            return PreparedOrder(
+                False,
+                f"amount below minimum: {prepared_quantity:.8f} < "
+                f"{minimum_amount:.8f}",
+                quantity=prepared_quantity,
+                price=prepared_price,
+                reference_price=reference_price,
+                notional=notional,
+            )
+        if not reduce_only and prepared_quantity < minimum_amount:
             return PreparedOrder(
                 False,
                 f"amount below minimum: {prepared_quantity:.8f} < "
@@ -63,7 +74,7 @@ class ExecutionGuard:
 
         min_notional = self._market_min_notional(market)
         required_notional = max(self.min_notional, min_notional)
-        if notional < required_notional:
+        if not reduce_only and notional < required_notional:
             return PreparedOrder(
                 False,
                 f"notional below minimum: {notional:.8f} < {required_notional:.8f}",
@@ -73,7 +84,6 @@ class ExecutionGuard:
                 notional=notional,
             )
 
-        reduce_only = bool(params.get("reduceOnly"))
         if order_type == "market" and not reduce_only:
             slippage = await self._market_slippage_bps(client, symbol, side)
             if slippage > self.max_slippage_bps:

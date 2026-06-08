@@ -52,6 +52,10 @@ a valid strategy approval.
 - Completed leg protection is finalized before aggregate quantity validation.
 - Missing conditional history is recovered from private trade executions, so a
   partial net-position reduction can be attributed to the correct audited leg.
+- Ambiguous market exits are confirmed from private executions by exact order
+  ID before the bot declares the exit failed.
+- Timeframe scans are aligned to UTC exchange candle boundaries with a short
+  close grace period, while duplicate-candle suppression preserves idempotency.
 - Fatal shutdown submits one aggregate reduce-only exit per Binance symbol,
   then closes the corresponding internal legs from the confirmed fill.
 - Failed emergency flattening activates emergency stop.

@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     timeframes: str = "5m,15m,30m,1h,4h,1d"
     position_scope: str = "symbol"
     scan_sleep_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    candle_close_grace_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     account_refresh_interval_seconds: float = Field(default=60.0, ge=10.0, le=600.0)
     reconciliation_interval_seconds: float = Field(default=30.0, ge=10.0, le=3600.0)
     min_ohlcv_candles: int = Field(default=200, ge=200, le=1000)

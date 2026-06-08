@@ -1353,6 +1353,19 @@ class PositionManager:
         order_id: str,
         expected_quantity: float,
     ) -> float | None:
+        fill = await self._execution_fill_details(
+            symbol,
+            order_id,
+            expected_quantity,
+        )
+        return fill[1] if fill is not None else None
+
+    async def _execution_fill_details(
+        self,
+        symbol: str,
+        order_id: str,
+        expected_quantity: float,
+    ) -> tuple[float, float] | None:
         fetch_my_trades = getattr(self.client, "fetch_my_trades", None)
         if not callable(fetch_my_trades):
             return None
@@ -1379,8 +1392,9 @@ class PositionManager:
                     or filled_quantity >= expected_quantity - tolerance
                 ):
                     return (
+                        filled_quantity,
                         sum(amount * price for amount, price in matched)
-                        / filled_quantity
+                        / filled_quantity,
                     )
             if attempt < attempts:
                 await asyncio.sleep(
@@ -1723,9 +1737,25 @@ class PositionManager:
             refreshed = await self.client.fetch_order(order_id, symbol)
         except Exception as exc:
             logger.warning(f"Could not confirm exit fill for {symbol}: {exc}")
-            return None
-        if float(refreshed.get("filled") or 0) >= expected_quantity - tolerance:
+            refreshed = None
+        if (
+            refreshed
+            and float(refreshed.get("filled") or 0) >= expected_quantity - tolerance
+        ):
             return refreshed
+        execution_fill = await self._execution_fill_details(
+            symbol,
+            order_id,
+            expected_quantity,
+        )
+        if execution_fill is not None:
+            filled_quantity, average_price = execution_fill
+            return {
+                **order,
+                "filled": filled_quantity,
+                "average": average_price,
+                "status": "closed",
+            }
         return None
 
     def _audit(
