@@ -81,13 +81,9 @@ class PositionManager:
             symbol, "long", price, pos_size.quantity, position_key
         )
         if not exposure_ok:
-            logger.warning(f"Exposure limit blocked {symbol}: {exposure_reason}")
-            await self._notify_trade_failed(symbol, exposure_reason)
-            self._audit(
-                "trade_blocked_exposure",
+            await self._report_entry_limit_block(
+                symbol,
                 exposure_reason,
-                severity="warning",
-                symbol=symbol,
                 payload={
                     "price": price,
                     "quantity": pos_size.quantity,
@@ -224,13 +220,9 @@ class PositionManager:
             symbol, "short", price, pos_size.quantity, position_key
         )
         if not exposure_ok:
-            logger.warning(f"Exposure limit blocked {symbol}: {exposure_reason}")
-            await self._notify_trade_failed(symbol, exposure_reason)
-            self._audit(
-                "trade_blocked_exposure",
+            await self._report_entry_limit_block(
+                symbol,
                 exposure_reason,
-                severity="warning",
-                symbol=symbol,
                 payload={
                     "price": price,
                     "quantity": pos_size.quantity,
@@ -737,6 +729,39 @@ class PositionManager:
     async def _notify_trade_failed(self, symbol: str, reason: str):
         if self.alerter:
             await self.alerter.trade_failed_alert(self.mode, symbol, reason)
+
+    async def _report_entry_limit_block(
+        self,
+        symbol: str,
+        reason: str,
+        *,
+        payload: dict,
+    ) -> None:
+        expected_policy_block = reason.startswith(
+            (
+                "opposite-side entry blocked",
+                "trade leg already open",
+                "max trade legs",
+            )
+        )
+        if expected_policy_block:
+            logger.info(f"Entry skipped for {symbol}: {reason}")
+            self._audit(
+                "trade_skipped_policy",
+                reason,
+                symbol=symbol,
+                payload=payload,
+            )
+            return
+        logger.warning(f"Exposure limit blocked {symbol}: {reason}")
+        await self._notify_trade_failed(symbol, reason)
+        self._audit(
+            "trade_blocked_exposure",
+            reason,
+            severity="warning",
+            symbol=symbol,
+            payload=payload,
+        )
 
     def _order_failure_reason(self, symbol: str, fallback: str) -> str:
         failure_reason = getattr(self.orders, "failure_reason", None)
