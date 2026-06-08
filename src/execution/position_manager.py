@@ -618,11 +618,10 @@ class PositionManager:
             restored += 1
 
         if restored:
-            logger.warning(f"Restored {restored} open trade(s) from audit store")
+            logger.info(f"Restored {restored} open trade(s) from audit store")
             self._audit(
                 "open_trades_restored",
                 f"Restored {restored} open trade(s) from audit store",
-                severity="warning",
                 payload={"count": restored},
             )
         return restored
