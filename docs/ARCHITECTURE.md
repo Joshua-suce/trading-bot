@@ -12,8 +12,8 @@ trade mode
   -> TA/ML signal aggregation
   -> portfolio and exposure controls
   -> precision/slippage/minimum-notional guards
-  -> market entry
-  -> stop-loss and take-profit orders
+  -> controlled same-direction market entry leg
+  -> leg-owned stop-loss and take-profit orders
   -> audit, alerts, monitoring, and reconciliation
 ```
 
@@ -46,6 +46,10 @@ a valid strategy approval.
 ## Failure Safety
 
 - Missing protective orders trigger emergency flattening.
+- Failed add-on protection rolls back only the new leg and preserves existing
+  symbol protection.
+- Reconciliation compares Binance's net symbol quantity with summed audit legs.
+- Completed leg protection is finalized before aggregate quantity validation.
 - Failed emergency flattening activates emergency stop.
 - Unmanaged exchange positions block reconciliation.
 - Missing audited protection blocks reconciliation.

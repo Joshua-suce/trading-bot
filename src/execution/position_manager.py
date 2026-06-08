@@ -78,7 +78,7 @@ class PositionManager:
             return False
 
         exposure_ok, exposure_reason = self._check_exposure_limits(
-            symbol, price, pos_size.quantity, position_key
+            symbol, "long", price, pos_size.quantity, position_key
         )
         if not exposure_ok:
             logger.warning(f"Exposure limit blocked {symbol}: {exposure_reason}")
@@ -150,6 +150,8 @@ class PositionManager:
                     filled_quantity,
                     f"audit persistence failed after long entry: {exc}",
                     correlation_id,
+                    stop_order_id=stop_order_id,
+                    take_profit_order_id=take_profit_order_id,
                 )
                 return False
 
@@ -219,7 +221,7 @@ class PositionManager:
             return False
 
         exposure_ok, exposure_reason = self._check_exposure_limits(
-            symbol, price, pos_size.quantity, position_key
+            symbol, "short", price, pos_size.quantity, position_key
         )
         if not exposure_ok:
             logger.warning(f"Exposure limit blocked {symbol}: {exposure_reason}")
@@ -291,6 +293,8 @@ class PositionManager:
                     filled_quantity,
                     f"audit persistence failed after short entry: {exc}",
                     correlation_id,
+                    stop_order_id=stop_order_id,
+                    take_profit_order_id=take_profit_order_id,
                 )
                 return False
 
@@ -388,6 +392,19 @@ class PositionManager:
             )
             return False
 
+        if await self._finalize_filled_protective_legs():
+            positions = await self._fetch_positions_for_reconciliation()
+            if positions is None:
+                return None
+            exchange_positions, unmanaged = self._classify_exchange_positions(positions)
+            if unmanaged:
+                reason = f"unmanaged exchange positions detected: {unmanaged}"
+                await self._fail_reconciliation(
+                    "unmanaged_positions",
+                    reason,
+                    payload={"positions": unmanaged},
+                )
+                return False
         await self._clear_missing_exchange_positions(set(exchange_positions))
 
         if not await self._verify_exchange_position_details(exchange_positions):
@@ -464,37 +481,49 @@ class PositionManager:
     async def _verify_exchange_position_details(
         self, exchange_positions: dict[str, dict]
     ) -> bool:
-        for position_key, trade in self.open_trades.items():
-            position = exchange_positions.get(trade.symbol)
+        for symbol in {trade.symbol for trade in self.open_trades.values()}:
+            symbol_trades = self._trades_for_symbol(symbol)
+            position = exchange_positions.get(symbol)
             if position is None:
                 continue
             exchange_side = self._position_side(position)
-            if exchange_side and exchange_side != trade.side:
+            audit_sides = {trade.side for _, trade in symbol_trades}
+            if len(audit_sides) != 1:
+                reason = f"mixed audited sides detected for {symbol}: {audit_sides}"
+                await self._fail_reconciliation(
+                    "mixed_position_sides",
+                    reason,
+                    symbol=symbol,
+                )
+                return False
+            audit_side = next(iter(audit_sides))
+            if exchange_side and exchange_side != audit_side:
                 reason = (
-                    f"exchange side mismatch for {trade.symbol}: "
-                    f"audit={trade.side} exchange={exchange_side}"
+                    f"exchange side mismatch for {symbol}: "
+                    f"audit={audit_side} exchange={exchange_side}"
                 )
                 await self._fail_reconciliation(
                     "position_side_mismatch",
                     reason,
-                    symbol=trade.symbol,
-                    correlation_id=self.trade_correlation_ids.get(position_key),
+                    symbol=symbol,
+                    correlation_id=self.trade_correlation_ids.get(symbol_trades[0][0]),
                 )
                 return False
 
             exchange_quantity = abs(self._position_size(position))
-            tolerance = await self._quantity_tolerance(trade.symbol)
-            if abs(exchange_quantity - trade.quantity) > tolerance:
+            audit_quantity = sum(trade.quantity for _, trade in symbol_trades)
+            tolerance = await self._quantity_tolerance(symbol)
+            if abs(exchange_quantity - audit_quantity) > tolerance:
                 reason = (
-                    f"exchange quantity mismatch for {trade.symbol}: "
-                    f"audit={trade.quantity} exchange={exchange_quantity} "
+                    f"exchange quantity mismatch for {symbol}: "
+                    f"audit={audit_quantity} exchange={exchange_quantity} "
                     f"tolerance={tolerance}"
                 )
                 await self._fail_reconciliation(
                     "position_quantity_mismatch",
                     reason,
-                    symbol=trade.symbol,
-                    correlation_id=self.trade_correlation_ids.get(position_key),
+                    symbol=symbol,
+                    correlation_id=self.trade_correlation_ids.get(symbol_trades[0][0]),
                 )
                 return False
         return True
@@ -543,6 +572,7 @@ class PositionManager:
         for row in self.audit_store.load_open_trades(self.mode):
             symbol = self._normalize_symbol(row["symbol"])
             timeframe = row.get("timeframe")
+            correlation_id = str(row["correlation_id"])
             trade = TradeRecord(
                 symbol=symbol,
                 side=str(row["side"]),
@@ -552,7 +582,17 @@ class PositionManager:
                 timeframe=str(timeframe) if timeframe else None,
             )
             position_key = self.position_key(symbol, trade.timeframe)
-            correlation_id = str(row["correlation_id"])
+            if position_key in self.open_trades:
+                reason = f"duplicate audited trade leg detected: {position_key}"
+                self.audit_store.activate_emergency_stop(reason)
+                self._audit(
+                    "duplicate_trade_leg",
+                    reason,
+                    severity="critical",
+                    symbol=symbol,
+                    correlation_id=correlation_id,
+                )
+                continue
             self.open_trades[position_key] = trade
             self.trade_correlation_ids[position_key] = correlation_id
             stop_order_id = row.get("stop_order_id")
@@ -589,14 +629,33 @@ class PositionManager:
         return restored
 
     def _check_exposure_limits(
-        self, symbol: str, entry_price: float, quantity: float, position_key: str
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        quantity: float,
+        position_key: str,
     ) -> tuple[bool, str]:
         if position_key in self.open_trades:
-            return False, f"position already open: {position_key}"
+            return False, f"trade leg already open: {position_key}"
 
         open_count = len(self.open_trades)
         if open_count >= settings.max_open_positions:
             return False, f"max open positions reached: {open_count}"
+
+        symbol_trades = self._trades_for_symbol(symbol)
+        if len(symbol_trades) >= settings.max_positions_per_symbol:
+            return (
+                False,
+                f"max trade legs for {symbol} reached: {len(symbol_trades)}",
+            )
+        existing_sides = {trade.side for _, trade in symbol_trades}
+        if existing_sides and existing_sides != {side}:
+            return (
+                False,
+                f"opposite-side entry blocked for {symbol}: "
+                f"open side={next(iter(existing_sides))}, requested={side}",
+            )
 
         account = self.portfolio.account
         if account is None or account.total_equity <= 0:
@@ -756,11 +815,42 @@ class PositionManager:
         return True
 
     async def _finalize_exchange_closed_position(self, position_key: str) -> None:
-        trade = self.open_trades[position_key]
         correlation_id = self.trade_correlation_ids.get(position_key, "")
         exit_price, reason = await self._protective_exit_details(position_key)
+        await self._finalize_trade_leg(
+            position_key,
+            exit_price=exit_price,
+            reason=reason,
+            correlation_id=correlation_id,
+        )
+
+    async def _finalize_filled_protective_legs(self) -> bool:
+        finalized = False
+        for position_key in list(self.open_trades):
+            details = await self._filled_protective_exit_details(position_key)
+            if details is None:
+                continue
+            exit_price, reason = details
+            await self._finalize_trade_leg(
+                position_key,
+                exit_price=exit_price,
+                reason=reason,
+                correlation_id=self.trade_correlation_ids.get(position_key, ""),
+            )
+            finalized = True
+        return finalized
+
+    async def _finalize_trade_leg(
+        self,
+        position_key: str,
+        *,
+        exit_price: float,
+        reason: str,
+        correlation_id: str,
+    ) -> None:
+        trade = self.open_trades[position_key]
         logger.info(
-            f"{trade.symbol}: exchange position closed via {reason} at {exit_price}"
+            f"{position_key}: exchange trade leg closed via {reason} at {exit_price}"
         )
         self.portfolio.close_trade(trade, exit_price, reason)
         if correlation_id:
@@ -782,6 +872,24 @@ class PositionManager:
         self.last_symbol_exit_at[trade.symbol] = datetime.now(timezone.utc)
 
     async def _protective_exit_details(self, position_key: str) -> tuple[float, str]:
+        filled_details = await self._filled_protective_exit_details(position_key)
+        if filled_details is not None:
+            return filled_details
+
+        trade = self.open_trades[position_key]
+        execution_order = await self._latest_exit_order(trade)
+        if execution_order is not None:
+            price = self._positive_order_price(execution_order)
+            if price is not None:
+                return price, "exchange_close"
+        return (
+            await self._market_price(trade.symbol, trade.entry_price),
+            "exchange_close",
+        )
+
+    async def _filled_protective_exit_details(
+        self, position_key: str
+    ) -> tuple[float, str] | None:
         trade = self.open_trades[position_key]
         candidates = (
             ("take_profit", self.active_tps.get(position_key), False),
@@ -799,6 +907,10 @@ class PositionManager:
             if not self._order_is_filled(order):
                 continue
             assert order is not None
+            if reason == "take_profit":
+                price = self._positive_order_price(order)
+                if price is not None:
+                    return price, reason
             execution_order = await self._latest_exit_order(trade)
             if execution_order is not None:
                 execution_price = self._positive_order_price(execution_order)
@@ -808,16 +920,7 @@ class PositionManager:
             if price is None:
                 price = await self._market_price(trade.symbol, trade.entry_price)
             return price, reason
-
-        execution_order = await self._latest_exit_order(trade)
-        if execution_order is not None:
-            price = self._positive_order_price(execution_order)
-            if price is not None:
-                return price, "exchange_close"
-        return (
-            await self._market_price(trade.symbol, trade.entry_price),
-            "exchange_close",
-        )
+        return None
 
     async def _resolved_order(
         self,
@@ -981,10 +1084,22 @@ class PositionManager:
 
     @staticmethod
     def position_key(symbol: str, timeframe: str | None = None) -> str:
-        return PositionManager._normalize_symbol(symbol)
+        normalized_symbol = PositionManager._normalize_symbol(symbol)
+        normalized_timeframe = str(timeframe or "").strip()
+        if not normalized_timeframe:
+            return normalized_symbol
+        return f"{normalized_symbol}:{normalized_timeframe}"
 
     def _has_open_trade_for_symbol(self, symbol: str) -> bool:
-        return any(trade.symbol == symbol for trade in self.open_trades.values())
+        return bool(self._trades_for_symbol(symbol))
+
+    def _trades_for_symbol(self, symbol: str) -> list[tuple[str, TradeRecord]]:
+        normalized_symbol = self._normalize_symbol(symbol)
+        return [
+            (key, trade)
+            for key, trade in self.open_trades.items()
+            if self._normalize_symbol(trade.symbol) == normalized_symbol
+        ]
 
     def _reentry_cooldown_reason(self, symbol: str) -> str:
         if settings.reentry_cooldown_seconds <= 0:
@@ -1111,6 +1226,9 @@ class PositionManager:
         quantity: float,
         reason: str,
         correlation_id: str,
+        *,
+        stop_order_id: str | None = None,
+        take_profit_order_id: str | None = None,
     ) -> None:
         self.last_symbol_exit_at[self._normalize_symbol(symbol)] = datetime.now(
             timezone.utc
@@ -1124,7 +1242,11 @@ class PositionManager:
             correlation_id=correlation_id,
             payload={"exit_side": exit_side, "quantity": quantity},
         )
-        await self.orders.cancel_all_orders(symbol)
+        await self._cancel_leg_protection(
+            symbol,
+            stop_order_id=stop_order_id,
+            take_profit_order_id=take_profit_order_id,
+        )
         flatten_order = await self.orders.market_order(
             symbol, exit_side, quantity, reduce_only=True
         )
@@ -1185,8 +1307,26 @@ class PositionManager:
             quantity,
             f"protective order placement failed after {trade_side} entry",
             correlation_id,
+            stop_order_id=str(sl_order.get("id") or "") if sl_order else None,
+            take_profit_order_id=str(tp_order.get("id") or "") if tp_order else None,
         )
         return None
+
+    async def _cancel_leg_protection(
+        self,
+        symbol: str,
+        *,
+        stop_order_id: str | None,
+        take_profit_order_id: str | None,
+    ) -> None:
+        if stop_order_id:
+            await self.orders.cancel_order(
+                symbol,
+                stop_order_id,
+                conditional=True,
+            )
+        if take_profit_order_id:
+            await self.orders.cancel_order(symbol, take_profit_order_id)
 
     async def _confirmed_full_fill(
         self, order: dict | None, symbol: str, expected_quantity: float

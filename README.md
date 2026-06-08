@@ -56,10 +56,22 @@ from being sent to an unknown endpoint.
 5. Validate closed OHLCV candles.
 6. Blend EMA 50/200 trend, Fibonacci retracement confluence, supporting
    technical signals, and trained ML predictions.
-7. Apply risk, loss, drawdown, position-count, and exposure controls.
+7. Apply risk, loss, drawdown, trade-leg, and exposure controls.
 8. Submit a market entry.
 9. Submit reduce-only stop-loss and take-profit protection.
 10. Audit and alert every lifecycle event.
+
+## Controlled Pyramiding
+
+The bot may hold up to three same-direction trade legs per symbol, with at most
+one leg from each timeframe. Binance exposes these legs as one aggregate
+position, while the bot retains separate audit, stop-loss, take-profit, and
+alert ownership for each leg.
+
+The default portfolio limits allow six legs globally, three per symbol, 10%
+notional exposure per symbol, and 20% total notional exposure. A fourth leg,
+an opposite-direction leg, a duplicate timeframe, or any entry exceeding an
+exposure limit is rejected before order submission.
 
 There is no locally simulated paper-trading branch. Demo trading uses Binance
 Demo Trading orders.

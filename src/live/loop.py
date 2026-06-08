@@ -366,10 +366,13 @@ class LiveTradingLoop:
             )
             return
 
-        # Check if already in position
+        # Only one leg per symbol/timeframe; other timeframes may pyramid.
         position_key = self.pos_mgr.position_key(symbol, candle["timeframe"])
         if position_key in self.pos_mgr.open_trades:
-            logger.debug(f"Already in position for {symbol}; skipping new entry")
+            logger.debug(
+                f"Already in position for {symbol} {candle['timeframe']}; "
+                "skipping new entry"
+            )
             return
 
         # Generate signal

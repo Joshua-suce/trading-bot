@@ -338,7 +338,7 @@ async def test_trade_failure_alert_when_sizing_rejects(tmp_path):
 
 
 def test_position_key_is_reconciled_per_symbol():
-    assert PositionManager.position_key("BTC/USDT:USDT", "5m") == "BTCUSDT"
+    assert PositionManager.position_key("BTC/USDT:USDT", "5m") == "BTCUSDT:5m"
 
 
 @pytest.mark.asyncio
@@ -412,3 +412,51 @@ async def test_exposure_blocks_symbol_notional(monkeypatch, tmp_path):
 
     assert opened is False
     assert "symbol exposure" in alerter.failed[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_allows_three_same_direction_legs_per_symbol(monkeypatch, tmp_path):
+    from src.execution import position_manager as position_manager_module
+
+    monkeypatch.setattr(position_manager_module.settings, "max_positions_per_symbol", 3)
+    monkeypatch.setattr(position_manager_module.settings, "max_open_positions", 6)
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0, timeframe="5m")
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0, timeframe="15m")
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0, timeframe="30m")
+    assert set(manager.open_trades) == {
+        "BTCUSDT:5m",
+        "BTCUSDT:15m",
+        "BTCUSDT:30m",
+    }
+
+    assert not await manager.enter_long("BTCUSDT", price=100.0, atr=2.0, timeframe="1h")
+    assert "max trade legs for BTCUSDT reached: 3" in alerter.failed[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_blocks_opposite_side_leg_for_open_symbol(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    assert await manager.enter_long("ETHUSDT", price=100.0, atr=2.0, timeframe="5m")
+    assert not await manager.enter_short(
+        "ETHUSDT", price=100.0, atr=2.0, timeframe="15m"
+    )
+    assert set(manager.open_trades) == {"ETHUSDT:5m"}
+    assert "opposite-side entry blocked" in alerter.failed[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_blocks_duplicate_timeframe_leg(tmp_path):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    assert await manager.enter_short("BTCUSDT", price=100.0, atr=2.0, timeframe="4h")
+    assert not await manager.enter_short(
+        "BTCUSDT", price=100.0, atr=2.0, timeframe="4h"
+    )
+    assert set(manager.open_trades) == {"BTCUSDT:4h"}
+    assert "trade leg already open" in alerter.failed[-1]["reason"]

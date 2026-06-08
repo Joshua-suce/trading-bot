@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     position_scope: str = "symbol"
     scan_sleep_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
     account_refresh_interval_seconds: float = Field(default=60.0, ge=10.0, le=600.0)
-    reconciliation_interval_seconds: float = Field(default=300.0, ge=30.0, le=3600.0)
+    reconciliation_interval_seconds: float = Field(default=30.0, ge=10.0, le=3600.0)
     min_ohlcv_candles: int = Field(default=200, ge=200, le=1000)
     max_candle_delay_multiplier: float = Field(default=3.0, ge=1.0, le=20.0)
     allow_zero_volume_candles: bool = False
@@ -58,7 +58,8 @@ class Settings(BaseSettings):
     min_order_notional: float = Field(default=5.0, ge=0.0, le=100000.0)
     max_leverage: int = Field(default=3, ge=1, le=20)
     max_position_size: float = Field(default=0.02, gt=0, le=0.10)
-    max_open_positions: int = Field(default=3, ge=1, le=100)
+    max_open_positions: int = Field(default=6, ge=1, le=100)
+    max_positions_per_symbol: int = Field(default=3, ge=1, le=20)
     max_total_open_notional_pct: float = Field(default=0.20, gt=0, le=1.0)
     max_symbol_open_notional_pct: float = Field(default=0.10, gt=0, le=1.0)
     daily_loss_limit: float = Field(default=0.05, gt=0, le=0.20)
@@ -191,7 +192,8 @@ class Settings(BaseSettings):
         if normalized != "symbol":
             raise ValueError(
                 "POSITION_SCOPE must be 'symbol'; Binance USD-M positions are "
-                "aggregated per symbol and cannot be reconciled safely per timeframe"
+                "aggregated per symbol even when internal trade legs are tracked "
+                "per timeframe"
             )
         return normalized
 

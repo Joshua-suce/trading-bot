@@ -158,6 +158,10 @@ take_profit = entry_price ± (ATR × 1.0 × 2.0)  # 2:1 risk-reward
 ### Portfolio Guards
 | Guard | Threshold | Action |
 |---|---|---|
+| Trade legs per symbol | 3 | Block additional entries |
+| Global open trade legs | 6 | Block additional entries |
+| Per-symbol notional | 10% of equity | Block additional entries |
+| Total open notional | 20% of equity | Block additional entries |
 | Max Drawdown | 15% | Block new trades |
 | Daily Loss | 5% of equity | Block new trades |
 | Consecutive Losses | 3 | Block new trades for 30 minutes |
@@ -172,9 +176,14 @@ deduplicated before alert delivery.
 A trade is entered when all conditions are met:
 1. Final signal direction is non-zero
 2. Signal confidence ≥ 0.4
-3. No existing position on the symbol; configured timeframes are scanned
-   sequentially, while exchange exposure is reconciled once per symbol
+3. No existing leg on the same symbol/timeframe
 4. Portfolio guards pass (drawdown, daily loss, consecutive losses)
+5. Existing legs on the symbol have the same direction
+6. Fewer than three legs are open on the symbol and exposure limits allow entry
+
+Binance reports the same-direction legs as one net position. The bot reconciles
+the exchange quantity against the sum of its audited legs and tracks each
+leg's protective orders independently.
 
 ## 6. Exit Criteria
 

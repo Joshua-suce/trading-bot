@@ -19,6 +19,7 @@ class FakeOrderManager:
         self.flatten_ok = flatten_ok
         self.market_orders = []
         self.cancelled_all = []
+        self.cancelled_orders = []
 
     async def market_order(self, symbol, side, quantity, reduce_only=False):
         self.market_orders.append(
@@ -40,17 +41,18 @@ class FakeOrderManager:
     async def stop_loss_order(self, symbol, side, quantity, stop_price, price=None):
         if not self.stop_ok:
             return None
-        return {"id": "sl-1"}
+        return {"id": f"sl-{len(self.market_orders)}"}
 
     async def take_profit_order(self, symbol, side, quantity, price):
         if not self.tp_ok:
             return None
-        return {"id": "tp-1"}
+        return {"id": f"tp-{len(self.market_orders)}"}
 
     async def cancel_all_orders(self, symbol):
         self.cancelled_all.append(symbol)
 
     async def cancel_order(self, symbol, order_id, conditional=False):
+        self.cancelled_orders.append((symbol, order_id, conditional))
         return None
 
 
@@ -150,7 +152,7 @@ async def test_trade_entry_flattens_and_fails_when_stop_loss_is_not_confirmed(tm
 
     assert opened is False
     assert "BTCUSDT" not in manager.open_trades
-    assert orders.cancelled_all == ["BTCUSDT"]
+    assert orders.cancelled_all == []
     assert orders.market_orders[-1]["reduce_only"] is True
     assert manager.alerter.failed[0]["symbol"] == "BTCUSDT"
 
@@ -184,9 +186,32 @@ async def test_audit_failure_after_entry_rolls_back_exchange_position(
 
     assert opened is False
     assert manager.open_trades == {}
-    assert orders.cancelled_all == ["BTCUSDT"]
+    assert orders.cancelled_all == []
+    assert orders.cancelled_orders == [
+        ("BTCUSDT", "sl-1", True),
+        ("BTCUSDT", "tp-1", False),
+    ]
     assert orders.market_orders[-1]["reduce_only"] is True
     assert "audit persistence failed" in manager.alerter.failed[-1]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_failed_add_on_keeps_existing_leg_protected(tmp_path):
+    orders = FakeOrderManager()
+    manager = build_manager(tmp_path, orders)
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0, timeframe="5m")
+    orders.tp_ok = False
+
+    assert not await manager.enter_long(
+        "BTCUSDT", price=100.0, atr=2.0, timeframe="15m"
+    )
+    assert list(manager.open_trades) == ["BTCUSDT:5m"]
+    assert manager.active_stops["BTCUSDT:5m"] == "sl-1"
+    assert manager.active_tps["BTCUSDT:5m"] == "tp-1"
+    assert ("BTCUSDT", "sl-2", True) in orders.cancelled_orders
+    assert ("BTCUSDT", "sl-1", True) not in orders.cancelled_orders
+    assert ("BTCUSDT", "tp-1", False) not in orders.cancelled_orders
 
 
 @pytest.mark.asyncio
@@ -325,6 +350,104 @@ async def test_reconciliation_accepts_standard_tp_and_conditional_stop(tmp_path)
     manager.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_compares_aggregate_symbol_quantity(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    opened_at = datetime.now()
+    for timeframe, correlation_id, quantity in (
+        ("5m", "corr-5m", 0.4),
+        ("15m", "corr-15m", 0.6),
+    ):
+        trade = TradeRecord(
+            symbol="BTCUSDT",
+            side="long",
+            entry_price=100.0,
+            quantity=quantity,
+            timestamp=opened_at,
+            timeframe=timeframe,
+        )
+        audit.record_open_trade(
+            trade,
+            mode="trade",
+            correlation_id=correlation_id,
+            stop_loss=98.0,
+            take_profit=104.0,
+            stop_order_id=f"sl-{timeframe}",
+            take_profit_order_id=f"tp-{timeframe}",
+        )
+    client = FakeClient(
+        positions=[{"symbol": "BTCUSDT", "contracts": 1.0, "side": "long"}],
+        open_orders={
+            "BTCUSDT": [{"id": "tp-5m"}, {"id": "tp-15m"}],
+        },
+        conditional_orders={
+            "BTCUSDT": [{"id": "sl-5m"}, {"id": "sl-15m"}],
+        },
+        fetched_orders={
+            ("tp-5m", False): {"id": "tp-5m", "status": "open"},
+            ("sl-5m", True): {"id": "sl-5m", "status": "open"},
+            ("tp-15m", False): {"id": "tp-15m", "status": "open"},
+            ("sl-15m", True): {"id": "sl-15m", "status": "open"},
+        },
+    )
+    manager = build_manager(tmp_path, FakeOrderManager(), client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is True
+    assert set(manager.open_trades) == {"BTCUSDT:5m", "BTCUSDT:15m"}
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_finalizes_one_filled_leg_and_keeps_other(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    opened_at = datetime.now()
+    for timeframe, correlation_id in (
+        ("5m", "corr-filled"),
+        ("15m", "corr-open"),
+    ):
+        trade = TradeRecord(
+            symbol="BTCUSDT",
+            side="long",
+            entry_price=100.0,
+            quantity=1.0,
+            timestamp=opened_at,
+            timeframe=timeframe,
+        )
+        audit.record_open_trade(
+            trade,
+            mode="trade",
+            correlation_id=correlation_id,
+            stop_loss=98.0,
+            take_profit=104.0,
+            stop_order_id=f"sl-{timeframe}",
+            take_profit_order_id=f"tp-{timeframe}",
+        )
+    client = FakeClient(
+        positions=[{"symbol": "BTCUSDT", "contracts": 1.0, "side": "long"}],
+        open_orders={"BTCUSDT": [{"id": "tp-15m"}]},
+        conditional_orders={"BTCUSDT": [{"id": "sl-15m"}]},
+        fetched_orders={
+            ("tp-5m", False): {
+                "id": "tp-5m",
+                "status": "closed",
+                "average": 104.0,
+            },
+            ("tp-15m", False): {"id": "tp-15m", "status": "open"},
+            ("sl-15m", True): {"id": "sl-15m", "status": "open"},
+        },
+    )
+    orders = FakeOrderManager()
+    manager = build_manager(tmp_path, orders, client=client)
+    manager.audit_store = audit
+    manager.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is True
+    assert set(manager.open_trades) == {"BTCUSDT:15m"}
+    assert audit.load_open_trades("trade")[0]["correlation_id"] == "corr-open"
+    assert ("BTCUSDT", "sl-5m", True) in orders.cancelled_orders
 
 
 @pytest.mark.asyncio
