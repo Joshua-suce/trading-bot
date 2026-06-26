@@ -9,6 +9,9 @@ data/logs/
 data/audit/
 data/reports/
 data/trades/
+data/governance/
+data/runtime/
+=
 *.egg-info/
 dist/
 build/
@@ -16,6 +19,7 @@ build/
 .ipynb_checkpoints/
 .streamlit/
 .pytest_cache/
+.pytest-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
