@@ -376,6 +376,22 @@ class Alerter:
             "trade_failed",
         )
 
+    async def data_feed_alert(
+        self,
+        mode: str,
+        symbol: str,
+        timeframe: str,
+        reason: str,
+    ):
+        await self.send(
+            "<b>Market Data Unavailable</b>\n"
+            f"Mode: {html.escape(mode.upper())}\n"
+            f"Symbol: {html.escape(symbol)}\n"
+            f"Timeframe: {html.escape(timeframe)}\n"
+            f"Reason: {html.escape(reason)}",
+            "data_feed",
+        )
+
     async def trade_alert(
         self,
         symbol: str,

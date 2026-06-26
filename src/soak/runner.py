@@ -7,11 +7,15 @@ from typing import cast
 import pandas as pd
 
 from src.audit import AuditStore
+from src.config import settings
 from src.exchange.account import AccountInfo
 from src.exchange.client import ExchangeClient
 from src.execution.order_manager import OrderManager
+from src.live.data_quality import timeframe_seconds
 from src.live.loop import LiveTradingLoop
+from src.models.ensemble import ModelEnsemble
 from src.monitoring.alerter import Alerter
+from src.monitoring.heartbeat import RuntimeHeartbeat
 from src.signals.aggregator import FinalSignal, SignalAggregator
 
 
@@ -44,6 +48,23 @@ class SoakAlerter:
             {"type": "trade_failed", "mode": mode, "symbol": symbol, "reason": reason}
         )
 
+    async def data_feed_alert(
+        self,
+        mode: str,
+        symbol: str,
+        timeframe: str,
+        reason: str,
+    ):
+        self.messages.append(
+            {
+                "type": "data_feed",
+                "mode": mode,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "reason": reason,
+            }
+        )
+
     async def error_alert(self, error: str):
         self.messages.append({"type": "error", "error": error})
 
@@ -70,8 +91,11 @@ class SoakClient:
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 200):
         periods = max(limit, 60)
+        cadence = pd.Timedelta(seconds=timeframe_seconds(timeframe))
         index = pd.date_range(
-            end=pd.Timestamp.now(tz="UTC"), periods=periods, freq="5min"
+            end=pd.Timestamp.now(tz="UTC"),
+            periods=periods,
+            freq=cadence,
         )
         return pd.DataFrame(
             {
@@ -85,10 +109,16 @@ class SoakClient:
         )
 
     async def fetch_ticker(self, symbol: str) -> dict:
-        return {"last": 110.45, "bid": 110.4, "ask": 110.5}
+        return {"last": 110.45, "bid": 110.44, "ask": 110.46}
 
     async def fetch_market(self, symbol: str) -> dict:
         return {"precision": {"amount": 0.001}}
+
+    async def fetch_funding_rate(self, symbol: str) -> float:
+        return 0.0
+
+    async def fetch_order_book(self, symbol: str, limit: int = 20) -> dict:
+        return {"bids": [[110.44, 1000.0]], "asks": [[110.46, 1000.0]]}
 
 
 class SoakOrderManager:
@@ -103,6 +133,22 @@ class SoakOrderManager:
             "id": f"soak-market-{self.counter}",
             "filled": quantity,
             "average": 110.5 if reduce_only else 110.4,
+        }
+
+    async def limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        post_only: bool = True,
+    ) -> dict:
+        self.counter += 1
+        return {
+            "id": f"soak-limit-{self.counter}",
+            "filled": quantity,
+            "average": price,
+            "status": "closed",
         }
 
     async def stop_loss_order(
@@ -132,10 +178,11 @@ class SoakOrderManager:
 
 
 class SoakAggregator:
-    def __init__(self) -> None:
+    def __init__(self, strategy: str) -> None:
         self.calls = 0
+        self.strategy = strategy
 
-    def generate(self, _df) -> FinalSignal:
+    def generate(self, _df, higher_trend_bias: int = 0) -> FinalSignal:
         self.calls += 1
         direction = 1 if self.calls == 1 else 0
         confidence = 0.9 if direction else 0.0
@@ -145,6 +192,7 @@ class SoakAggregator:
             ta_source="soak",
             ml_strength=0.0,
             ml_confidence=0.0,
+            strategy=self.strategy,
         )
 
 
@@ -176,19 +224,29 @@ class SoakRunner:
         self.iterations = iterations
 
     async def run(self) -> SoakReport:
-        bot = LiveTradingLoop(audit_store=self.audit_store)
+        bot = LiveTradingLoop(
+            ensemble=ModelEnsemble(),
+            audit_store=self.audit_store,
+        )
+        bot._heartbeat = RuntimeHeartbeat(
+            str(self.report_path.with_name("soak_heartbeat.json"))
+        )
         bot.mode = "soak"
         soak_alerter = SoakAlerter()
         bot.client = cast(ExchangeClient, SoakClient())
         bot.alerter = cast(Alerter, soak_alerter)
-        bot.aggregator = cast(SignalAggregator, SoakAggregator())
+        symbol, timeframe = self._enabled_scope()
+        strategy = "scalp" if timeframe in {"1m", "3m"} else "trend"
+        bot.aggregator = cast(SignalAggregator, SoakAggregator(strategy))
         bot._scoped_aggregators = {}
         soak_orders = SoakOrderManager()
         bot.order_mgr = cast(OrderManager, soak_orders)
-        bot.pos_mgr.alerter = bot.alerter
-        bot.pos_mgr.client = bot.client
-        bot.pos_mgr.orders = cast(OrderManager, soak_orders)
-        bot.pos_mgr.mode = "soak"
+        bot.pos_mgr.rebind_runtime(
+            bot.client,
+            cast(OrderManager, soak_orders),
+            bot.alerter,
+            "soak",
+        )
         bot.portfolio.update_account(
             AccountInfo(
                 total_equity=10_000.0,
@@ -199,7 +257,8 @@ class SoakRunner:
             )
         )
 
-        await bot.alerter.startup_alert("soak", "offline", ["BTCUSDT"])
+        bot._market_regimes[f"{symbol}:1h"] = 1
+        await bot.alerter.startup_alert("soak", "offline", [symbol])
         self.audit_store.record_event(
             "soak_started",
             "Offline trade-path soak started",
@@ -207,7 +266,10 @@ class SoakRunner:
             payload={"iterations": self.iterations},
         )
         for _ in range(self.iterations):
-            await bot._scan_timeframes_once(symbols=["BTCUSDT"], timeframes=["5m"])
+            await bot._scan_timeframes_once(
+                symbols=[symbol],
+                timeframes=[timeframe],
+            )
 
         await bot.stop("soak complete", close_positions=True)
         self.audit_store.record_event(
@@ -216,6 +278,15 @@ class SoakRunner:
             mode="soak",
         )
         return self._build_report(bot, soak_alerter)
+
+    @staticmethod
+    def _enabled_scope() -> tuple[str, str]:
+        disabled = settings.disabled_strategy_scopes_set
+        for symbol in settings.symbols_list:
+            for timeframe in settings.timeframes_list:
+                if f"{symbol}:{timeframe}" not in disabled:
+                    return symbol, timeframe
+        raise RuntimeError("offline soak requires at least one enabled strategy scope")
 
     def _build_report(self, bot: LiveTradingLoop, alerter: SoakAlerter) -> SoakReport:
         events = self.audit_store.load_recent_events(500)

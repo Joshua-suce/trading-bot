@@ -105,6 +105,7 @@ async def test_alert_helpers_format_operational_notifications():
     )
     await alerter.trade_completed_alert("trade", "BTCUSDT", "long", 108.0, 4.0, "tp")
     await alerter.trade_failed_alert("trade", "ETHUSDT", "risk blocked")
+    await alerter.data_feed_alert("trade", "BNBUSDT", "5m", "timeout")
     await alerter.trade_alert("SOLUSDT", "short", 50.0, 1.25, pnl=-1.5)
     await alerter.error_alert("exchange down")
     await alerter.daily_summary(12.5, 0.625, 8)
@@ -115,12 +116,14 @@ async def test_alert_helpers_format_operational_notifications():
         "trade",
         "trade_completed",
         "trade_failed",
+        "data_feed",
         "trade",
         "error",
         "daily",
     ]
     assert "Trade Placed" in alerter.messages[1][1]
-    assert "PnL: -1.50" in alerter.messages[4][1]
+    assert "Market Data Unavailable" in alerter.messages[4][1]
+    assert "PnL: -1.50" in alerter.messages[5][1]
 
 
 @pytest.mark.asyncio

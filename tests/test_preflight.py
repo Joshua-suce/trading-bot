@@ -32,7 +32,29 @@ def test_default_timeframes_include_short_and_long_intervals():
         binance_api_secret="secret",
     )
 
-    assert cfg.timeframes_list == ["5m", "15m", "30m", "1h", "4h", "1d"]
+    assert cfg.timeframes_list == [
+        "1m",
+        "3m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h",
+        "1d",
+    ]
+
+
+def test_demo_scalp_streaming_requires_explicit_override():
+    cfg = make_settings(
+        scalp_websocket_enabled=True,
+        scalp_demo_websocket_enabled=False,
+    )
+
+    assert not cfg.scalp_streaming_enabled
+    assert make_settings(
+        scalp_websocket_enabled=True,
+        scalp_demo_websocket_enabled=True,
+    ).scalp_streaming_enabled
 
 
 def test_settings_rejects_invalid_timeframes():
@@ -115,8 +137,8 @@ def test_consecutive_loss_circuit_breaker_is_configurable():
     assert cfg.risk_block_alert_cooldown_seconds == 600
 
 
-def test_default_consecutive_loss_cooldown_is_thirty_minutes():
-    assert make_settings().consecutive_loss_cooldown_seconds == 1_800
+def test_default_consecutive_loss_cooldown_is_fifteen_minutes():
+    assert Settings.model_fields["consecutive_loss_cooldown_seconds"].default == 900
 
 
 def test_preflight_requires_credentials_for_trade_mode():

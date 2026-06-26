@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.backtest.metrics import BacktestMetrics
+from src.backtest.walk_forward import WalkForwardFold, WalkForwardReport
 from src.config import Settings
 from src.governance import StrategyApprovalStore
 from src.preflight import run_preflight
@@ -42,9 +43,35 @@ def cfg(tmp_path, **overrides) -> Settings:
         "symbols": "BTCUSDT",
         "timeframes": "1h",
         "strategy_approval_path": str(tmp_path / "approval.json"),
+        "require_walk_forward_approval": False,
     }
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)
+
+
+def walk_forward_report() -> WalkForwardReport:
+    aggregate = metrics()
+    folds = [
+        WalkForwardFold(
+            index=index,
+            train_start="2026-01-01T00:00:00+00:00",
+            train_end="2026-02-01T00:00:00+00:00",
+            test_start="2026-02-01T00:00:00+00:00",
+            test_end="2026-02-08T00:00:00+00:00",
+            metrics=aggregate,
+        )
+        for index in range(3)
+    ]
+    return WalkForwardReport(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        folds=folds,
+        aggregate_metrics=aggregate,
+        profitable_fold_ratio=1.0,
+        expectancy_cv=0.1,
+        approved=True,
+        reason="validated",
+    )
 
 
 def test_strategy_approval_store_writes_and_validates(tmp_path):
@@ -119,11 +146,10 @@ def test_mainnet_preflight_accepts_valid_strategy_approval(tmp_path):
         tmp_path,
         binance_api_url="https://fapi.binance.com",
         allow_mainnet_trading=True,
+        require_walk_forward_approval=True,
     )
-    StrategyApprovalStore(cfg=settings).write(
-        metrics=metrics(),
-        symbol="BTCUSDT",
-        timeframe="1h",
+    StrategyApprovalStore(cfg=settings).write_walk_forward(
+        report=walk_forward_report(),
         approved_by="tester",
         reason="valid",
     )
@@ -131,3 +157,22 @@ def test_mainnet_preflight_accepts_valid_strategy_approval(tmp_path):
     result = run_preflight("trade", cfg=settings)
 
     assert result.mode == "trade"
+
+
+def test_mainnet_preflight_rejects_legacy_single_backtest_approval(tmp_path):
+    settings = cfg(
+        tmp_path,
+        binance_api_url="https://fapi.binance.com",
+        allow_mainnet_trading=True,
+        require_walk_forward_approval=True,
+    )
+    StrategyApprovalStore(cfg=settings).write(
+        metrics=metrics(),
+        symbol="BTCUSDT",
+        timeframe="1h",
+        approved_by="tester",
+        reason="legacy",
+    )
+
+    with pytest.raises(RuntimeError, match="walk-forward"):
+        run_preflight("trade", cfg=settings)

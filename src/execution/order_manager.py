@@ -1,4 +1,5 @@
 import asyncio
+import time
 import uuid
 from typing import Optional
 
@@ -222,10 +223,16 @@ class OrderManager:
         price = prepared.price
         last_error = ""
         for attempt in range(1, attempts + 1):
+            attempt_started = time.monotonic()
             try:
                 order = await self.client.create_order(
                     symbol, order_type, side, quantity, price, params=params
                 )
+                order["_bot_order_latency_ms"] = (
+                    time.monotonic() - attempt_started
+                ) * 1000
+                order["_bot_order_attempt"] = attempt
+                order["_bot_recovered"] = False
                 logger.info(
                     f"{order_type.upper()} {side} {quantity} {symbol}: "
                     f"id={order.get('id')} filled={order.get('filled')}"
@@ -256,6 +263,11 @@ class OrderManager:
                     conditional=order_type in {"stop_market", "stop_limit"},
                 )
                 if recovered is not None:
+                    recovered["_bot_order_latency_ms"] = (
+                        time.monotonic() - attempt_started
+                    ) * 1000
+                    recovered["_bot_order_attempt"] = attempt
+                    recovered["_bot_recovered"] = True
                     logger.warning(
                         f"Recovered accepted {order_type} {side} order for "
                         f"{symbol} after ambiguous create failure"

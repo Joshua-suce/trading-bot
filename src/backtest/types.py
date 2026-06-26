@@ -16,3 +16,9 @@ class BacktestTrade:
     pnl: float
     pnl_pct: float
     exit_reason: str
+    symbol: str = "UNKNOWN"
+    timeframe: str = "unknown"
+    strategy: str = "unknown"
+    gross_pnl: float = 0.0
+    fees: float = 0.0
+    slippage_cost: float = 0.0

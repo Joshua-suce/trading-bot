@@ -4,10 +4,21 @@ from typing import List
 import numpy as np
 import pandas as pd
 
+LABEL_SCHEMA = "cost_adjusted_horizon_v3"
+
 
 class FeatureEngineer:
-    def __init__(self, lookback: int = 100):
+    def __init__(
+        self,
+        lookback: int = 100,
+        prediction_horizon: int = 1,
+        label_atr_multiplier: float = 0.5,
+        label_min_return: float = 0.001,
+    ):
         self.lookback = lookback
+        self.prediction_horizon = prediction_horizon
+        self.label_atr_multiplier = label_atr_multiplier
+        self.label_min_return = label_min_return
         self.feature_cols: List[str] = []
 
     # Create lagged returns, rolling stats, indicator derivatives, and target
@@ -83,12 +94,26 @@ class FeatureEngineer:
                     (result["close"] - result[level]) / result["close"] * 100
                 )
 
-        # Target: next-period return direction (for classification)
-        result["target"] = result["close"].shift(-1) - result["close"]
+        # Volatility-adjusted multi-period target with a meaningful neutral class.
+        future_close = result["close"].shift(-self.prediction_horizon)
+        result["target"] = future_close - result["close"]
+        result["target_return"] = future_close / result["close"] - 1
+        atr_fraction = result["atr"] / result["close"].replace(0, np.nan)
+        result["target_threshold"] = np.maximum(
+            atr_fraction * self.label_atr_multiplier,
+            self.label_min_return,
+        )
         result["target_direction"] = np.nan
-        result.loc[result["target"] > 0, "target_direction"] = 1
-        result.loc[result["target"] == 0, "target_direction"] = 0
-        result.loc[result["target"] < 0, "target_direction"] = -1
+        result.loc[
+            result["target_return"] > result["target_threshold"],
+            "target_direction",
+        ] = 1
+        result.loc[
+            result["target_return"] < -result["target_threshold"],
+            "target_direction",
+        ] = -1
+        neutral = result["target_return"].abs() <= result["target_threshold"]
+        result.loc[neutral, "target_direction"] = 0
 
         self.feature_cols = [
             c
@@ -101,6 +126,8 @@ class FeatureEngineer:
                 "close",
                 "volume",
                 "target",
+                "target_return",
+                "target_threshold",
                 "target_direction",
             ]
         ]

@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,8 @@ def parse_args(argv: Optional[list[str]] = None):
             "health",
             "history",
             "soak",
+            "supervisor",
+            "rollout",
         ],
         help="Trading mode",
     )
@@ -109,6 +112,12 @@ def parse_args(argv: Optional[list[str]] = None):
         default="",
         help="Optional file path for JSON or CSV history output",
     )
+    parser.add_argument(
+        "--rollout-evidence",
+        type=str,
+        default="data/governance/rollout_evidence.json",
+        help="JSON evidence input for rollout gate evaluation",
+    )
     return parser.parse_args(argv)
 
 
@@ -133,9 +142,49 @@ async def run_train(symbol: str, timeframe: str, limit: int):
 
 # Connect to the configured exchange environment and execute signals.
 async def run_trade():
+    from src.config import settings
     from src.live.loop import LiveTradingLoop
+    from src.monitoring.heartbeat import RuntimeHeartbeat
 
-    loop = LiveTradingLoop()
+    heartbeat = RuntimeHeartbeat(settings.runtime_heartbeat_path)
+    heartbeat_stop = threading.Event()
+
+    def publish_bootstrap_heartbeat() -> None:
+        interval = max(
+            1.0,
+            min(15.0, settings.supervisor_heartbeat_stale_seconds / 3),
+        )
+        while not heartbeat_stop.is_set():
+            try:
+                heartbeat.write(
+                    "bootstrapping",
+                    mode="trade",
+                    environment=settings.binance_environment,
+                )
+            except Exception as exc:
+                logger.warning("Could not publish bootstrap heartbeat: {}", exc)
+            heartbeat_stop.wait(interval)
+
+    heartbeat_thread = threading.Thread(
+        target=publish_bootstrap_heartbeat,
+        name="bootstrap-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        loop = LiveTradingLoop()
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2.0)
+
+    try:
+        heartbeat.write(
+            "bootstrapping",
+            mode="trade",
+            environment=settings.binance_environment,
+        )
+    except Exception as exc:
+        logger.warning("Could not publish bootstrap heartbeat: {}", exc)
     await loop.start()
 
 
@@ -145,7 +194,17 @@ def run_dashboard():
     import sys
 
     dashboard_path = str(Path(__file__).parent / "monitoring" / "dashboard.py")
-    subprocess.run([sys.executable, "-m", "streamlit", "run", dashboard_path])
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            dashboard_path,
+            "--server.address=127.0.0.1",
+            "--server.headless=true",
+        ]
+    )
 
 
 def run_admin(action: str, reason: str = ""):
@@ -269,17 +328,37 @@ def run_history(
 
 
 async def run_soak(iterations: int, report_path: str) -> int:
-    from src.config import settings
+    from tempfile import TemporaryDirectory
+
     from src.soak import SoakRunner
 
-    runner = SoakRunner(
-        audit_path=settings.audit_db_path,
-        report_path=report_path,
-        iterations=iterations,
-    )
-    report = await runner.run()
+    with TemporaryDirectory(prefix="trading-bot-soak-") as temp_dir:
+        runner = SoakRunner(
+            audit_path=str(Path(temp_dir) / "soak_audit.db"),
+            report_path=report_path,
+            iterations=iterations,
+        )
+        report = await runner.run()
     print(report.to_json())
     return 0 if report.status == "ok" else 1
+
+
+def run_rollout(evidence_path: str) -> int:
+    import json
+
+    from src.config import settings
+    from src.governance.rollout import (
+        RolloutArtifactStore,
+        RolloutEvidence,
+        RolloutGate,
+    )
+
+    payload = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+    evidence = RolloutEvidence(**payload)
+    decision = RolloutGate().evaluate(evidence)
+    RolloutArtifactStore(settings.rollout_artifact_path).write(evidence, decision)
+    print(json.dumps(decision.__dict__, indent=2, sort_keys=True))
+    return 0 if decision.passed else 1
 
 
 # Top-level dispatch: parse args, set up logging, route to the chosen mode
@@ -294,6 +373,12 @@ def main():
 
     if args.mode == "soak":
         raise SystemExit(asyncio.run(run_soak(args.soak_iterations, args.soak_report)))
+    if args.mode == "supervisor":
+        from src.supervisor import TradingSupervisor
+
+        raise SystemExit(TradingSupervisor().run())
+    if args.mode == "rollout":
+        raise SystemExit(run_rollout(args.rollout_evidence))
     if args.mode == "train":
         asyncio.run(run_train(args.symbol, args.timeframe, args.limit))
     elif args.mode == "trade":

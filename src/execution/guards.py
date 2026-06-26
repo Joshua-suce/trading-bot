@@ -5,6 +5,23 @@ from typing import Any
 from src.config import settings
 
 
+def adverse_price_movement_bps(
+    side: str,
+    reference_price: float,
+    execution_price: float,
+) -> float:
+    if reference_price <= 0 or execution_price <= 0:
+        return float("inf")
+    normalized_side = side.lower()
+    if normalized_side in {"buy", "long"}:
+        adverse_move = execution_price - reference_price
+    elif normalized_side in {"sell", "short"}:
+        adverse_move = reference_price - execution_price
+    else:
+        return float("inf")
+    return max(adverse_move / reference_price * 10_000, 0.0)
+
+
 @dataclass(frozen=True)
 class PreparedOrder:
     allowed: bool
@@ -32,6 +49,11 @@ class ExecutionGuard:
             settings.min_order_notional if min_notional is None else min_notional
         )
 
+    def _max_slippage_for(self, symbol: str) -> float:
+        return settings.max_entry_slippage_bps_per_symbol.get(
+            symbol, self.max_slippage_bps
+        )
+
     async def prepare(
         self,
         client: Any,
@@ -54,8 +76,7 @@ class ExecutionGuard:
         if prepared_quantity <= 0:
             return PreparedOrder(
                 False,
-                f"amount below minimum: {prepared_quantity:.8f} < "
-                f"{minimum_amount:.8f}",
+                f"amount below minimum: {prepared_quantity:.8f} < {minimum_amount:.8f}",
                 quantity=prepared_quantity,
                 price=prepared_price,
                 reference_price=reference_price,
@@ -64,8 +85,7 @@ class ExecutionGuard:
         if not reduce_only and prepared_quantity < minimum_amount:
             return PreparedOrder(
                 False,
-                f"amount below minimum: {prepared_quantity:.8f} < "
-                f"{minimum_amount:.8f}",
+                f"amount below minimum: {prepared_quantity:.8f} < {minimum_amount:.8f}",
                 quantity=prepared_quantity,
                 price=prepared_price,
                 reference_price=reference_price,
@@ -86,7 +106,7 @@ class ExecutionGuard:
 
         if order_type == "market" and not reduce_only:
             slippage = await self._market_slippage_bps(client, symbol, side)
-            if slippage > self.max_slippage_bps:
+            if slippage > self._max_slippage_for(symbol):
                 return PreparedOrder(
                     False,
                     f"slippage above limit: {slippage:.2f}bps",
@@ -160,8 +180,23 @@ class ExecutionGuard:
         ticker = await client.fetch_ticker(symbol)
         bid = float(ticker.get("bid") or 0)
         ask = float(ticker.get("ask") or 0)
-        last = float(ticker.get("last") or ticker.get("mark") or 0)
-        if bid <= 0 or ask <= 0 or last <= 0:
-            return 0.0
+        reference = float(
+            ticker.get("last") or ticker.get("mark") or ticker.get("index") or 0
+        )
+        if bid <= 0 or ask <= 0 or ask < bid:
+            fetch_order_book = getattr(client, "fetch_order_book", None)
+            if callable(fetch_order_book):
+                try:
+                    order_book = await fetch_order_book(symbol, limit=5)
+                    bids = order_book.get("bids") or []
+                    asks = order_book.get("asks") or []
+                    bid = float(bids[0][0]) if bids else 0.0
+                    ask = float(asks[0][0]) if asks else 0.0
+                except Exception:
+                    return float("inf")
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return float("inf")
+        if reference <= 0:
+            reference = (bid + ask) / 2
         execution_price = ask if side == "buy" else bid
-        return abs(execution_price - last) / last * 10_000
+        return adverse_price_movement_bps(side, reference, execution_price)

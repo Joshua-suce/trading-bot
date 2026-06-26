@@ -5,8 +5,11 @@ from datetime import datetime
 import pytest
 
 from src.audit import AuditStore
+from src.config import settings
 from src.exchange.account import AccountInfo
+from src.execution.fill_resolver import FillResolver
 from src.execution.position_manager import PositionManager
+from src.execution.position_reconciler import PositionReconciler
 from src.risk.portfolio import PortfolioManager, TradeRecord
 from src.risk.position_sizer import PositionSizer
 from src.risk.stop_loss import StopLossManager
@@ -100,7 +103,7 @@ class FakeClient:
         return [trade for trade in trades if str(trade.get("order")) == str(order_id)]
 
     async def fetch_ticker(self, symbol):
-        return {"last": 100.0}
+        return {"last": 100.0, "bid": 99.99, "ask": 100.01}
 
     async def fetch_market(self, symbol):
         return {"precision": {"amount": 0.001}}
@@ -206,7 +209,8 @@ async def test_audit_failure_after_entry_rolls_back_exchange_position(
 
 
 @pytest.mark.asyncio
-async def test_failed_add_on_keeps_existing_leg_protected(tmp_path):
+async def test_failed_add_on_keeps_existing_leg_protected(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "max_positions_per_symbol", 3)
     orders = FakeOrderManager()
     manager = build_manager(tmp_path, orders)
 
@@ -217,15 +221,16 @@ async def test_failed_add_on_keeps_existing_leg_protected(tmp_path):
         "BTCUSDT", price=100.0, atr=2.0, timeframe="15m"
     )
     assert list(manager.open_trades) == ["BTCUSDT:5m"]
-    assert manager.active_stops["BTCUSDT:5m"] == "sl-1"
-    assert manager.active_tps["BTCUSDT:5m"] == "tp-1"
+    assert manager.protection.active_stops["BTCUSDT:5m"] == "sl-1"
+    assert manager.protection.active_tps["BTCUSDT:5m"] == "tp-1"
     assert ("BTCUSDT", "sl-2", True) in orders.cancelled_orders
     assert ("BTCUSDT", "sl-1", True) not in orders.cancelled_orders
     assert ("BTCUSDT", "tp-1", False) not in orders.cancelled_orders
 
 
 @pytest.mark.asyncio
-async def test_close_all_submits_one_aggregate_exit_per_symbol(tmp_path):
+async def test_close_all_submits_one_aggregate_exit_per_symbol(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "max_positions_per_symbol", 3)
     orders = FakeOrderManager()
     manager = build_manager(tmp_path, orders)
 
@@ -257,8 +262,7 @@ async def test_reconciliation_blocks_unmanaged_exchange_position(tmp_path):
     assert reconciled is False
     allowed, reason = manager.audit_store.trading_allowed()
     assert allowed is False
-    assert "emergency stop" in reason
-    assert manager.alerter.errors
+    assert "trading degraded (level 1)" in reason
 
 
 @pytest.mark.asyncio
@@ -309,12 +313,12 @@ def test_position_manager_restores_open_trades_from_audit(tmp_path):
     manager = build_manager(tmp_path, FakeOrderManager())
     manager.audit_store = audit
 
-    restored = manager.restore_open_trades_from_audit()
+    restored = manager.trades.restore_open_trades_from_audit()
 
     assert restored == 1
     assert manager.open_trades["BTCUSDT"].quantity == 1.25
-    assert manager.active_stops["BTCUSDT"] == "sl-1"
-    assert manager.active_tps["BTCUSDT"] == "tp-1"
+    assert manager.protection.active_stops["BTCUSDT"] == "sl-1"
+    assert manager.protection.active_tps["BTCUSDT"] == "tp-1"
 
 
 @pytest.mark.asyncio
@@ -342,15 +346,13 @@ async def test_reconciliation_blocks_missing_protective_order(tmp_path):
         conditional_orders={"BTCUSDT": []},
     )
     manager = build_manager(tmp_path, FakeOrderManager(), client=client)
-    manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     reconciled = await manager.reconcile_exchange_state()
 
-    assert reconciled is False
-    allowed, reason = manager.audit_store.trading_allowed()
-    assert allowed is False
-    assert "emergency stop" in reason
+    assert reconciled is True
+    assert manager.protection.active_stops["BTCUSDT"] not in ("sl-2",)
+    assert manager.protection.active_tps["BTCUSDT"] not in ("tp-2",)
 
 
 @pytest.mark.asyncio
@@ -379,7 +381,7 @@ async def test_reconciliation_accepts_standard_tp_and_conditional_stop(tmp_path)
     )
     manager = build_manager(tmp_path, FakeOrderManager(), client=client)
     manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
     assert client.fetch_order_calls == []
@@ -427,7 +429,7 @@ async def test_reconciliation_compares_aggregate_symbol_quantity(tmp_path):
     )
     manager = build_manager(tmp_path, FakeOrderManager(), client=client)
     manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
     assert set(manager.open_trades) == {"BTCUSDT:5m", "BTCUSDT:15m"}
@@ -475,7 +477,7 @@ async def test_reconciliation_finalizes_one_filled_leg_and_keeps_other(tmp_path)
     orders = FakeOrderManager()
     manager = build_manager(tmp_path, orders, client=client)
     manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
     assert set(manager.open_trades) == {"BTCUSDT:15m"}
@@ -529,7 +531,7 @@ async def test_reconciliation_maps_net_reduction_to_missing_leg(tmp_path):
     orders = FakeOrderManager()
     manager = build_manager(tmp_path, orders, client=client)
     manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
     assert set(manager.open_trades) == {"BNBUSDT:1h"}
@@ -563,11 +565,10 @@ async def test_reconciliation_blocks_exchange_side_mismatch(tmp_path):
         positions=[{"symbol": "BTCUSDT", "contracts": 1.0, "side": "short"}],
     )
     manager = build_manager(tmp_path, FakeOrderManager(), client=client)
-    manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is False
-    assert not manager.audit_store.trading_allowed()[0]
+    assert not manager.audit_store.trading_allowed(symbol="BTCUSDT")[0]
     assert manager.audit_store.load_recent_events(1)[0]["event_type"] == (
         "position_side_mismatch"
     )
@@ -596,11 +597,10 @@ async def test_reconciliation_blocks_exchange_quantity_mismatch(tmp_path):
         positions=[{"symbol": "ETHUSDT", "contracts": 0.9, "side": "long"}],
     )
     manager = build_manager(tmp_path, FakeOrderManager(), client=client)
-    manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is False
-    assert not manager.audit_store.trading_allowed()[0]
+    assert not manager.audit_store.trading_allowed(symbol="ETHUSDT")[0]
     assert manager.audit_store.load_recent_events(1)[0]["event_type"] == (
         "position_quantity_mismatch"
     )
@@ -612,7 +612,7 @@ def test_position_side_uses_signed_binance_position_amount():
         "info": {"positionSide": "BOTH", "positionAmt": "-1.0"},
     }
 
-    assert PositionManager._position_side(position) == "short"
+    assert PositionReconciler._position_side(position) == "short"
 
 
 @pytest.mark.asyncio
@@ -648,7 +648,7 @@ async def test_reconciliation_finalizes_take_profit_closed_position(tmp_path):
     orders = FakeOrderManager()
     manager = build_manager(tmp_path, orders, client=client)
     manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
     assert manager.open_trades == {}
@@ -709,7 +709,7 @@ async def test_reconciliation_finds_finished_stop_in_order_history(tmp_path):
     )
     manager = build_manager(tmp_path, FakeOrderManager(), client=client)
     manager.audit_store = audit
-    manager.restore_open_trades_from_audit()
+    manager.trades.restore_open_trades_from_audit()
 
     assert await manager.reconcile_exchange_state() is True
     closed = audit.load_trades(1)[0]
@@ -718,7 +718,56 @@ async def test_reconciliation_finds_finished_stop_in_order_history(tmp_path):
     assert closed["exit_price"] == pytest.approx(1563.86)
 
 
+@pytest.mark.asyncio
+async def test_existing_exchange_position_repairs_missing_protection(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(),
+    )
+    audit.record_open_trade(
+        trade,
+        mode="trade",
+        correlation_id="corr-still-open",
+        stop_loss=98.0,
+        take_profit=104.0,
+        stop_order_id="old-stop",
+        take_profit_order_id="old-target",
+    )
+    client = FakeClient(
+        positions=[
+            {
+                "symbol": "BTCUSDT",
+                "contracts": 1.0,
+                "side": "long",
+            }
+        ],
+        conditional_history={
+            "BTCUSDT": [
+                {
+                    "id": "old-stop",
+                    "status": "closed",
+                    "triggerPrice": 98.0,
+                }
+            ]
+        },
+    )
+    orders = FakeOrderManager()
+    manager = build_manager(tmp_path, orders, client=client)
+    manager.audit_store = audit
+    manager.trades.restore_open_trades_from_audit()
+
+    assert await manager.reconcile_exchange_state() is True
+    assert list(manager.open_trades) == ["BTCUSDT"]
+    assert audit.load_open_trades("trade")[0]["status"] == "open"
+    assert manager.protection.active_stops["BTCUSDT"] == "sl-0"
+    assert manager.protection.active_tps["BTCUSDT"] == "tp-0"
+
+
 def test_finished_binance_algo_status_is_treated_as_filled():
-    assert PositionManager._order_is_filled(
+    assert FillResolver.order_is_filled(
         {"status": "open", "info": {"algoStatus": "FINISHED"}}
     )

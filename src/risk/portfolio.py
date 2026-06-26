@@ -22,6 +22,10 @@ class TradeRecord:
     pnl: Optional[float] = None
     pnl_pct: Optional[float] = None
     exit_reason: Optional[str] = None
+    strategy: Optional[str] = None
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
+    gross_pnl: Optional[float] = None
 
 
 # Aggregated stats for one trading day
@@ -49,6 +53,12 @@ class PortfolioManager:
         self.consecutive_loss_cooldown_seconds: int = (
             settings.consecutive_loss_cooldown_seconds
         )
+        self.loss_cooldown_seconds: int = settings.loss_cooldown_seconds
+        self.last_symbol_loss_at: dict[str, datetime] = {}
+        self.strategy_consecutive_losses: dict[str, int] = {}
+        self.strategy_last_loss_at: dict[str, datetime] = {}
+        self.strategy_max_consecutive_losses = settings.strategy_max_consecutive_losses
+        self.strategy_loss_cooldown_seconds = settings.strategy_loss_cooldown_seconds
         self.daily_loss_limit: float = settings.daily_loss_limit
         self.max_drawdown: float = settings.max_drawdown
         self._daily_reset()
@@ -69,6 +79,8 @@ class PortfolioManager:
         stats = DailyStats(date=today)
         self.consecutive_losses = 0
         self.last_loss_at = None
+        self.strategy_consecutive_losses.clear()
+        self.strategy_last_loss_at.clear()
 
         for row in closed_trades:
             pnl = float(row.get("pnl") or 0)
@@ -91,8 +103,32 @@ class PortfolioManager:
                     parsed = parsed.replace(tzinfo=timezone.utc)
                 self.last_loss_at = parsed
 
+        self._restore_strategy_loss_streaks(closed_trades)
+
         self.daily_stats[today] = stats
         self.daily_pnl = stats.total_pnl
+
+    def _restore_strategy_loss_streaks(self, closed_trades: list[dict]) -> None:
+        strategies = {
+            str(row.get("strategy") or "trend").lower() for row in closed_trades
+        }
+        for strategy in strategies:
+            scoped_rows = (
+                row
+                for row in closed_trades
+                if str(row.get("strategy") or "trend").lower() == strategy
+            )
+            for row in scoped_rows:
+                if float(row.get("pnl") or 0) > 0:
+                    break
+                self.strategy_consecutive_losses[strategy] = (
+                    self.strategy_consecutive_losses.get(strategy, 0) + 1
+                )
+                if strategy not in self.strategy_last_loss_at and row.get("closed_at"):
+                    parsed = datetime.fromisoformat(str(row["closed_at"]))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    self.strategy_last_loss_at[strategy] = parsed
 
     # Update account info and recalculate peak equity / drawdown
     def update_account(self, account: AccountInfo) -> None:
@@ -105,7 +141,11 @@ class PortfolioManager:
             ) / self.peak_equity
 
     # Check whether new trades are allowed (drawdown, daily loss, consecutive losses)
-    def can_trade(self) -> tuple[bool, str]:
+    def can_trade(
+        self,
+        symbol: str | None = None,
+        strategy: str | None = None,
+    ) -> tuple[bool, str]:
         self._daily_reset()
         today = self._today()
         stats = self.daily_stats[today]
@@ -118,7 +158,21 @@ class PortfolioManager:
         ):
             return False, f"Daily loss limit reached: {stats.total_pnl:.2f}"
 
-        if self.consecutive_losses >= self.max_consecutive_losses:
+        if strategy:
+            key = strategy.lower()
+            losses = self.strategy_consecutive_losses.get(key, 0)
+            if losses >= self.strategy_max_consecutive_losses:
+                remaining = self._strategy_loss_cooldown_remaining(key)
+                if remaining <= 0:
+                    self.strategy_consecutive_losses[key] = 0
+                    self.strategy_last_loss_at.pop(key, None)
+                else:
+                    return (
+                        False,
+                        f"{key} loss limit: {losses}; automatic retry in "
+                        f"{remaining:.0f}s",
+                    )
+        elif self.consecutive_losses >= self.max_consecutive_losses:
             remaining = self._loss_cooldown_remaining()
             if remaining <= 0:
                 self.consecutive_losses = 0
@@ -138,17 +192,24 @@ class PortfolioManager:
             self.trades.append(trade)
 
     # Close a trade: compute PnL, update daily stats, log the result
-    def close_trade(self, trade: TradeRecord, exit_price: float, reason: str = "tp_sl"):
+    def close_trade(
+        self,
+        trade: TradeRecord,
+        exit_price: float,
+        reason: str = "tp_sl",
+        *,
+        exit_fee: float = 0.0,
+    ):
         self._daily_reset()
         trade.exit_price = exit_price
         trade.exit_reason = reason
+        trade.exit_fee = max(float(exit_fee), 0.0)
         self.add_trade(trade)
-        if trade.side == "long":
-            trade.pnl = (exit_price - trade.entry_price) * trade.quantity
-            trade.pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
-        else:
-            trade.pnl = (trade.entry_price - exit_price) * trade.quantity
-            trade.pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
+        direction = 1 if trade.side == "long" else -1
+        trade.gross_pnl = (exit_price - trade.entry_price) * trade.quantity * direction
+        trade.pnl = trade.gross_pnl - max(trade.entry_fee, 0.0) - trade.exit_fee
+        entry_notional = trade.entry_price * trade.quantity
+        trade.pnl_pct = trade.pnl / entry_notional if entry_notional > 0 else 0.0
 
         self.daily_pnl += trade.pnl or 0
         today = self._today()
@@ -159,14 +220,26 @@ class PortfolioManager:
             stats.wins += 1
             self.consecutive_losses = 0
             self.last_loss_at = None
+            if trade.strategy:
+                key = trade.strategy.lower()
+                self.strategy_consecutive_losses[key] = 0
+                self.strategy_last_loss_at.pop(key, None)
         else:
             stats.losses += 1
             self.consecutive_losses += 1
             self.last_loss_at = datetime.now(timezone.utc)
+            self.last_symbol_loss_at[trade.symbol] = datetime.now(timezone.utc)
+            key = str(trade.strategy or "trend").lower()
+            self.strategy_consecutive_losses[key] = (
+                self.strategy_consecutive_losses.get(key, 0) + 1
+            )
+            self.strategy_last_loss_at[key] = datetime.now(timezone.utc)
 
         logger.info(
             f"Trade closed: {trade.symbol} {trade.side} "
-            f"PnL={trade.pnl:.2f} ({trade.pnl_pct:.2%}) reason={reason}"
+            f"PnL={trade.pnl:.2f} ({trade.pnl_pct:.2%}) "
+            f"gross={trade.gross_pnl:.2f} fees={trade.entry_fee + trade.exit_fee:.2f} "
+            f"reason={reason}"
         )
 
     def _loss_cooldown_remaining(self) -> float:
@@ -177,3 +250,12 @@ class PortfolioManager:
             last_loss_at = last_loss_at.replace(tzinfo=timezone.utc)
         elapsed = (datetime.now(timezone.utc) - last_loss_at).total_seconds()
         return max(self.consecutive_loss_cooldown_seconds - elapsed, 0.0)
+
+    def _strategy_loss_cooldown_remaining(self, strategy: str) -> float:
+        last_loss_at = self.strategy_last_loss_at.get(strategy)
+        if last_loss_at is None:
+            return float(self.strategy_loss_cooldown_seconds)
+        if last_loss_at.tzinfo is None:
+            last_loss_at = last_loss_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last_loss_at).total_seconds()
+        return max(self.strategy_loss_cooldown_seconds - elapsed, 0.0)

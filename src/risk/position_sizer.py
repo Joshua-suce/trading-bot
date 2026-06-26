@@ -5,6 +5,7 @@ from loguru import logger
 
 from src.config import settings
 from src.risk.portfolio import PortfolioManager
+from src.strategies import StrategyRegistry
 
 
 # Result of the sizing calculation
@@ -27,13 +28,28 @@ class PositionSizer:
         stop_loss_price: float,
         leverage: int = 1,
         side: str = "long",
+        strategy: str | None = None,
     ) -> PositionSize:
         account = self.portfolio.account
         if account is None:
             return PositionSize(0, 0, 0, "no_account")
 
         equity = account.total_equity
-        risk_per_trade = settings.risk_per_trade * equity
+        policy = StrategyRegistry(settings).get(strategy)
+        risk_fraction = policy.risk_fraction if strategy else settings.risk_per_trade
+        max_position_fraction = (
+            policy.max_position_fraction if strategy else settings.max_position_size
+        )
+        if (
+            settings.binance_environment == "mainnet"
+            and settings.mainnet_canary_enabled
+        ):
+            risk_fraction = min(risk_fraction, settings.mainnet_canary_risk_per_trade)
+            max_position_fraction = min(
+                max_position_fraction,
+                settings.mainnet_canary_max_position_size,
+            )
+        risk_per_trade = risk_fraction * equity
 
         # Risk per unit
         if side == "long":
@@ -49,21 +65,15 @@ class PositionSizer:
 
         # Quantity based on risk
         quantity = risk_per_trade / risk_per_unit
-        leveraged_quantity = quantity * min(leverage, settings.max_leverage)
-
         # Constrain by max position size
-        max_pos = settings.max_position_size * equity / entry_price
+        max_pos = max_position_fraction * equity / entry_price
         quantity = min(quantity, max_pos)
-        leveraged_quantity = min(
-            leveraged_quantity, max_pos * min(leverage, settings.max_leverage)
-        )
-
         quantity = max(quantity, 0)
-        leveraged_quantity = max(leveraged_quantity, 0)
 
         return PositionSize(
             quantity=round(quantity, 6),
-            leveraged_quantity=round(leveraged_quantity, 6),
+            # Exchange leverage changes margin use, not stop-defined loss risk.
+            leveraged_quantity=round(quantity, 6),
             risk_amount=round(risk_per_trade, 2),
             size_type="risk_based",
         )

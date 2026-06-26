@@ -5,11 +5,13 @@ from typing import Any, Tuple
 import numpy as np
 import pandas as pd
 from loguru import logger
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
 
 from src.config import settings
 from src.models.ensemble import ModelEnsemble
-from src.models.feature_engineer import FeatureEngineer
+from src.models.feature_engineer import LABEL_SCHEMA, FeatureEngineer
+from src.models.registry import ModelArtifactRegistry
 
 XGBModel: Any = None
 try:
@@ -29,7 +31,10 @@ class ModelTrainer:
         self.model_dir = configured_dir.resolve()
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self.feature_engineer = FeatureEngineer(
-            lookback=lookback or settings.feature_lookback
+            lookback=lookback or settings.feature_lookback,
+            prediction_horizon=settings.prediction_horizon,
+            label_atr_multiplier=settings.ml_label_atr_multiplier,
+            label_min_return=settings.ml_effective_label_min_return,
         )
 
     # Full pipeline: indicators → features → drop NaN → matrix + labels
@@ -64,6 +69,10 @@ class ModelTrainer:
         model.metadata = {
             "symbol": symbol.upper(),
             "timeframe": timeframe,
+            "label_schema": LABEL_SCHEMA,
+            "prediction_horizon": str(settings.prediction_horizon),
+            "label_atr_multiplier": str(settings.ml_label_atr_multiplier),
+            "label_min_return": str(settings.ml_effective_label_min_return),
         }
         model.train(X_train, y_train, eval_set=(X_test, y_test))
 
@@ -89,3 +98,48 @@ class ModelTrainer:
         )
         ensemble = ModelEnsemble(xgb_model=xgb)
         return ensemble
+
+    def train_candidate(
+        self,
+        df: pd.DataFrame,
+        *,
+        symbol: str,
+        timeframe: str,
+    ) -> tuple[Any, dict[str, Any]]:
+        if not XGB_AVAILABLE:
+            raise RuntimeError("XGBoost is unavailable")
+        X, y = self.prepare_data(df)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            shuffle=False,
+        )
+        model = XGBModel()
+        model.metadata = {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "label_schema": "volatility_horizon_v2",
+            "candidate": "true",
+        }
+        model.train(X_train, y_train, eval_set=(X_test, y_test))
+        predictions = model.predict(X_test)
+        accuracy = float(accuracy_score(y_test, predictions))
+        macro_f1 = float(f1_score(y_test, predictions, average="macro"))
+        validation = {
+            "approved": (
+                accuracy >= settings.ml_candidate_min_accuracy
+                and macro_f1 >= settings.ml_candidate_min_macro_f1
+            ),
+            "accuracy": round(accuracy, 6),
+            "macro_f1": round(macro_f1, 6),
+            "test_samples": len(y_test),
+            "class_count": len(np.unique(y)),
+        }
+        candidate = ModelArtifactRegistry(str(self.model_dir)).candidate_path(
+            symbol,
+            timeframe,
+        )
+        model.metadata["validation"] = str(validation)
+        model.save(str(candidate))
+        return model, validation

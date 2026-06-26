@@ -30,14 +30,17 @@ def test_run_admin_updates_controls_and_strategy_state(tmp_path, monkeypatch):
 
     run_admin("pause", "maintenance")
     audit = AuditStore(str(audit_path))
-    assert audit.trading_allowed() == (False, "manual trading pause is active")
+    assert audit.trading_allowed() == (False, "manual pause is active")
     assert audit.get_controls()["manual_pause"]["reason"] == "maintenance"
 
     run_admin("resume", "ready")
     assert audit.trading_allowed() == (True, "ok")
 
     run_admin("emergency-stop", "operator stop")
-    assert audit.trading_allowed() == (False, "emergency stop is active")
+    assert audit.trading_allowed() == (
+        False,
+        "emergency stop active (level 3): operator stop",
+    )
 
     run_admin("clear-emergency", "operator clear")
     assert audit.trading_allowed() == (True, "ok")

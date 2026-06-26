@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from src.backtest.metrics import BacktestMetrics
+from src.backtest.walk_forward import WalkForwardReport
 from src.config import Settings, settings
 
 
@@ -17,6 +18,7 @@ class StrategyApproval:
     symbol: str
     timeframe: str
     metrics: dict[str, Any]
+    validation: dict[str, Any]
 
     @property
     def approved_datetime(self) -> datetime:
@@ -39,6 +41,7 @@ class StrategyApprovalStore:
         timeframe: str,
         approved_by: str,
         reason: str,
+        validation: dict[str, Any] | None = None,
     ) -> StrategyApproval:
         approval = StrategyApproval(
             approved=True,
@@ -48,6 +51,7 @@ class StrategyApprovalStore:
             symbol=symbol,
             timeframe=timeframe,
             metrics=asdict(metrics),
+            validation=validation or {},
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
@@ -55,6 +59,24 @@ class StrategyApprovalStore:
             encoding="utf-8",
         )
         return approval
+
+    def write_walk_forward(
+        self,
+        *,
+        report: WalkForwardReport,
+        approved_by: str,
+        reason: str,
+    ) -> StrategyApproval:
+        if not report.approved:
+            raise ValueError(f"walk-forward report is not approved: {report.reason}")
+        return self.write(
+            metrics=report.aggregate_metrics,
+            symbol=report.symbol,
+            timeframe=report.timeframe,
+            approved_by=approved_by,
+            reason=reason,
+            validation={"method": "walk_forward", **report.to_dict()},
+        )
 
     def revoke(self, reason: str = "") -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +88,7 @@ class StrategyApprovalStore:
             "symbol": "",
             "timeframe": "",
             "metrics": {},
+            "validation": {},
         }
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -81,6 +104,7 @@ class StrategyApprovalStore:
             symbol=str(data.get("symbol", "")),
             timeframe=str(data.get("timeframe", "")),
             metrics=dict(data.get("metrics", {})),
+            validation=dict(data.get("validation", {})),
         )
 
     def validate_for_mainnet(self) -> tuple[bool, str]:
@@ -109,4 +133,24 @@ class StrategyApprovalStore:
             return False, f"profit factor below approval threshold: {profit_factor}"
         if drawdown_pct > self.cfg.max_approval_drawdown_pct:
             return False, f"drawdown above approval threshold: {drawdown_pct}"
+        if self.cfg.require_walk_forward_approval:
+            valid, reason = self._validate_walk_forward(approval.validation)
+            if not valid:
+                return valid, reason
         return True, "strategy approval valid"
+
+    def _validate_walk_forward(
+        self,
+        validation: dict[str, Any],
+    ) -> tuple[bool, str]:
+        if validation.get("method") != "walk_forward":
+            return False, "approval is missing walk-forward validation"
+        if not validation.get("approved"):
+            return False, "walk-forward validation did not pass"
+        folds = validation.get("folds") or []
+        if len(folds) < self.cfg.min_approval_oos_folds:
+            return False, f"approval has too few out-of-sample folds: {len(folds)}"
+        profitable_ratio = float(validation.get("profitable_fold_ratio", 0.0))
+        if profitable_ratio < self.cfg.min_approval_profitable_fold_ratio:
+            return False, "profitable fold ratio below approval threshold"
+        return True, "walk-forward validation valid"

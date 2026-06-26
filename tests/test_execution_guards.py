@@ -148,6 +148,81 @@ async def test_order_manager_blocks_entry_slippage(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("side", "ticker"),
+    [
+        ("buy", {"last": 100.0, "bid": 94.9, "ask": 95.0}),
+        ("sell", {"last": 100.0, "bid": 105.0, "ask": 105.1}),
+    ],
+)
+async def test_order_manager_allows_favorable_market_movement(side, ticker):
+    client = FakeExchangeClient(ticker=ticker)
+    orders = OrderManager(
+        client,
+        guard=ExecutionGuard(max_slippage_bps=25.0, min_notional=5.0),
+    )
+
+    order = await orders.market_order("BTCUSDT", side, 1.0)
+
+    assert order is not None
+
+
+@pytest.mark.asyncio
+async def test_order_manager_blocks_invalid_market_quote():
+    client = FakeExchangeClient(ticker={"last": 100.0, "bid": 0.0, "ask": 0.0})
+    orders = OrderManager(
+        client,
+        guard=ExecutionGuard(max_slippage_bps=25.0, min_notional=5.0),
+    )
+
+    order = await orders.market_order("BTCUSDT", "buy", 1.0)
+
+    assert order is None
+    assert client.created_orders == []
+
+
+@pytest.mark.asyncio
+async def test_order_manager_uses_order_book_when_ticker_quote_is_incomplete():
+    client = FakeExchangeClient(
+        ticker={"last": 100.0, "bid": None, "ask": None},
+    )
+
+    async def fetch_order_book(symbol, limit=5):
+        return {"bids": [[99.99, 2.0]], "asks": [[100.01, 2.0]]}
+
+    client.fetch_order_book = fetch_order_book
+    orders = OrderManager(
+        client,
+        guard=ExecutionGuard(max_slippage_bps=25.0, min_notional=5.0),
+    )
+
+    order = await orders.market_order("BTCUSDT", "sell", 1.0)
+
+    assert order is not None
+
+
+@pytest.mark.asyncio
+async def test_order_manager_still_blocks_when_ticker_and_book_are_invalid():
+    client = FakeExchangeClient(
+        ticker={"last": 100.0, "bid": None, "ask": None},
+    )
+
+    async def fetch_order_book(symbol, limit=5):
+        return {"bids": [], "asks": []}
+
+    client.fetch_order_book = fetch_order_book
+    orders = OrderManager(
+        client,
+        guard=ExecutionGuard(max_slippage_bps=25.0, min_notional=5.0),
+    )
+
+    order = await orders.market_order("BTCUSDT", "buy", 1.0)
+
+    assert order is None
+    assert client.created_orders == []
+
+
+@pytest.mark.asyncio
 async def test_order_manager_allows_reduce_only_exit_despite_slippage(tmp_path):
     client = FakeExchangeClient(ticker={"last": 100.0, "bid": 90.0, "ask": 110.0})
     orders = OrderManager(

@@ -1,9 +1,11 @@
 # Real-time candle stream via WebSocket — pushes new candles to a callback
 import asyncio
+import random
 from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 
+from src.config import settings
 from src.exchange.client import ExchangeClient
 
 
@@ -46,7 +48,8 @@ class CandleStream:
                     await self.callback(candle)
             except Exception as e:
                 logger.error(f"Stream error for {self.symbol}: {e}")
-                await asyncio.sleep(5)
+                jitter = random.uniform(0, settings.exchange_ws_reconnect_jitter)
+                await asyncio.sleep(5 + jitter)
 
     # Cancel the background task to stop streaming
     async def stop(self):

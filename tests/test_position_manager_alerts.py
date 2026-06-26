@@ -5,6 +5,7 @@ import pytest
 from src.audit import AuditStore
 from src.exchange.account import AccountInfo
 from src.execution.position_manager import PositionManager
+from src.execution.position_registry import PositionRegistry
 from src.risk.portfolio import PortfolioManager
 from src.risk.position_sizer import PositionSizer
 from src.risk.stop_loss import StopLossManager
@@ -121,7 +122,7 @@ def build_manager(alerter, tmp_path, *, with_account=True):
         client=FakeClient(),
         order_mgr=FakeOrderManager(),
         pos_sizer=PositionSizer(portfolio),
-        sl_mgr=StopLossManager(),
+        sl_mgr=StopLossManager(max_stop_loss_pct=1.0),
         portfolio=portfolio,
         alerter=alerter,
         mode="trade",
@@ -157,8 +158,8 @@ async def test_protective_levels_are_recalculated_from_actual_fill(tmp_path):
 
     assert await manager.enter_short("ETHUSDT", price=100.0, atr=2.0)
     assert manager.open_trades["ETHUSDT"].entry_price == 100.2
-    assert manager.orders.stop_prices == [102.2]
-    assert manager.orders.target_prices == [96.2]
+    assert manager.orders.stop_prices == [103.2]
+    assert manager.orders.target_prices == [94.2]
 
 
 @pytest.mark.asyncio
@@ -187,7 +188,7 @@ async def test_adverse_fill_slippage_is_immediately_flattened(monkeypatch, tmp_p
     assert manager.open_trades == {}
     assert manager.orders.protective_quantities == []
     assert "slippage above limit" in alerter.failed[-1]["reason"]
-    assert manager._reentry_cooldown_reason("BTCUSDT")
+    assert manager.trades.reentry_cooldown_reason("BTCUSDT")
 
 
 @pytest.mark.asyncio
@@ -201,7 +202,7 @@ async def test_signal_price_drift_blocks_before_market_order(monkeypatch, tmp_pa
     manager = build_manager(alerter, tmp_path)
 
     async def stale_quote(symbol):
-        return {"last": 101.0, "bid": 101.0, "ask": 101.0}
+        return {"last": 99.0, "bid": 99.0, "ask": 99.0}
 
     manager.client.fetch_ticker = stale_quote
 
@@ -233,8 +234,8 @@ async def test_entry_fill_price_is_refetched_before_protection(tmp_path):
 
     assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
     assert manager.open_trades["BTCUSDT"].entry_price == 100.2
-    assert manager.orders.stop_prices == [98.2]
-    assert manager.orders.target_prices == [104.2]
+    assert manager.orders.stop_prices == [97.2]
+    assert manager.orders.target_prices == [106.2]
 
 
 @pytest.mark.asyncio
@@ -269,8 +270,8 @@ async def test_entry_fill_price_uses_weighted_trade_executions(tmp_path):
 
     assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
     assert manager.open_trades["BTCUSDT"].entry_price == pytest.approx(100.12)
-    assert manager.orders.stop_prices == [pytest.approx(98.12)]
-    assert manager.orders.target_prices == [pytest.approx(104.12)]
+    assert manager.orders.stop_prices == [pytest.approx(97.12)]
+    assert manager.orders.target_prices == [pytest.approx(106.12)]
 
 
 @pytest.mark.asyncio
@@ -299,11 +300,56 @@ async def test_entry_fill_price_retries_delayed_trade_executions(monkeypatch, tm
 
     manager.orders.market_order = fill_without_price
     manager.client.fetch_my_trades = delayed_execution
-    monkeypatch.setattr("src.execution.position_manager.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("src.execution.fill_resolver.asyncio.sleep", no_sleep)
 
     assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
-    assert calls == 2
+    assert calls == 3  # Two fill attempts followed by entry-fee resolution.
     assert manager.open_trades["BTCUSDT"].entry_price == 100.1
+
+
+@pytest.mark.asyncio
+async def test_demo_entry_recovers_price_from_matching_position_snapshot(
+    monkeypatch, tmp_path
+):
+    alerter = FakeAlerter()
+    manager = build_manager(alerter, tmp_path)
+
+    async def fill_without_price(symbol, side, quantity, reduce_only=False):
+        return {
+            "id": "demo-market-fill",
+            "filled": quantity,
+            "average": None,
+            "price": None,
+            "side": side,
+            "status": "closed",
+            "info": {
+                "executedQty": str(quantity),
+                "status": "FILLED",
+            },
+        }
+
+    async def matching_position(symbol=None):
+        return [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 1.0,
+                "side": "long",
+                "entryPrice": 100.15,
+            }
+        ]
+
+    async def no_sleep(_seconds):
+        return None
+
+    manager.orders.market_order = fill_without_price
+    manager.client.fetch_positions = matching_position
+    monkeypatch.setattr("src.execution.fill_resolver.asyncio.sleep", no_sleep)
+
+    assert await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
+    assert manager.open_trades["BTCUSDT"].entry_price == 100.15
+    assert manager.orders.stop_prices == [pytest.approx(97.15)]
+    assert manager.orders.target_prices == [pytest.approx(106.15)]
+    assert alerter.failed == []
 
 
 @pytest.mark.asyncio
@@ -334,10 +380,10 @@ async def test_reentry_cooldown_blocks_same_symbol(monkeypatch, tmp_path):
     from src.execution import position_manager as position_manager_module
 
     monkeypatch.setattr(
-        position_manager_module.settings, "reentry_cooldown_seconds", 900
+        position_manager_module.settings, "max_entry_slippage_bps", 25.0
     )
     manager = build_manager(FakeAlerter(), tmp_path)
-    manager.last_symbol_exit_at["BTCUSDT"] = datetime.now(timezone.utc)
+    manager.trades.last_symbol_exit_at["BTCUSDT"] = datetime.now(timezone.utc)
 
     assert not await manager.enter_long("BTCUSDT", price=100.0, atr=2.0)
     assert manager.orders.counter == 0
@@ -410,7 +456,7 @@ async def test_trade_failure_alert_when_sizing_rejects(tmp_path):
 
 
 def test_position_key_is_reconciled_per_symbol():
-    assert PositionManager.position_key("BTC/USDT:USDT", "5m") == "BTCUSDT:5m"
+    assert PositionRegistry.position_key("BTC/USDT:USDT", "5m") == "BTCUSDT:5m"
 
 
 @pytest.mark.asyncio
@@ -427,8 +473,8 @@ async def test_exit_keeps_trade_open_when_fill_is_not_confirmed(tmp_path):
     await manager.exit_position("BTCUSDT", reason="manual")
 
     assert "BTCUSDT" in manager.open_trades
-    assert manager.active_stops["BTCUSDT"] == "stop-1"
-    assert manager.active_tps["BTCUSDT"] == "target-1"
+    assert manager.protection.active_stops["BTCUSDT"] == "stop-1"
+    assert manager.protection.active_tps["BTCUSDT"] == "target-1"
     assert alerter.completed == []
     assert "exit order failed" in alerter.failed[-1]["reason"]
 

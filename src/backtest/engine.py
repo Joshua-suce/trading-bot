@@ -5,9 +5,13 @@ from typing import Callable, List, Optional
 
 import pandas as pd
 
+from src.backtest.baseline import ScopeBaseline, build_scope_baselines
 from src.backtest.metrics import BacktestMetrics
 from src.backtest.types import BacktestTrade
 from src.indicators.compute import compute_all_indicators
+from src.live.data_quality import timeframe_seconds
+from src.risk.stop_loss import StopLossManager
+from src.strategies import StrategyRegistry
 
 
 def _to_trade_datetime(value) -> datetime:
@@ -23,6 +27,7 @@ class BacktestResult:
     trades: List[BacktestTrade]
     equity_curve: List[float]
     metrics: BacktestMetrics
+    scope_baselines: List[ScopeBaseline]
 
 
 class BacktestEngine:
@@ -49,6 +54,12 @@ class BacktestEngine:
         risk_per_trade: float = 0.02,
         atr_mult_sl: float = 1.0,
         atr_mult_tp: float = 2.0,
+        *,
+        symbol: str = "UNKNOWN",
+        timeframe: str = "1h",
+        default_strategy: str = "unknown",
+        entry_confidence: float = 0.3,
+        use_strategy_policy: bool = False,
     ) -> BacktestResult:
         df = compute_all_indicators(df).copy()
         trades: List[BacktestTrade] = []
@@ -62,6 +73,14 @@ class BacktestEngine:
         quantity = 0.0
         stop_loss = 0.0
         take_profit = 0.0
+        entry_fee = 0.0
+        entry_slippage_cost = 0.0
+        position_strategy = default_strategy
+        entry_bar_index = 0
+        maximum_hold_bars: int | None = None
+        strategy_registry = StrategyRegistry()
+        strategy_names = {policy.name for policy in strategy_registry.all()}
+        stop_manager = StopLossManager()
 
         # Start at index 100 to allow enough data for indicators and features
         for i in range(100, len(df) - 1):
@@ -72,39 +91,82 @@ class BacktestEngine:
             # No position — check for entry signal
             if not in_position:
                 signal = signal_fn(current)
-                if signal["direction"] != 0 and signal["confidence"] > 0.3:
+                if (
+                    signal["direction"] != 0
+                    and signal["confidence"] >= entry_confidence
+                ):
                     side = "long" if signal["direction"] == 1 else "short"
+                    position_strategy = str(
+                        signal.get("strategy") or default_strategy or "unknown"
+                    )
                     atr_val = max(
                         row.get("atr", row["close"] * 0.01), row["close"] * 0.002
                     )
                     # Apply slippage to entry price (worse for aggressive direction)
-                    entry_price = row["close"] * (
+                    entry_reference_price = float(row["close"])
+                    entry_price = entry_reference_price * (
                         1 + self.slippage * signal["direction"]
                     )
-                    risk_amount = equity * risk_per_trade
-                    sl_distance = atr_val * atr_mult_sl
+                    policy = strategy_registry.get(position_strategy)
+                    policy_active = (
+                        use_strategy_policy and position_strategy in strategy_names
+                    )
+                    applied_risk = (
+                        policy.risk_fraction if policy_active else risk_per_trade
+                    )
+                    risk_amount = equity * applied_risk
+                    if policy_active:
+                        levels = stop_manager.calculate(
+                            entry_price,
+                            side,
+                            atr_val,
+                            strategy=position_strategy,
+                        )
+                        stop_loss = levels.stop_loss
+                        take_profit = float(levels.take_profit or entry_price)
+                        sl_distance = abs(entry_price - stop_loss)
+                        maximum_hold_bars = max(
+                            policy.max_hold_seconds(timeframe)
+                            // timeframe_seconds(timeframe),
+                            1,
+                        )
+                    else:
+                        sl_distance = atr_val * atr_mult_sl
+                        maximum_hold_bars = None
                     quantity = risk_amount / sl_distance
                     max_by_margin = equity * self.leverage / entry_price
-                    max_by_risk = self.max_position_size * equity / entry_price
+                    position_cap = (
+                        policy.max_position_fraction
+                        if policy_active
+                        else self.max_position_size
+                    )
+                    max_by_risk = position_cap * equity / entry_price
                     quantity = min(quantity, max_by_margin, max_by_risk)
                     quantity = max(quantity, 0)
 
                     if quantity > 0:
                         in_position = True
+                        entry_bar_index = i
                         position_side = side
                         entry_time = _to_trade_datetime(row.name)
-                        if side == "long":
-                            stop_loss = entry_price - sl_distance
-                            take_profit = (
-                                entry_price + sl_distance * atr_mult_tp / atr_mult_sl
-                            )
-                        else:
-                            stop_loss = entry_price + sl_distance
-                            take_profit = (
-                                entry_price - sl_distance * atr_mult_tp / atr_mult_sl
-                            )
-                        commission_cost = entry_price * quantity * self.commission
-                        equity -= commission_cost
+                        if not policy_active:
+                            if side == "long":
+                                stop_loss = entry_price - sl_distance
+                                take_profit = (
+                                    entry_price
+                                    + sl_distance * atr_mult_tp / atr_mult_sl
+                                )
+                            else:
+                                stop_loss = entry_price + sl_distance
+                                take_profit = (
+                                    entry_price
+                                    - sl_distance * atr_mult_tp / atr_mult_sl
+                                )
+                        entry_fee = entry_price * quantity * self.commission
+                        entry_slippage_cost = (
+                            abs(entry_price - entry_reference_price) * quantity
+                        )
+                        equity -= entry_fee
 
             # In position — check for exit (SL/TP/reversal)
             else:
@@ -131,6 +193,14 @@ class BacktestEngine:
                         exit_price = take_profit
 
                 # Exit on opposite signal when no SL/TP triggered
+                if (
+                    exit_reason is None
+                    and maximum_hold_bars is not None
+                    and i + 1 - entry_bar_index >= maximum_hold_bars
+                ):
+                    exit_reason = "maximum_hold"
+                    exit_price = next_close
+
                 if exit_reason is None:
                     signal = signal_fn(df.iloc[: i + 2])
                     if signal["confidence"] > 0.4:
@@ -138,26 +208,33 @@ class BacktestEngine:
                             position_side == "short" and signal["direction"] == 1
                         ):
                             exit_reason = "signal_reversal"
-                            exit_price = next_close * (
-                                1
-                                - self.slippage * (1 if position_side == "long" else -1)
-                            )
+                            exit_price = next_close
 
                 if exit_reason:
                     if exit_price is None:
                         exit_price = next_close
                     if entry_time is None:
                         raise RuntimeError("Backtest position is missing entry time")
+                    exit_reference_price = float(exit_price)
+                    exit_price = exit_reference_price * (
+                        1 - self.slippage
+                        if position_side == "long"
+                        else 1 + self.slippage
+                    )
                     if position_side == "long":
-                        pnl = (exit_price - entry_price) * quantity
-                        pnl_pct = (exit_price - entry_price) / entry_price
+                        gross_pnl = (exit_price - entry_price) * quantity
                     else:
-                        pnl = (entry_price - exit_price) * quantity
-                        pnl_pct = (entry_price - exit_price) / entry_price
+                        gross_pnl = (entry_price - exit_price) * quantity
 
-                    commission_cost = exit_price * quantity * self.commission
-                    pnl -= commission_cost
-                    equity += pnl
+                    exit_fee = exit_price * quantity * self.commission
+                    fees = entry_fee + exit_fee
+                    pnl = gross_pnl - fees
+                    notional = entry_price * quantity
+                    pnl_pct = pnl / notional if notional > 0 else 0.0
+                    exit_slippage_cost = (
+                        abs(exit_price - exit_reference_price) * quantity
+                    )
+                    equity += gross_pnl - exit_fee
 
                     exit_time = _to_trade_datetime(next_row.name)
                     trade = BacktestTrade(
@@ -170,12 +247,18 @@ class BacktestEngine:
                         pnl=pnl,
                         pnl_pct=pnl_pct,
                         exit_reason=exit_reason,
+                        symbol=symbol.upper(),
+                        timeframe=timeframe,
+                        strategy=position_strategy,
+                        gross_pnl=gross_pnl,
+                        fees=fees,
+                        slippage_cost=(entry_slippage_cost + exit_slippage_cost),
                     )
                     trades.append(trade)
                     in_position = False
 
                 # Update trailing stop
-                if in_position:
+                if in_position and not use_strategy_policy:
                     if position_side == "long":
                         new_sl = (
                             next_close - df.iloc[: i + 2]["atr"].iloc[-1] * atr_mult_sl
@@ -201,18 +284,23 @@ class BacktestEngine:
         # Close any open position at end
         if in_position:
             last_row = df.iloc[-1]
-            exit_price = last_row["close"]
+            exit_reference_price = float(last_row["close"])
+            exit_price = exit_reference_price * (
+                1 - self.slippage if position_side == "long" else 1 + self.slippage
+            )
             if entry_time is None:
                 raise RuntimeError("Backtest position is missing entry time")
             if position_side == "long":
-                pnl = (exit_price - entry_price) * quantity
-                pnl_pct = (exit_price - entry_price) / entry_price
+                gross_pnl = (exit_price - entry_price) * quantity
             else:
-                pnl = (entry_price - exit_price) * quantity
-                pnl_pct = (entry_price - exit_price) / entry_price
-            commission_cost = exit_price * quantity * self.commission
-            pnl -= commission_cost
-            equity += pnl
+                gross_pnl = (entry_price - exit_price) * quantity
+            exit_fee = exit_price * quantity * self.commission
+            fees = entry_fee + exit_fee
+            pnl = gross_pnl - fees
+            notional = entry_price * quantity
+            pnl_pct = pnl / notional if notional > 0 else 0.0
+            exit_slippage_cost = abs(exit_price - exit_reference_price) * quantity
+            equity += gross_pnl - exit_fee
             trade = BacktestTrade(
                 entry_time=entry_time,
                 exit_time=_to_trade_datetime(df.index[-1]),
@@ -223,9 +311,26 @@ class BacktestEngine:
                 pnl=pnl,
                 pnl_pct=pnl_pct,
                 exit_reason="end_of_data",
+                symbol=symbol.upper(),
+                timeframe=timeframe,
+                strategy=position_strategy,
+                gross_pnl=gross_pnl,
+                fees=fees,
+                slippage_cost=(entry_slippage_cost + exit_slippage_cost),
             )
             trades.append(trade)
             equity_curve[-1] = max(equity, 0.0)
 
-        metrics = BacktestMetrics.calculate(trades, equity_curve, self.initial_capital)
-        return BacktestResult(trades=trades, equity_curve=equity_curve, metrics=metrics)
+        periods_per_year = 365.0 * 24 * 60 * 60 / timeframe_seconds(timeframe)
+        metrics = BacktestMetrics.calculate(
+            trades,
+            equity_curve,
+            self.initial_capital,
+            periods_per_year=periods_per_year,
+        )
+        return BacktestResult(
+            trades=trades,
+            equity_curve=equity_curve,
+            metrics=metrics,
+            scope_baselines=build_scope_baselines(trades),
+        )

@@ -26,28 +26,37 @@ class BacktestMetrics:
     largest_win: float
     largest_loss: float
     avg_holding_periods: float
+    gross_pnl: float = 0.0
+    total_fees: float = 0.0
+    total_slippage_cost: float = 0.0
+    expectancy: float = 0.0
 
     # Compute all metrics from the trade list and equity curve
     @staticmethod
     def calculate(
-        trades: List[BacktestTrade], equity_curve: List[float], initial_capital: float
+        trades: List[BacktestTrade],
+        equity_curve: List[float],
+        initial_capital: float,
+        *,
+        periods_per_year: float = 8760.0,
     ) -> "BacktestMetrics":
         equity = np.array(equity_curve)
         total_return = equity[-1] - initial_capital
         total_return_pct = total_return / initial_capital * 100
 
-        # Annualized return (assuming hourly data unless specified)
         n_periods = len(equity)
-        periods_per_year = 8760  # hourly
-        annualized_return = (equity[-1] / initial_capital) ** (
-            periods_per_year / max(n_periods, 1)
-        ) - 1
+        annualized_return = 0.0
+        if initial_capital > 0 and equity[-1] > 0:
+            annualized_return = (equity[-1] / initial_capital) ** (
+                periods_per_year / max(n_periods - 1, 1)
+            ) - 1
 
         # Drawdown
         peak = np.maximum.accumulate(equity)
         drawdown = peak - equity
         max_dd = float(np.max(drawdown))
-        max_dd_pct = float(np.max(drawdown / peak * 100))
+        safe_peak = np.where(peak > 0, peak, np.nan)
+        max_dd_pct = float(np.nanmax(drawdown / safe_peak * 100))
 
         # Trade stats
         total_trades = len(trades)
@@ -75,8 +84,12 @@ class BacktestMetrics:
         losses = [t.pnl for t in trades if t.pnl < 0]
         win_rate = len(wins) / total_trades * 100
         total_wins = sum(wins) if wins else 0
-        total_losses = abs(sum(losses)) if losses else 1
-        profit_factor = total_wins / max(total_losses, 1)
+        total_losses = abs(sum(losses))
+        profit_factor = (
+            total_wins / total_losses
+            if total_losses > 0
+            else (float("inf") if total_wins > 0 else 0.0)
+        )
 
         avg_win = float(np.mean(wins)) if wins else 0.0
         avg_loss = float(np.mean(losses)) if losses else 0.0
@@ -93,6 +106,10 @@ class BacktestMetrics:
                     holding = (t.exit_time - t.entry_time).total_seconds() / 3600
                     holding_periods.append(holding)
         avg_holding = float(np.mean(holding_periods)) if holding_periods else 0.0
+        gross_pnl = sum(trade.gross_pnl for trade in trades)
+        total_fees = sum(trade.fees for trade in trades)
+        total_slippage_cost = sum(trade.slippage_cost for trade in trades)
+        expectancy = sum(trade.pnl for trade in trades) / total_trades
 
         # Sharpe (using equity curve returns)
         equity_returns = np.diff(equity) / equity[:-1]
@@ -122,9 +139,9 @@ class BacktestMetrics:
             total_trades=total_trades,
             win_rate=round(win_rate, 2),
             profit_factor=round(profit_factor, 2),
-            sharpe_ratio=round(sharpe, 2),
-            sortino_ratio=round(sortino, 2),
-            calmar_ratio=round(calmar, 2),
+            sharpe_ratio=float(round(sharpe, 2)),
+            sortino_ratio=float(round(sortino, 2)),
+            calmar_ratio=float(round(calmar, 2)),
             max_drawdown=round(max_dd, 2),
             max_drawdown_pct=round(max_dd_pct, 2),
             avg_win=round(avg_win, 2),
@@ -132,6 +149,10 @@ class BacktestMetrics:
             largest_win=round(largest_win, 2),
             largest_loss=round(largest_loss, 2),
             avg_holding_periods=round(avg_holding, 2),
+            gross_pnl=round(gross_pnl, 8),
+            total_fees=round(total_fees, 8),
+            total_slippage_cost=round(total_slippage_cost, 8),
+            expectancy=round(expectancy, 8),
         )
 
     # Human-readable dictionary of results for logging
@@ -152,4 +173,8 @@ class BacktestMetrics:
             "Largest Win": f"${self.largest_win}",
             "Largest Loss": f"${self.largest_loss}",
             "Avg Hold (hrs)": self.avg_holding_periods,
+            "Gross PnL": f"${self.gross_pnl}",
+            "Total Fees": f"${self.total_fees}",
+            "Slippage Cost": f"${self.total_slippage_cost}",
+            "Expectancy": f"${self.expectancy}",
         }

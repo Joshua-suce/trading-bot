@@ -1,5 +1,6 @@
 # Async ccxt exchange client — wraps Binance Futures REST + WebSocket APIs
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import List, Optional, TypeVar
@@ -8,12 +9,21 @@ import aiohttp
 import ccxt.async_support as ccxt
 import ccxt.pro as ccxt_pro
 import pandas as pd
-from ccxt.base.errors import AuthenticationError, InvalidNonce, NetworkError
+from ccxt.base.errors import (
+    AuthenticationError,
+    ExchangeError,
+    InvalidNonce,
+    NetworkError,
+)
 from loguru import logger
 
 from src.config import settings
 
 T = TypeVar("T")
+
+
+class BinanceDemoAccountInactiveError(RuntimeError):
+    pass
 
 
 class ExchangeClient:
@@ -24,6 +34,10 @@ class ExchangeClient:
         self._ws: Optional[ccxt_pro.Exchange] = None
         self._rest_session: Optional[aiohttp.ClientSession] = None
         self._ws_session: Optional[aiohttp.ClientSession] = None
+        self._clock_sync_task: Optional[asyncio.Task] = None
+        self._clock_sync_lock = asyncio.Lock()
+        self._last_balance_snapshot: Optional[dict] = None
+        self._last_balance_snapshot_at = 0.0
 
     # Context manager entry — connect then return self
     async def __aenter__(self):
@@ -70,6 +84,9 @@ class ExchangeClient:
         else:
             logger.warning("Connected to Binance Futures MAINNET")
 
+        if self._rest is not None:
+            self._clock_sync_task = asyncio.create_task(self._periodic_clock_sync())
+
     async def _connect_once(self) -> None:
         self._rest_session = self._create_aiohttp_session()
         self._ws_session = self._create_aiohttp_session()
@@ -81,10 +98,11 @@ class ExchangeClient:
             self._enable_demo_trading(self._rest)
             self._enable_demo_trading(self._ws)
 
-        # load_markets checks public connectivity; fetch_balance checks auth.
+        # load_markets checks public connectivity; balance checks auth and primes
+        # the short-lived snapshot cache used by startup account initialization.
         await self._rest.load_markets()
         if self.config.get("apiKey") and self.config.get("secret"):
-            await self._rest.fetch_balance()
+            await self._fetch_balance_snapshot()
 
     @staticmethod
     def _enable_demo_trading(exchange):
@@ -101,11 +119,24 @@ class ExchangeClient:
         connector = aiohttp.TCPConnector(
             resolver=aiohttp.ThreadedResolver(),
             enable_cleanup_closed=True,
+            ttl_dns_cache=settings.exchange_dns_cache_ttl,
+            keepalive_timeout=settings.exchange_keepalive_seconds,
+            limit=settings.exchange_connection_limit,
+            limit_per_host=settings.exchange_connection_limit_per_host,
         )
-        return aiohttp.ClientSession(connector=connector)
+        timeout = aiohttp.ClientTimeout(
+            total=settings.exchange_request_timeout_ms / 1000 * 2,
+            connect=settings.exchange_request_timeout_ms / 1000,
+        )
+        return aiohttp.ClientSession(connector=connector, timeout=timeout)
 
     # Gracefully close both REST and WebSocket connections
     async def close(self):
+        if self._clock_sync_task is not None:
+            self._clock_sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._clock_sync_task
+            self._clock_sync_task = None
         resources = (
             self._rest,
             self._ws,
@@ -134,21 +165,56 @@ class ExchangeClient:
                     raise
                 await self._resync_time()
                 await self._read_retry_delay(label, exc, attempt, attempts)
+            except ExchangeError as exc:
+                if self._is_demo_account_inactive(exc):
+                    raise BinanceDemoAccountInactiveError(
+                        "Binance demo trading account is inactive. "
+                        "Activate the demo futures account in Binance before "
+                        "running trade mode."
+                    ) from exc
+                raise
             except NetworkError as exc:
                 if attempt == attempts:
                     raise
                 await self._read_retry_delay(label, exc, attempt, attempts)
         raise RuntimeError(f"Unreachable retry state for {label}")
 
+    @staticmethod
+    def _is_demo_account_inactive(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return '"code":-4109' in message or "activate the account first" in message
+
     async def _resync_time(self) -> None:
+        if self._rest is None:
+            return
+        async with self._clock_sync_lock:
+            try:
+                await self._rest.load_time_difference()
+                logger.warning("Resynchronized Binance server time after InvalidNonce")
+            except Exception as exc:
+                logger.warning(
+                    "Binance time resynchronization failed: {}",
+                    type(exc).__name__,
+                )
+
+    async def _periodic_clock_sync(self) -> None:
+        interval = settings.clock_sync_interval_seconds
         try:
-            await self.rest.load_time_difference()
-            logger.warning("Resynchronized Binance server time after InvalidNonce")
-        except Exception as exc:
-            logger.warning(
-                "Binance time resynchronization failed: {}",
-                type(exc).__name__,
-            )
+            while True:
+                await asyncio.sleep(interval)
+                if self._rest is None:
+                    continue
+                try:
+                    async with self._clock_sync_lock:
+                        await self._rest.load_time_difference()
+                    logger.debug("Periodic clock sync completed")
+                except Exception as exc:
+                    logger.warning(
+                        "Periodic clock sync failed: {}",
+                        type(exc).__name__,
+                    )
+        except asyncio.CancelledError:
+            pass
 
     @staticmethod
     async def _read_retry_delay(
@@ -200,9 +266,42 @@ class ExchangeClient:
 
     # Fetch wallet balance (all currencies)
     async def fetch_balance(self) -> dict:
+        cached = self._cached_balance_snapshot()
+        if cached is not None:
+            return cached
         return await self._read_with_retries(
-            lambda: self.rest.fetch_balance(), "account balance"
+            self._fetch_balance_snapshot, "account balance"
         )
+
+    async def _fetch_balance_snapshot(self) -> dict:
+        params = {"type": "swap"}
+        try:
+            balance = await self.rest.fetch_balance(params)
+        except (AuthenticationError, InvalidNonce):
+            raise
+        except (ExchangeError, NetworkError) as primary_exc:
+            if not settings.binance_demo:
+                raise
+            logger.warning(
+                "Binance Demo account v3 balance failed ({}); trying v2",
+                type(primary_exc).__name__,
+            )
+            try:
+                balance = await self.rest.fetch_balance({**params, "useV2": True})
+            except Exception as fallback_exc:
+                raise primary_exc from fallback_exc
+
+        self._last_balance_snapshot = balance
+        self._last_balance_snapshot_at = time.monotonic()
+        return balance
+
+    def _cached_balance_snapshot(self) -> Optional[dict]:
+        if self._last_balance_snapshot is None:
+            return None
+        age = time.monotonic() - self._last_balance_snapshot_at
+        if age > settings.account_balance_cache_seconds:
+            return None
+        return self._last_balance_snapshot
 
     # Fetch open positions, optionally filtered by symbol
     async def fetch_positions(self, symbol: Optional[str] = None) -> List[dict]:
@@ -313,6 +412,12 @@ class ExchangeClient:
     async def fetch_ticker(self, symbol: str) -> dict:
         return await self._read_with_retries(
             lambda: self.rest.fetch_ticker(symbol), f"ticker {symbol}"
+        )
+
+    async def fetch_order_book(self, symbol: str, limit: int = 5) -> dict:
+        return await self._read_with_retries(
+            lambda: self.rest.fetch_order_book(symbol, limit),
+            f"order book {symbol}",
         )
 
     # Load all markets and return the market info for one symbol

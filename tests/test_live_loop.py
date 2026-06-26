@@ -1,12 +1,19 @@
 import asyncio
+import time
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from src.exchange.account import AccountInfo
+from src.exchange.client import BinanceDemoAccountInactiveError
 from src.live import loop as live_loop_module
 from src.live.loop import LiveTradingLoop
+from src.risk.portfolio import TradeRecord
+from src.signals.aggregator import FinalSignal
+from src.signals.quality_gate import StrategyQuality
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +28,21 @@ def isolate_live_loop_audit(tmp_path, monkeypatch):
         "model_dir",
         str(tmp_path / "models"),
     )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "runtime_heartbeat_path",
+        str(tmp_path / "heartbeat.json"),
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "disabled_strategy_scopes",
+        "",
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "auto_retrain_enabled",
+        False,
+    )
 
 
 def test_live_loop_uses_injected_audit_store(tmp_path):
@@ -32,6 +54,273 @@ def test_live_loop_uses_injected_audit_store(tmp_path):
     assert bot.audit_store is audit
     assert bot.order_mgr.audit_store is audit
     assert bot.pos_mgr.audit_store is audit
+
+
+def test_candle_cache_deduplicates_and_keeps_latest_rows():
+    bot = LiveTradingLoop()
+    first = pd.DataFrame(
+        {"close": [100.0, 101.0]},
+        index=pd.date_range("2026-01-01", periods=2, freq="1min"),
+    )
+    update = pd.DataFrame(
+        {"close": [102.0, 103.0]},
+        index=pd.date_range("2026-01-01 00:01", periods=2, freq="1min"),
+    )
+
+    cached = bot._cache_market_frame("BTCUSDT", "1m", first)
+    cached = bot._cache_market_frame("BTCUSDT", "1m", update)
+
+    assert len(cached) == 3
+    assert cached.iloc[1]["close"] == 102.0
+
+
+def test_healthy_scalp_stream_suppresses_rest_scan(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT")
+    monkeypatch.setattr(live_loop_module.settings, "timeframes", "1m,5m")
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_demo_websocket_enabled",
+        True,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_websocket_enabled",
+        True,
+    )
+    bot = LiveTradingLoop()
+    bot._scalp_stream_heartbeat["BTCUSDT_1m"] = time.monotonic()
+
+    pairs = bot._due_scan_pairs(time.monotonic())
+
+    assert ("BTCUSDT", "1m") not in pairs
+    assert ("BTCUSDT", "5m") in pairs
+
+
+def test_stale_scalp_stream_restores_rest_fallback(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT")
+    monkeypatch.setattr(live_loop_module.settings, "timeframes", "1m")
+    bot = LiveTradingLoop()
+    bot._scalp_stream_heartbeat["BTCUSDT_1m"] = (
+        time.monotonic() - live_loop_module.settings.scalp_stream_fallback_seconds - 1
+    )
+
+    assert ("BTCUSDT", "1m") in bot._due_scan_pairs(time.monotonic())
+
+
+def test_demo_defaults_to_rest_scalp_fast_lane(monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "binance_api_url",
+        "https://demo-fapi.binance.com",
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_websocket_enabled",
+        True,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_demo_websocket_enabled",
+        False,
+    )
+    bot = LiveTradingLoop()
+
+    bot._start_scalp_streams()
+
+    assert bot._scalp_stream_tasks == []
+
+
+def test_mainnet_can_enable_scalp_websockets(monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "binance_api_url",
+        "https://fapi.binance.com",
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_websocket_enabled",
+        True,
+    )
+
+    assert live_loop_module.settings.scalp_streaming_enabled
+
+
+def test_closed_candle_latency_uses_timeframe_close():
+    candle = {
+        "timestamp": pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=65),
+        "timeframe": "1m",
+    }
+
+    latency = LiveTradingLoop._closed_candle_latency_seconds(candle)
+
+    assert 4 <= latency <= 7
+
+
+def test_due_scan_pairs_prioritizes_scalp_timeframes(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT,ETHUSDT")
+    monkeypatch.setattr(live_loop_module.settings, "timeframes", "1h,3m,1m")
+    monkeypatch.setattr(live_loop_module.settings, "scalp_websocket_enabled", False)
+    bot = LiveTradingLoop()
+
+    pairs = bot._due_scan_pairs(100.0)
+
+    assert pairs[:4] == [
+        ("BTCUSDT", "1m"),
+        ("ETHUSDT", "1m"),
+        ("BTCUSDT", "3m"),
+        ("ETHUSDT", "3m"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rest_scalp_uses_fallback_latency_budget(monkeypatch):
+    bot = LiveTradingLoop()
+    signal = FinalSignal(
+        direction=1,
+        confidence=0.9,
+        ta_source="scalp",
+        ml_strength=0.0,
+        ml_confidence=0.0,
+        strategy="scalp",
+    )
+    bot._entry_runtime_blocked = MagicMock(return_value=False)
+    bot._aggregator_for = MagicMock()
+    bot._aggregator_for.return_value.generate.return_value = signal
+    bot._record_signal_observation = MagicMock()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(False, 0.0, "stop after latency check", {})
+    )
+    monkeypatch.setattr(
+        bot,
+        "_closed_candle_latency_seconds",
+        MagicMock(return_value=30.0),
+    )
+    candle = {
+        "symbol": "BTCUSDT",
+        "timeframe": "1m",
+        "timestamp": pd.Timestamp.now(tz="UTC") - pd.Timedelta(minutes=1),
+        "close": 100.0,
+        "market_data_source": "rest",
+    }
+
+    await bot._execute_trade(candle, df_ind=pd.DataFrame({"atr": [1.0]}))
+
+    assert bot.strategy_quality.evaluate.called
+
+
+def test_responsive_scalp_stop_advances_to_break_even(monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_break_even_offset_bps",
+        10.0,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_estimated_round_trip_fee_bps",
+        8.0,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_min_net_edge_bps",
+        3.0,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "binance_api_url",
+        "https://demo-fapi.binance.com",
+    )
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="1m",
+        strategy="scalp",
+    )
+
+    stop = LiveTradingLoop._responsive_scalp_stop(
+        trade,
+        price=101.0,
+        peak=101.0,
+        current_stop=99.0,
+        initial_risk=1.0,
+        favorable_r=1.0,
+    )
+
+    assert stop == 100.19
+
+
+@pytest.mark.asyncio
+async def test_scalp_max_hold_exits_position(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "scalp_max_hold_seconds_1m", 60)
+    bot = LiveTradingLoop()
+    bot.pos_mgr.exit_position = AsyncMock()
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(timezone.utc) - timedelta(seconds=61),
+        timeframe="1m",
+        strategy="scalp",
+    )
+
+    await bot._manage_scalp_position("BTCUSDT:1m", trade)
+
+    bot.pos_mgr.exit_position.assert_awaited_once_with(
+        "BTCUSDT:1m",
+        "scalp maximum hold",
+    )
+
+
+def test_non_scalp_holding_period_is_timeframe_aware():
+    bot = LiveTradingLoop()
+    now = datetime.now(timezone.utc)
+    five_minute_trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=now - timedelta(minutes=61),
+        timeframe="5m",
+        strategy="trend",
+    )
+    hourly_trade = TradeRecord(
+        symbol="ETHUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=now - timedelta(minutes=61),
+        timeframe="1h",
+        strategy="trend",
+    )
+
+    assert bot._strategy_max_hold_reached(five_minute_trade)
+    assert not bot._strategy_max_hold_reached(hourly_trade)
+
+
+def test_disabled_scope_model_is_not_loaded(tmp_path, monkeypatch):
+    model_path = tmp_path / "xgb_BTCUSDT_5m.json"
+    model_path.write_text("unused", encoding="utf-8")
+    monkeypatch.setattr(live_loop_module.settings, "model_dir", str(tmp_path))
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "disabled_strategy_scopes",
+        "BTCUSDT:5m",
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "symbols",
+        "BTCUSDT",
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "timeframes",
+        "5m",
+    )
+
+    assert LiveTradingLoop._load_scoped_aggregators() == {}
 
 
 class NoopAlerter:
@@ -47,6 +336,9 @@ class NoopAlerter:
         return None
 
     async def trade_failed_alert(self, mode, symbol, reason):
+        return None
+
+    async def data_feed_alert(self, mode, symbol, timeframe, reason):
         return None
 
     async def error_alert(self, error):
@@ -90,6 +382,228 @@ async def test_trade_account_refresh_failure_is_non_fatal_before_threshold(monke
 
 
 @pytest.mark.asyncio
+async def test_manual_request_processor_completes_successful_request(monkeypatch):
+    bot = LiveTradingLoop()
+    request_id = bot.audit_store.create_manual_trade_request(
+        action="open",
+        symbol="BTCUSDT",
+        side="long",
+        timeframe="1h",
+        reason="test request",
+    )
+    execute = AsyncMock(
+        return_value={
+            "success": True,
+            "reason": "opened",
+            "correlation_id": "manual-1",
+        }
+    )
+    monkeypatch.setattr(bot, "_execute_manual_trade_request", execute)
+
+    await bot._process_manual_trade_requests()
+
+    request = bot.audit_store.load_manual_trade_requests(1)[0]
+    assert request["request_id"] == request_id
+    assert request["status"] == "completed"
+    assert request["result"]["correlation_id"] == "manual-1"
+
+
+@pytest.mark.asyncio
+async def test_manual_result_persistence_failure_does_not_crash_loop(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.audit_store.create_manual_trade_request(
+        action="open",
+        symbol="BTCUSDT",
+        side="long",
+        timeframe="1h",
+        reason="test request",
+    )
+    monkeypatch.setattr(
+        bot,
+        "_execute_manual_trade_request",
+        AsyncMock(return_value={"success": True, "correlation_id": "manual-2"}),
+    )
+    monkeypatch.setattr(
+        bot.audit_store,
+        "finish_manual_trade_request",
+        MagicMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    await bot._process_manual_trade_requests()
+
+    events = bot.audit_store.load_recent_events(5)
+    assert any(
+        event["event_type"] == "manual_trade_result_persistence_failed"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_open_rejects_disabled_scope(monkeypatch):
+    bot = LiveTradingLoop()
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "disabled_strategy_scopes",
+        "BTCUSDT:1h",
+    )
+
+    result = await bot._execute_manual_trade_request(
+        {
+            "action": "open",
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "timeframe": "1h",
+            "reason": "test",
+            "options": {"require_quality": False},
+        }
+    )
+
+    assert result["success"] is False
+    assert "disabled" in str(result["reason"])
+
+
+@pytest.mark.asyncio
+async def test_manual_open_uses_validated_closed_candle(monkeypatch):
+    bot = LiveTradingLoop()
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0],
+            "high": [102.0, 103.0, 104.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [101.0, 102.0, 103.0],
+            "volume": [10.0, 11.0, 12.0],
+        },
+        index=pd.date_range("2026-01-01", periods=3, freq="h", tz="UTC"),
+    )
+    bot.client.fetch_ohlcv = AsyncMock(return_value=frame)
+    bot.data_quality.validate = MagicMock(
+        return_value=MagicMock(valid=True, reason="ok")
+    )
+
+    def fake_indicators(closed):
+        result = closed.copy()
+        result["atr"] = 2.5
+        return result
+
+    monkeypatch.setattr(
+        "src.indicators.compute.compute_all_indicators",
+        fake_indicators,
+    )
+
+    async def enter_long(
+        symbol,
+        price,
+        atr,
+        leverage,
+        timeframe,
+        signal_timestamp=None,
+    ):
+        assert (symbol, price, atr, leverage, timeframe) == (
+            "BTCUSDT",
+            102.0,
+            2.5,
+            live_loop_module.settings.max_leverage,
+            "1h",
+        )
+        assert signal_timestamp == frame.index[-2]
+        bot.pos_mgr.trades.trade_correlation_ids["BTCUSDT:1h"] = "manual-open-1"
+        return True
+
+    bot.pos_mgr.enter_long = enter_long
+
+    result = await bot._execute_manual_trade_request(
+        {
+            "action": "open",
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "timeframe": "1h",
+            "reason": "operator entry",
+            "options": {"leverage": 2, "require_quality": False},
+        }
+    )
+
+    assert result["success"] is True
+    assert result["correlation_id"] == "manual-open-1"
+    assert result["exchange_leverage"] == live_loop_module.settings.max_leverage
+
+
+@pytest.mark.asyncio
+async def test_manual_entry_quality_rejection_blocks_order(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(
+            accepted=False,
+            score=0.4,
+            reason="trend strength too low",
+            metrics={"adx": 10.0},
+        )
+    )
+
+    result = await bot._manual_entry_quality(
+        "BTCUSDT",
+        "1h",
+        "long",
+        pd.DataFrame({"close": [100.0]}),
+        True,
+    )
+
+    assert isinstance(result, dict)
+    assert result["success"] is False
+    assert result["quality_score"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_manual_bulk_close_all_reports_remaining_positions():
+    bot = LiveTradingLoop()
+    bot.pos_mgr.close_all = AsyncMock()
+    bot.pos_mgr.trades.open_trades["BTCUSDT:1h"] = MagicMock()
+
+    result = await bot._execute_manual_bulk_close(
+        "close-all",
+        "ALL",
+        "operator close",
+    )
+
+    assert result["success"] is False
+    assert result["remaining_positions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_close_targets_exact_correlation_id():
+    from src.risk.portfolio import TradeRecord
+
+    bot = LiveTradingLoop()
+    position_key = "BTCUSDT:1h"
+    bot.pos_mgr.trades.open_trades[position_key] = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=pd.Timestamp.now(),
+        timeframe="1h",
+    )
+    bot.pos_mgr.trades.trade_correlation_ids[position_key] = "close-me"
+
+    async def successful_exit(key, reason):
+        assert key == position_key
+        assert reason == "dashboard: operator close"
+        del bot.pos_mgr.trades.open_trades[key]
+
+    bot.pos_mgr.exit_position = successful_exit
+
+    result = await bot._execute_manual_close(
+        {
+            "symbol": "BTCUSDT",
+            "correlation_id": "close-me",
+        },
+        "operator close",
+    )
+
+    assert result["success"] is True
+    assert result["correlation_id"] == "close-me"
+
+
+@pytest.mark.asyncio
 async def test_trade_start_stops_after_initial_account_refresh_failure(monkeypatch):
     bot = LiveTradingLoop()
     bot.client = NoopClient()
@@ -114,7 +628,7 @@ async def test_trade_start_stops_after_initial_account_refresh_failure(monkeypat
         reached.append("stop")
 
     monkeypatch.setattr(live_loop_module, "get_account_info", fail_account)
-    monkeypatch.setattr(bot.pos_mgr, "restore_open_trades_from_audit", lambda: 0)
+    monkeypatch.setattr(bot.pos_mgr.trades, "restore_open_trades_from_audit", lambda: 0)
     monkeypatch.setattr(bot.pos_mgr, "reconcile_exchange_state", reconcile)
     monkeypatch.setattr(bot, "_scan_due_timeframes_once", cancel_scan)
     monkeypatch.setattr(bot, "stop", stop)
@@ -137,20 +651,61 @@ async def test_startup_reconciliation_unavailable_preserves_positions(monkeypatc
     async def refresh_account(required=False):
         return None
 
-    async def reconcile():
+    async def reconcile(*args, **kwargs):
         return None
 
     async def stop(reason, close_positions=None):
         stopped.append((reason, close_positions))
 
+    async def cancel_scan():
+        raise asyncio.CancelledError
+
     monkeypatch.setattr(bot, "_refresh_account", refresh_account)
-    monkeypatch.setattr(bot.pos_mgr, "restore_open_trades_from_audit", lambda: 1)
+    monkeypatch.setattr(bot.pos_mgr.trades, "restore_open_trades_from_audit", lambda: 1)
     monkeypatch.setattr(bot.pos_mgr, "reconcile_exchange_state", reconcile)
+    monkeypatch.setattr(bot, "_scan_due_timeframes_once", cancel_scan)
     monkeypatch.setattr(bot, "stop", stop)
 
     await bot.start()
 
-    assert stopped == [("startup reconciliation unavailable", False)]
+    assert stopped == [("cancelled", None)]
+
+
+@pytest.mark.asyncio
+async def test_trade_start_stops_cleanly_when_demo_account_is_inactive(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.client = NoopClient()
+    bot.alerter = NoopAlerter()
+    stopped = []
+
+    async def refresh_account(required=False):
+        account = AccountInfo(
+            total_equity=100.0,
+            wallet_balance=100.0,
+            available_balance=100.0,
+            unrealized_pnl=0.0,
+            margin_ratio=0.0,
+        )
+        bot.portfolio.update_account(account)
+
+    async def reconcile(*args, **kwargs):
+        return True
+
+    async def set_leverage(symbol, leverage):
+        raise BinanceDemoAccountInactiveError("inactive")
+
+    async def stop(reason, close_positions=None):
+        stopped.append((reason, close_positions))
+
+    monkeypatch.setattr(bot, "_refresh_account", refresh_account)
+    monkeypatch.setattr(bot.pos_mgr.trades, "restore_open_trades_from_audit", lambda: 0)
+    monkeypatch.setattr(bot.pos_mgr, "reconcile_exchange_state", reconcile)
+    monkeypatch.setattr(bot.client, "set_leverage", set_leverage, raising=False)
+    monkeypatch.setattr(bot, "stop", stop)
+
+    await bot.start()
+
+    assert stopped == [("demo account inactive", None)]
 
 
 @pytest.mark.asyncio
@@ -191,6 +746,63 @@ async def test_fatal_shutdown_flattens_positions(monkeypatch):
     await bot.stop("fatal error")
 
     assert closed == [True]
+
+
+def test_heartbeat_failure_does_not_escape_live_loop(monkeypatch):
+    bot = LiveTradingLoop()
+
+    def fail_write(*args, **kwargs):
+        raise PermissionError("temporarily locked")
+
+    monkeypatch.setattr(bot._heartbeat, "write", fail_write)
+
+    bot._write_heartbeat("running", open_positions=0)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_publisher_runs_independently_of_scan_loop(monkeypatch):
+    bot = LiveTradingLoop()
+    writes = []
+
+    def record_write(state, **details):
+        writes.append((state, details))
+
+    async def stop_after_first_interval(_seconds):
+        bot._stopped = True
+
+    monkeypatch.setattr(bot, "_write_heartbeat", record_write)
+    monkeypatch.setattr(live_loop_module.asyncio, "sleep", stop_after_first_interval)
+
+    await bot._heartbeat_publisher()
+
+    assert writes[0][0] == "running"
+    assert writes[0][1]["open_positions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_heartbeat_before_writing_stopped(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.client = NoopClient()
+    bot.alerter = LifecycleAlerter()
+    states = []
+
+    async def publisher():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            states.append("publisher_cancelled")
+
+    monkeypatch.setattr(
+        bot,
+        "_write_heartbeat",
+        lambda state, **details: states.append(state),
+    )
+    bot._heartbeat_task = asyncio.create_task(publisher())
+    await asyncio.sleep(0)
+
+    await bot.stop("cancelled")
+
+    assert states == ["publisher_cancelled", "stopping", "stopped"]
 
 
 @pytest.mark.asyncio
@@ -372,6 +984,152 @@ async def test_failed_account_refresh_blocks_new_entries(tmp_path):
     assert event["event_type"] == "entry_blocked_account_stale"
 
 
+@pytest.mark.asyncio
+async def test_disabled_strategy_scope_skips_signal_generation(
+    tmp_path,
+    monkeypatch,
+):
+    from src.audit import AuditStore
+    from src.live import loop as live_loop_module
+
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "disabled_strategy_scopes",
+        "BTCUSDT:5m",
+    )
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "scope-disabled.db"))
+    generated = []
+
+    class Aggregator:
+        def generate(self, _df):
+            generated.append(True)
+
+    bot.aggregator = Aggregator()
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "5m",
+            "close": 100.0,
+        },
+        df_ind=pd.DataFrame({"close": [100.0]}),
+    )
+
+    assert generated == []
+    event = bot.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "strategy_scope_disabled"
+
+
+@pytest.mark.asyncio
+async def test_accepted_signal_records_decision_context(tmp_path):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "signal-context.db")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    class Aggregator:
+        def generate(self, _df):
+            return FinalSignal(
+                direction=1,
+                confidence=0.72,
+                ta_source="ema_fibonacci",
+                ml_strength=0.70,
+                ml_confidence=0.81,
+                decision_reason="aligned signal ready",
+                strategy="breakout",
+            )
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(
+            accepted=True,
+            score=0.85,
+            reason="confirmed",
+            metrics={"adx": 30.0},
+        )
+    )
+    bot.pos_mgr.enter_long = AsyncMock(return_value=True)
+    timestamp = pd.Timestamp("2026-06-13T10:00:00Z")
+
+    await bot._execute_trade(
+        {
+            "symbol": "ETHUSDT",
+            "timeframe": "30m",
+            "close": 1700.0,
+            "timestamp": timestamp,
+        },
+        df_ind=pd.DataFrame({"close": [1700.0], "atr": [12.0]}),
+    )
+
+    event = audit.load_recent_events(1)[0]
+    assert event["event_type"] == "signal_accepted"
+    assert event["payload"]["scope"] == "ETHUSDT:30m"
+    assert event["payload"]["confidence"] == 0.72
+    assert event["payload"]["strategy"] == "breakout"
+    assert event["payload"]["atr"] == 12.0
+    assert event["payload"]["quality_score"] == 0.85
+    assert bot.pos_mgr.enter_long.await_args.kwargs["strategy"] == "breakout"
+    observation = audit.load_signal_observations(1)[0]
+    assert observation["decision"] == "accepted"
+    assert observation["execution_status"] == "opened"
+    assert observation["strategy"] == "breakout"
+    assert observation["quality_score"] == 0.85
+
+
+@pytest.mark.asyncio
+async def test_skipped_signal_is_recorded_for_forward_analysis(tmp_path):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "skipped-signal.db")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    class Aggregator:
+        def generate(self, _df):
+            return FinalSignal(
+                direction=-1,
+                confidence=0.10,
+                ta_source="ema_fibonacci",
+                ml_strength=-0.30,
+                ml_confidence=0.40,
+                decision_reason="confidence below threshold",
+                strategy="trend",
+            )
+
+    bot.aggregator = Aggregator()
+    await bot._execute_trade(
+        {
+            "symbol": "BNBUSDT",
+            "timeframe": "1h",
+            "close": 600.0,
+            "timestamp": pd.Timestamp("2026-06-15T10:00:00Z"),
+        },
+        df_ind=pd.DataFrame({"close": [600.0]}),
+    )
+
+    observation = audit.load_signal_observations(1)[0]
+    assert observation["decision"] == "skipped"
+    assert observation["direction"] == -1
+    assert observation["execution_status"] == "not_attempted"
+    assert observation["reason"] == "confidence below threshold"
+
+
+def test_strategy_specific_confidence_thresholds(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "min_confidence", 0.45)
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "strategy_breakout_min_confidence",
+        0.55,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "strategy_scalp_min_confidence",
+        0.60,
+    )
+
+    assert LiveTradingLoop._strategy_minimum_confidence("trend") == 0.45
+    assert LiveTradingLoop._strategy_minimum_confidence("breakout") == 0.55
+    assert LiveTradingLoop._strategy_minimum_confidence("scalp") == 0.60
+
+
 def test_live_loop_restores_persisted_peak_equity(tmp_path):
     from src.audit import AuditStore
 
@@ -440,6 +1198,49 @@ def test_next_scan_aligns_to_exchange_candle_boundary(monkeypatch):
     assert due == 100.0 + 8 * 60 + 2.0
 
 
+def test_rest_scalp_scan_waits_for_exchange_publication(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "candle_close_grace_seconds", 2.0)
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_rest_candle_close_grace_seconds",
+        15.0,
+    )
+    monkeypatch.setattr(live_loop_module.settings, "scalp_websocket_enabled", False)
+    monkeypatch.setattr(live_loop_module.settings, "scan_sleep_seconds", 5.0)
+
+    due = LiveTradingLoop._next_candle_scan_due(
+        "1m",
+        monotonic_now=100.0,
+        epoch_now=12 * 3600 + 30.0,
+    )
+
+    assert due == 100.0 + 30.0 + 15.0
+
+
+def test_streamed_scalp_scan_keeps_standard_close_grace(monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "binance_api_url",
+        "https://fapi.binance.com",
+    )
+    monkeypatch.setattr(live_loop_module.settings, "candle_close_grace_seconds", 2.0)
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_rest_candle_close_grace_seconds",
+        15.0,
+    )
+    monkeypatch.setattr(live_loop_module.settings, "scalp_websocket_enabled", True)
+    monkeypatch.setattr(live_loop_module.settings, "scan_sleep_seconds", 5.0)
+
+    due = LiveTradingLoop._next_candle_scan_due(
+        "1m",
+        monotonic_now=100.0,
+        epoch_now=12 * 3600 + 30.0,
+    )
+
+    assert due == 100.0 + 30.0 + 2.0
+
+
 def test_live_loop_loads_configured_xgboost_model(monkeypatch, tmp_path):
     model_path = tmp_path / "xgb_BTCUSDT_5m.json"
     model_path.write_text("{}", encoding="utf-8")
@@ -447,7 +1248,20 @@ def test_live_loop_loads_configured_xgboost_model(monkeypatch, tmp_path):
     class FakeClassifier:
         def load(self, path):
             assert path == str(model_path)
-            self.metadata = {"symbol": "BTCUSDT", "timeframe": "5m"}
+            self.metadata = {
+                "symbol": "BTCUSDT",
+                "timeframe": "5m",
+                "label_schema": "cost_adjusted_horizon_v3",
+                "prediction_horizon": str(
+                    live_loop_module.settings.prediction_horizon
+                ),
+                "label_atr_multiplier": str(
+                    live_loop_module.settings.ml_label_atr_multiplier
+                ),
+                "label_min_return": str(
+                    live_loop_module.settings.ml_effective_label_min_return
+                ),
+            }
 
         def predict_with_confidence(self, X):
             return np.array([1]), np.array([0.9])
@@ -460,6 +1274,54 @@ def test_live_loop_loads_configured_xgboost_model(monkeypatch, tmp_path):
     aggregators = LiveTradingLoop._load_scoped_aggregators()
 
     assert set(aggregators) == {"BTCUSDT:5m"}
+    assert (
+        aggregators["BTCUSDT:5m"].ensemble.confidence_threshold
+        == live_loop_module.settings.ml_confidence_threshold
+    )
+
+
+def test_live_loop_skips_legacy_xgboost_model(monkeypatch, tmp_path):
+    model_path = tmp_path / "xgb_BTCUSDT_5m.json"
+    model_path.write_text("{}", encoding="utf-8")
+
+    class FakeClassifier:
+        def load(self, _path):
+            self.metadata = {
+                "symbol": "BTCUSDT",
+                "timeframe": "5m",
+            }
+
+    monkeypatch.setattr(live_loop_module.settings, "model_dir", str(tmp_path))
+    monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT")
+    monkeypatch.setattr(live_loop_module.settings, "timeframes", "5m")
+    monkeypatch.setattr(live_loop_module, "XGBoostClassifier", FakeClassifier)
+
+    aggregators = LiveTradingLoop._load_scoped_aggregators()
+
+    assert aggregators == {}
+
+
+def test_live_loop_rejects_model_with_sub_cost_training_labels():
+    model = type(
+        "Model",
+        (),
+        {
+            "metadata": {
+                "symbol": "BTCUSDT",
+                "timeframe": "1m",
+                "label_schema": "cost_adjusted_horizon_v3",
+                "prediction_horizon": str(
+                    live_loop_module.settings.prediction_horizon
+                ),
+                "label_atr_multiplier": str(
+                    live_loop_module.settings.ml_label_atr_multiplier
+                ),
+                "label_min_return": "0.001",
+            }
+        },
+    )()
+
+    assert not LiveTradingLoop._model_is_compatible(model, "BTCUSDT", "1m")
 
 
 def test_scoped_model_is_not_reused_for_other_markets():
@@ -540,6 +1402,7 @@ async def test_process_timeframe_uses_last_closed_candle(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_process_timeframe_rejects_bad_data(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "allow_zero_volume_candles", False)
     bot = LiveTradingLoop()
     bot.alerter = NoopAlerter()
     bot.client = FakeSequentialClient()
@@ -562,3 +1425,153 @@ async def test_process_timeframe_rejects_bad_data(monkeypatch):
     assert processed == []
     events = bot.audit_store.load_recent_events(5)
     assert any(event["event_type"] == "data_quality_rejected" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_process_timeframe_reports_market_data_failure(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.client.fetch_ohlcv = AsyncMock(side_effect=RuntimeError("feed unavailable"))
+    bot.alerter.data_feed_alert = AsyncMock()
+    bot.alerter.trade_failed_alert = AsyncMock()
+
+    await bot._process_timeframe("BTCUSDT", "5m")
+
+    bot.alerter.data_feed_alert.assert_awaited_once_with(
+        "trade",
+        "BTCUSDT",
+        "5m",
+        "RuntimeError: feed unavailable",
+    )
+    bot.alerter.trade_failed_alert.assert_not_awaited()
+    event = bot.audit_store.load_recent_events(1)[0]
+    assert event["event_type"] == "market_data_scan_failed"
+    assert event["payload"]["timeframe"] == "5m"
+
+
+def test_scalp_cost_floor_delays_partial_until_fees_and_edge_are_covered(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_break_even_offset_bps",
+        10.0,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_estimated_round_trip_fee_bps",
+        8.0,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_min_net_edge_bps",
+        3.0,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "binance_api_url",
+        "https://demo-fapi.binance.com",
+    )
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="1m",
+        strategy="scalp",
+    )
+
+    trigger_r = LiveTradingLoop._scalp_cost_floor_r(
+        trade,
+        initial_risk=0.15,
+    )
+
+    assert trigger_r == pytest.approx(19.0 / 15.0)
+
+
+@pytest.mark.asyncio
+async def test_stale_rest_scalp_candle_is_refetched(monkeypatch):
+    bot = LiveTradingLoop()
+    now = pd.Timestamp.now(tz="UTC").floor("min")
+    stale = pd.DataFrame(
+        {"close": [100.0, 100.0, 100.0]},
+        index=[now - pd.Timedelta(minutes=4), now - pd.Timedelta(minutes=3), now],
+    )
+    fresh = pd.DataFrame(
+        {"close": [100.0, 100.0, 100.0]},
+        index=[now - pd.Timedelta(minutes=1), now, now + pd.Timedelta(minutes=1)],
+    )
+    bot.client.fetch_ohlcv = AsyncMock(side_effect=[stale, fresh])
+    sleep = AsyncMock()
+    monkeypatch.setattr(live_loop_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_rest_freshness_attempts",
+        3,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_rest_freshness_retry_seconds",
+        5.0,
+    )
+
+    result = await bot._fetch_rest_market_frame("BNBUSDT", "1m")
+
+    assert result is fresh
+    assert bot.client.fetch_ohlcv.await_count == 2
+    sleep.assert_awaited_once_with(5.0)
+
+
+@pytest.mark.asyncio
+async def test_current_expected_rest_candle_is_not_refetched_for_age_alone(
+    monkeypatch,
+):
+    bot = LiveTradingLoop()
+    now = pd.Timestamp("2026-06-21 21:04:29", tz="UTC")
+    frame = pd.DataFrame(
+        {"close": [100.0, 100.0, 100.0]},
+        index=pd.DatetimeIndex(
+            [
+                pd.Timestamp("2026-06-21 20:57:00", tz="UTC"),
+                pd.Timestamp("2026-06-21 21:00:00", tz="UTC"),
+                pd.Timestamp("2026-06-21 21:03:00", tz="UTC"),
+            ]
+        ),
+    )
+    bot.client.fetch_ohlcv = AsyncMock(return_value=frame)
+    monkeypatch.setattr(
+        bot,
+        "_latest_expected_closed_candle_timestamp",
+        lambda timeframe: LiveTradingLoop._latest_expected_closed_candle_timestamp(
+            timeframe, now=now
+        ),
+    )
+
+    result = await bot._fetch_rest_market_frame("BTCUSDT", "3m")
+
+    assert result is frame
+    bot.client.fetch_ohlcv.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_rest_scalp_refetch_is_bounded(monkeypatch):
+    bot = LiveTradingLoop()
+    now = pd.Timestamp.now(tz="UTC").floor("min")
+    stale = pd.DataFrame(
+        {"close": [100.0, 100.0, 100.0]},
+        index=[now - pd.Timedelta(minutes=3), now - pd.Timedelta(minutes=2), now],
+    )
+    bot.client.fetch_ohlcv = AsyncMock(return_value=stale)
+    sleep = AsyncMock()
+    monkeypatch.setattr(live_loop_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "scalp_rest_freshness_attempts",
+        3,
+    )
+
+    result = await bot._fetch_rest_market_frame("BNBUSDT", "1m")
+
+    assert result is stale
+    assert bot.client.fetch_ohlcv.await_count == 3
+    assert sleep.await_count == 2

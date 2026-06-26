@@ -30,6 +30,16 @@ def test_parse_args_custom_options():
     assert args.limit == 200
 
 
+def test_parse_args_accepts_supervisor_mode():
+    assert parse_args(["--mode", "supervisor"]).mode == "supervisor"
+
+
+def test_parse_args_accepts_rollout_evidence_path():
+    args = parse_args(["--mode", "rollout", "--rollout-evidence", "evidence.json"])
+    assert args.mode == "rollout"
+    assert args.rollout_evidence == "evidence.json"
+
+
 def test_parse_args_rejects_removed_backtest_mode():
     with pytest.raises(SystemExit):
         parse_args(["--mode", "backtest"])
