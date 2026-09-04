@@ -19,7 +19,7 @@ def test_decision_policy_uses_strategy_specific_threshold():
         strategy_breakout_min_confidence=0.60,
     )
     quality_gate = MagicMock()
-    signal = FinalSignal(1, 0.59, "breakout", 0.0, 0.0, strategy="breakout")
+    signal = FinalSignal(1, 0.59, "breakout", strategy="breakout")
 
     decision = evaluate_signal_decision(
         pd.DataFrame({"close": [100.0]}),
@@ -49,14 +49,7 @@ def test_replay_uses_only_closed_higher_timeframe_regime(monkeypatch):
         lambda frame: frame.copy(),
     )
     aggregator = MagicMock()
-    aggregator.generate.return_value = FinalSignal(
-        1,
-        1.0,
-        "trend",
-        0.0,
-        0.0,
-        strategy="trend",
-    )
+    aggregator.generate.return_value = [FinalSignal(1, 1.0, "trend", strategy="trend")]
     quality_gate = MagicMock()
     quality_gate.evaluate.return_value = StrategyQuality(True, 1.0, "ok", {})
     replay = DecisionReplayEngine(
@@ -83,14 +76,7 @@ def test_replay_records_quality_rejection(monkeypatch):
         lambda data: data.copy(),
     )
     aggregator = MagicMock()
-    aggregator.generate.return_value = FinalSignal(
-        1,
-        1.0,
-        "trend",
-        0.0,
-        0.0,
-        strategy="trend",
-    )
+    aggregator.generate.return_value = [FinalSignal(1, 1.0, "trend", strategy="trend")]
     quality_gate = MagicMock()
     quality_gate.evaluate.return_value = StrategyQuality(
         False,
@@ -109,3 +95,29 @@ def test_replay_records_quality_rejection(monkeypatch):
     assert len(observations) == 1
     assert observations[0].decision.decision == "quality_rejected"
     assert observations[0].decision.reason == "quality below threshold"
+
+
+def test_replay_can_evaluate_one_strategy_independently(monkeypatch):
+    index = pd.date_range("2026-01-01", periods=4, freq="1h", tz="UTC")
+    frame = pd.DataFrame({"close": [100.0, 101.0, 102.0, 103.0]}, index=index)
+    monkeypatch.setattr(
+        "src.backtest.replay.compute_all_indicators",
+        lambda data: data.copy(),
+    )
+    aggregator = MagicMock()
+    aggregator.generate.return_value = [
+        FinalSignal(1, 0.9, "trend", strategy="trend"),
+        FinalSignal(-1, 0.95, "range", strategy="range"),
+    ]
+    quality_gate = MagicMock()
+    quality_gate.evaluate.return_value = StrategyQuality(True, 1.0, "ok", {})
+    replay = DecisionReplayEngine(
+        aggregator,
+        quality_gate=quality_gate,
+        min_history=2,
+    )
+
+    observations = replay.evaluate(frame, timeframe="1h", strategy="trend")
+
+    assert len(observations) == 2
+    assert all(observation.signal.strategy == "trend" for observation in observations)

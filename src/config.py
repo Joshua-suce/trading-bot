@@ -31,6 +31,15 @@ class Settings(BaseSettings):
         "1w",
         "1M",
     }
+    allowed_strategies: ClassVar[set[str]] = {
+        "trend",
+        "transition",
+        "range",
+        "breakout",
+        "reversal",
+        "countertrend",
+        "scalp",
+    }
 
     binance_api_key: str = ""
     binance_api_secret: str = ""
@@ -51,9 +60,19 @@ class Settings(BaseSettings):
 
     symbols: str = "BTCUSDT,ETHUSDT,BNBUSDT"
     timeframes: str = "1m,3m,5m,15m,30m,1h,4h,1d"
+    enabled_strategies: str = (
+        "trend,transition,range,breakout,reversal,countertrend,scalp"
+    )
     disabled_strategy_scopes: str = ""
     position_scope: str = "symbol"
     scan_sleep_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    network_outage_failure_threshold: int = Field(default=6, ge=1, le=100)
+    network_outage_cooldown_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+    network_outage_alert_cooldown_seconds: float = Field(
+        default=300.0,
+        ge=30.0,
+        le=86_400.0,
+    )
     candle_close_grace_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     account_balance_cache_seconds: float = Field(default=10.0, ge=0.0, le=60.0)
     account_refresh_interval_seconds: float = Field(default=60.0, ge=10.0, le=600.0)
@@ -77,12 +96,15 @@ class Settings(BaseSettings):
         ge=0.1,
         le=5.0,
     )
-    reentry_cooldown_seconds: int = Field(default=900, ge=0, le=86_400)
+    reentry_cooldown_seconds: int = Field(default=0, ge=0, le=86_400)
     min_order_notional: float = Field(default=5.0, ge=0.0, le=100000.0)
     max_leverage: int = Field(default=3, ge=1, le=20)
     max_position_size: float = Field(default=0.02, gt=0, le=0.10)
     max_open_positions: int = Field(default=6, ge=1, le=100)
-    max_positions_per_symbol: int = Field(default=1, ge=1, le=20)
+    max_same_direction_positions: int = Field(default=2, ge=1, le=100)
+    reverse_on_opposite_signal: bool = True
+    max_positions_per_symbol: int = Field(default=2, ge=1, le=20)
+    restored_position_exposure_cleanup_enabled: bool = True
     max_total_open_notional_pct: float = Field(default=0.20, gt=0, le=1.0)
     max_symbol_open_notional_pct: float = Field(default=0.10, gt=0, le=1.0)
     correlated_symbols: str = "BTCUSDT,ETHUSDT,BNBUSDT"
@@ -116,7 +138,7 @@ class Settings(BaseSettings):
     strategy_breakout_min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
     strategy_reversal_min_confidence: float = Field(default=0.50, ge=0.0, le=1.0)
     strategy_countertrend_min_confidence: float = Field(
-        default=0.55,
+        default=0.65,
         ge=0.0,
         le=1.0,
     )
@@ -135,15 +157,37 @@ class Settings(BaseSettings):
         gt=0.0,
         le=0.05,
     )
-    strategy_min_net_edge_bps: float = Field(default=5.0, ge=0.0, le=100.0)
-    strategy_max_spread_bps: float = Field(default=25.0, gt=0.0, le=500.0)
+    strategy_min_net_edge_bps: float = Field(default=12.0, ge=0.0, le=100.0)
+    strategy_max_spread_bps: float = Field(default=12.0, gt=0.0, le=500.0)
     strategy_max_consecutive_losses: int = Field(default=3, ge=1, le=20)
     strategy_loss_cooldown_seconds: int = Field(default=1800, ge=60, le=604_800)
     ml_confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     ta_weight: float = Field(default=0.40, ge=0.0, le=1.0)
     ml_weight: float = Field(default=0.40, ge=0.0, le=1.0)
     require_signal_confluence: bool = False
-    strategy_quality_min_score: float = Field(default=0.45, ge=0.0, le=1.0)
+    strategy_quality_min_score: float = Field(default=0.68, ge=0.0, le=1.0)
+    strategy_quality_gate_enforced: bool = True
+    same_symbol_reversal_guard_enabled: bool = True
+    lower_timeframe_reversal_min_confidence: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+    )
+    lower_timeframe_reversal_min_quality_score: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+    )
+    lower_timeframe_reversal_min_hold_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=86_400,
+    )
+    lower_timeframe_reversal_max_timeframe_ratio: float = Field(
+        default=3.0,
+        ge=1.0,
+        le=96.0,
+    )
     strategy_min_adx: float = Field(default=18.0, ge=0.0, le=100.0)
     strategy_min_volume_ratio: float = Field(default=0.70, ge=0.0, le=10.0)
     strategy_min_atr_pct: float = Field(default=0.0005, ge=0.0, le=0.10)
@@ -167,7 +211,12 @@ class Settings(BaseSettings):
         le=1.0,
     )
     strategy_breakout_min_close_location: float = Field(
-        default=0.75,
+        default=0.60,
+        ge=0.50,
+        le=1.0,
+    )
+    strategy_breakout_max_close_location: float = Field(
+        default=0.85,
         ge=0.50,
         le=1.0,
     )
@@ -181,15 +230,15 @@ class Settings(BaseSettings):
     scalp_risk_reward_ratio: float = Field(default=2.00, ge=1.0, le=5.0)
     scalp_min_stop_loss_pct: float = Field(default=0.005, gt=0.0, le=0.02)
     scalp_max_stop_loss_pct: float = Field(default=0.008, gt=0.0, le=0.05)
-    scalp_max_spread_bps: float = Field(default=15.0, ge=0.1, le=100.0)
+    scalp_max_spread_bps: float = Field(default=4.0, ge=0.1, le=100.0)
     scalp_max_entry_slippage_bps: float = Field(default=5.0, ge=0.1, le=100.0)
     scalp_estimated_round_trip_fee_bps: float = Field(
         default=8.0,
         ge=0.0,
         le=100.0,
     )
-    scalp_min_net_edge_bps: float = Field(default=5.0, ge=0.0, le=100.0)
-    scalp_reentry_cooldown_seconds: int = Field(default=60, ge=0, le=3600)
+    scalp_min_net_edge_bps: float = Field(default=15.0, ge=0.0, le=100.0)
+    scalp_reentry_cooldown_seconds: int = Field(default=0, ge=0, le=3600)
     scalp_websocket_enabled: bool = True
     scalp_demo_websocket_enabled: bool = False
     scalp_stream_fallback_seconds: int = Field(default=20, ge=5, le=300)
@@ -267,8 +316,8 @@ class Settings(BaseSettings):
     max_stop_loss_pct: float = Field(default=0.02, gt=0.0, le=0.20)
     risk_block_alert_cooldown_seconds: int = Field(default=900, ge=60, le=86_400)
 
-    force_ta_only: bool = False
-    auto_retrain_enabled: bool = True
+    force_ta_only: bool = True
+    auto_retrain_enabled: bool = False
     auto_retrain_on_startup: bool = False
     model_update_interval_hours: int = Field(default=24, ge=1, le=168)
     auto_retrain_check_interval_seconds: int = Field(
@@ -291,6 +340,11 @@ class Settings(BaseSettings):
     ml_drift_min_samples: int = Field(default=100, ge=20, le=10000)
     ml_candidate_min_accuracy: float = Field(default=0.45, ge=0.0, le=1.0)
     ml_candidate_min_macro_f1: float = Field(default=0.35, ge=0.0, le=1.0)
+    signal_source_gate_enabled: bool = True
+    signal_source_gate_min_samples: int = Field(default=3, ge=3, le=10000)
+    signal_source_gate_min_accuracy: float = Field(default=0.45, ge=0.0, le=1.0)
+    signal_source_gate_min_avg_bps: float = Field(default=2.0, ge=-1000.0, le=1000.0)
+    signal_source_gate_lookback: int = Field(default=2000, ge=100, le=100000)
 
     log_level: str = "INFO"
     log_dir: str = "data/logs"
@@ -461,22 +515,38 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid timeframes: {', '.join(invalid)}")
         return ",".join(timeframes)
 
+    @field_validator("enabled_strategies")
+    @classmethod
+    def validate_enabled_strategies(cls, value: str) -> str:
+        strategies = [item.lower() for item in cls._split_csv(value)]
+        invalid = sorted(set(strategies) - cls.allowed_strategies)
+        if invalid:
+            raise ValueError(f"Invalid enabled strategies: {', '.join(invalid)}")
+        return ",".join(dict.fromkeys(strategies))
+
     @field_validator("disabled_strategy_scopes")
     @classmethod
     def validate_disabled_strategy_scopes(cls, value: str) -> str:
         scopes = []
         for raw_scope in cls._split_csv(value):
-            parts = raw_scope.split(":", 1)
-            if len(parts) != 2:
+            parts = raw_scope.split(":")
+            if len(parts) not in {2, 3}:
                 raise ValueError(
-                    "DISABLED_STRATEGY_SCOPES entries must use SYMBOL:timeframe"
+                    "DISABLED_STRATEGY_SCOPES entries must use SYMBOL:timeframe "
+                    "or SYMBOL:timeframe:strategy"
                 )
             symbol, timeframe = parts[0].upper(), parts[1]
             if not re.fullmatch(r"[A-Z0-9]{6,20}", symbol):
                 raise ValueError(f"Invalid disabled strategy symbol: {symbol}")
             if timeframe not in cls.allowed_timeframes:
                 raise ValueError(f"Invalid disabled strategy timeframe: {timeframe}")
-            scopes.append(f"{symbol}:{timeframe}")
+            if len(parts) == 3:
+                strategy = parts[2].lower()
+                if strategy not in cls.allowed_strategies:
+                    raise ValueError(f"Invalid disabled strategy name: {strategy}")
+                scopes.append(f"{symbol}:{timeframe}:{strategy}")
+            else:
+                scopes.append(f"{symbol}:{timeframe}")
         return ",".join(scopes)
 
     @field_validator("position_scope")
@@ -550,6 +620,10 @@ class Settings(BaseSettings):
         return set(self._split_csv(self.disabled_strategy_scopes))
 
     @property
+    def enabled_strategies_set(self) -> set[str]:
+        return set(self._split_csv(self.enabled_strategies))
+
+    @property
     def has_exchange_credentials(self) -> bool:
         return bool(self.binance_api_key and self.binance_api_secret)
 
@@ -570,8 +644,7 @@ class Settings(BaseSettings):
     @property
     def ml_effective_label_min_return(self) -> float:
         cost_floor = (
-            self.scalp_effective_round_trip_fee_bps
-            + self.strategy_min_net_edge_bps
+            self.scalp_effective_round_trip_fee_bps + self.strategy_min_net_edge_bps
         ) / 10_000
         return max(self.ml_label_min_return, cost_floor)
 

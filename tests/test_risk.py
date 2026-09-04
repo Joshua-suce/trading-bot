@@ -21,7 +21,32 @@ class TestStopLoss:
         sl = StopLossManager(atr_mult_sl=1.5, risk_reward_ratio=2.0)
         levels = sl.calculate(entry_price=50000, side="short", atr=1000)
         assert levels.stop_loss > 50000  # Above entry for short
-        assert levels.take_profit < 50000  # Below entry for short
+        assert levels.take_profit < 50000
+
+    def test_range_target_uses_mean_reversion_level_when_reward_is_valid(self):
+        sl = StopLossManager()
+        levels = sl.calculate(
+            entry_price=100.0,
+            side="long",
+            atr=1.0,
+            strategy="range",
+            market_context={"bb_middle": 102.0, "vwap": 101.0},
+        )
+
+        assert levels.take_profit == 102.0
+        assert levels.take_profit_pct == 2.0
+
+    def test_range_target_falls_back_when_mean_target_is_too_close(self):
+        sl = StopLossManager()
+        levels = sl.calculate(
+            entry_price=100.0,
+            side="long",
+            atr=1.0,
+            strategy="range",
+            market_context={"bb_middle": 100.5, "vwap": 100.4},
+        )
+
+        assert levels.take_profit > 101.0
 
     def test_trailing_stop_long(self):
         sl = StopLossManager()
@@ -167,7 +192,7 @@ def test_mainnet_canary_caps_risk_and_notional(monkeypatch):
 
     size = PositionSizer(portfolio).calculate(100.0, 90.0)
 
-    assert size.risk_amount == 25.0
+    assert size.risk_amount == 5.0
     assert size.quantity == 0.5
 
 

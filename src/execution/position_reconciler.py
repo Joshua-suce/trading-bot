@@ -1,5 +1,4 @@
 # Exchange state reconciliation, finalization, and protective exit detection.
-from datetime import datetime, timezone
 from typing import Literal
 
 from loguru import logger
@@ -72,14 +71,14 @@ class PositionReconciler:
 
     @staticmethod
     def _position_size(position: dict) -> float:
-        for key in ("contracts",):
-            value = position.get(key)
-            if value not in (None, ""):
-                assert value is not None
-                return float(value)
         info = position.get("info", {})
         for key in ("positionAmt", "positionAmt".lower()):
             value = info.get(key)
+            if value not in (None, ""):
+                assert value is not None
+                return float(value)
+        for key in ("contracts",):
+            value = position.get(key)
             if value not in (None, ""):
                 assert value is not None
                 return float(value)
@@ -87,13 +86,7 @@ class PositionReconciler:
 
     @staticmethod
     def _position_side(position: dict) -> str | None:
-        side = str(position.get("side") or "").lower()
-        if side in {"long", "short"}:
-            return side
         info = position.get("info", {})
-        position_side = str(info.get("positionSide") or "").lower()
-        if position_side in {"long", "short"}:
-            return position_side
         position_amount = info.get("positionAmt")
         if position_amount not in (None, ""):
             signed_amount = float(position_amount)
@@ -101,11 +94,44 @@ class PositionReconciler:
                 return "long"
             if signed_amount < 0:
                 return "short"
+        side = str(position.get("side") or "").lower()
+        if side in {"long", "short"}:
+            return side
+        position_side = str(info.get("positionSide") or "").lower()
+        if position_side in {"long", "short"}:
+            return position_side
         size = PositionReconciler._position_size(position)
         if size > 0:
             return "long"
         if size < 0:
             return "short"
+        return None
+
+    @staticmethod
+    def _exchange_symbols(
+        exchange_positions: dict[str, dict[str, dict]],
+    ) -> set[str]:
+        return set(exchange_positions)
+
+    @staticmethod
+    def _select_position(
+        exchange_positions: dict[str, dict[str, dict]],
+        symbol: str,
+        preferred_side: str | None = None,
+    ) -> dict | None:
+        pos_map = exchange_positions.get(symbol)
+        if not pos_map:
+            return None
+        if preferred_side and preferred_side in pos_map:
+            return pos_map[preferred_side]
+        return next(iter(pos_map.values()), None)
+
+    @staticmethod
+    def _close_position_side_param(position: dict) -> str | None:
+        info = position.get("info", {})
+        position_side = str(info.get("positionSide") or "").upper()
+        if position_side in {"LONG", "SHORT"}:
+            return position_side
         return None
 
     async def _fetch_positions_for_reconciliation(self) -> list[dict] | None:
@@ -141,9 +167,9 @@ class PositionReconciler:
 
     def _classify_exchange_positions(
         self, positions: list[dict]
-    ) -> tuple[dict[str, dict], list[dict]]:
+    ) -> tuple[dict[str, dict[str, dict]], list[dict]]:
         unmanaged = []
-        exchange_positions = {}
+        exchange_positions: dict[str, dict[str, dict]] = {}
         for position in positions:
             symbol = self.trades.normalize_symbol(
                 position.get("symbol") or position.get("info", {}).get("symbol")
@@ -151,10 +177,55 @@ class PositionReconciler:
             size = self._position_size(position)
             if abs(size) <= 0 or not symbol:
                 continue
-            exchange_positions[symbol] = position
+            side_key = self._close_position_side_param(position) or "BOTH"
+            pos_map = exchange_positions.setdefault(symbol, {})
+            pos_map[side_key] = position
             if not self.trades.has_open_trade_for_symbol(symbol):
-                unmanaged.append({"symbol": symbol, "size": size})
+                unmanaged.append(
+                    {
+                        "symbol": symbol,
+                        "size": size,
+                        "side": self._position_side(position),
+                        "position_side": self._close_position_side_param(position),
+                    }
+                )
         return exchange_positions, unmanaged
+
+    async def _close_unmanaged_position(self, item: dict) -> None:
+        symbol = item["symbol"]
+        size = float(item["size"])
+        side = "sell" if size > 0 else "buy"
+        qty = abs(size)
+        position_side = item.get("position_side")
+        logger.warning(
+            f"Closing unmanaged position: {symbol} "
+            f"{'long' if side == 'sell' else 'short'} {qty}"
+        )
+        await self.orders.cancel_all_orders(symbol)
+        order = await self.orders.market_order(
+            symbol,
+            side,
+            qty,
+            reduce_only=True,
+            position_side=position_side,
+        )
+        if order is not None:
+            return
+
+        failure_reason = self.orders.failure_reason(symbol, "")
+        if "reduceonly" not in failure_reason.lower():
+            return
+        logger.warning(
+            f"Retrying unmanaged close for {symbol} without reduceOnly after "
+            "Binance reduce-only rejection"
+        )
+        await self.orders.market_order(
+            symbol,
+            side,
+            qty,
+            reduce_only=False,
+            position_side=position_side,
+        )
 
     async def _reconciliation_state(
         self,
@@ -162,7 +233,7 @@ class PositionReconciler:
         auto_close_unmanaged: bool = False,
     ) -> (
         tuple[
-            dict[str, dict],
+            dict[str, dict[str, dict]],
             dict[str, tuple[set[str], set[str]]],
         ]
         | Literal[False]
@@ -175,19 +246,8 @@ class PositionReconciler:
         if unmanaged:
             if auto_close_unmanaged:
                 for item in unmanaged:
-                    side = "sell" if float(item["size"]) > 0 else "buy"
-                    qty = abs(float(item["size"]))
-                    logger.warning(
-                        f"Closing unmanaged position: {item['symbol']} "
-                        f"{'long' if side == 'sell' else 'short'} {qty}"
-                    )
                     try:
-                        await self.orders.market_order(
-                            item["symbol"],
-                            side,
-                            qty,
-                            reduce_only=True,
-                        )
+                        await self._close_unmanaged_position(item)
                     except Exception as exc:
                         logger.warning(
                             f"Failed to close unmanaged {item['symbol']}: {exc}"
@@ -258,7 +318,7 @@ class PositionReconciler:
             await self.orders.cancel_order(trade.symbol, take_profit_order_id)
         self.trades.open_trades.pop(position_key, None)
         self.trades.trade_correlation_ids.pop(position_key, None)
-        self.trades.last_symbol_exit_at[trade.symbol] = datetime.now(timezone.utc)
+        self.trades.record_exit_time(trade.symbol)
 
     async def _filled_protective_exit_details(  # noqa: C901
         self,
@@ -334,9 +394,7 @@ class PositionReconciler:
                     oid = str(execution_order.get("id") or "")
                     if oid:
                         self._consumed_exit_order_ids.add(oid)
-                    fee = await self._order_fee(
-                        execution_order, trade, execution_price
-                    )
+                    fee = await self._order_fee(execution_order, trade, execution_price)
                     return execution_price, reason, fee
             price = self._fill_resolver.positive_order_price(order)
             if price is None:
@@ -412,11 +470,16 @@ class PositionReconciler:
             )
 
     async def _verify_exchange_position_details(
-        self, exchange_positions: dict[str, dict]
+        self, exchange_positions: dict[str, dict[str, dict]]
     ) -> bool:
         for symbol in {trade.symbol for trade in self.trades.open_trades.values()}:
             symbol_trades = self.trades.trades_for_symbol(symbol)
-            position = exchange_positions.get(symbol)
+            trade_side = next(iter({t.side for _, t in symbol_trades}), None)
+            position = self._select_position(
+                exchange_positions,
+                symbol,
+                preferred_side=trade_side.upper() if trade_side else None,
+            )
             if position is None:
                 continue
             exchange_side = self._position_side(position)
@@ -520,15 +583,31 @@ class PositionReconciler:
 
     async def _reconcile_partial_exchange_exits(
         self,
-        exchange_positions: dict[str, dict],
+        exchange_positions: dict[str, dict[str, dict]],
         order_snapshots: dict[str, tuple[set[str], set[str]]],
         notify_trade_completed,
     ) -> bool:
         finalized = False
-        for symbol in {trade.symbol for trade in self.trades.open_trades.values()}:
-            symbol_trades = self.trades.trades_for_symbol(symbol)
+        # Group by (symbol, side) rather than symbol alone: in hedge mode a
+        # symbol can carry both a long and a short leg at once, each backed
+        # by its own exchange position. Aggregating quantity across sides
+        # and comparing it to a single arbitrarily-picked side's exchange
+        # position would misdetect a missing/partial exit on one leg based
+        # on the other leg's size entirely.
+        executions_by_symbol: dict[str, list[dict]] = {}
+        symbol_sides = {
+            (trade.symbol, trade.side) for trade in self.trades.open_trades.values()
+        }
+        for symbol, side in symbol_sides:
+            symbol_trades = [
+                (key, trade)
+                for key, trade in self.trades.trades_for_symbol(symbol)
+                if trade.side == side
+            ]
             audited_quantity = sum(trade.quantity for _, trade in symbol_trades)
-            position = exchange_positions.get(symbol)
+            position = self._select_position(
+                exchange_positions, symbol, preferred_side=side.upper()
+            )
             exchange_quantity = abs(self._position_size(position)) if position else 0.0
             tolerance = await self._fill_resolver.quantity_tolerance(symbol)
             missing_quantity = audited_quantity - exchange_quantity
@@ -539,7 +618,11 @@ class PositionReconciler:
                 symbol_trades,
                 order_snapshots.get(symbol, (set(), set())),
             )
-            executions = await self._exit_execution_groups(symbol)
+            if symbol not in executions_by_symbol:
+                executions_by_symbol[symbol] = await self._exit_execution_groups(
+                    symbol
+                )
+            executions = executions_by_symbol[symbol]
             consumed_orders: set[str] = set()
             for position_key, trade in candidates:
                 if trade.quantity > missing_quantity + tolerance:
@@ -661,6 +744,30 @@ class PositionReconciler:
         )
         return reason
 
+    async def _exchange_reports_position_closed(self, trade) -> bool:
+        """True only when the exchange was readable AND reports the leg gone.
+
+        An unreadable snapshot returns False (unknown), so callers never treat a
+        failed position read as evidence that a live position has been closed.
+        """
+        exchange_positions = await self._fetch_positions_for_reconciliation()
+        if exchange_positions is None:
+            return False
+        exchange_pos = next(
+            (
+                pos
+                for pos in exchange_positions
+                if self.trades.normalize_symbol(
+                    pos.get("symbol") or pos.get("info", {}).get("symbol")
+                )
+                == trade.symbol
+            ),
+            None,
+        )
+        if exchange_pos is None:
+            return True
+        return abs(self._position_size(exchange_pos)) < trade.quantity * 0.5
+
     async def _recreate_protection_for_trade(
         self,
         position_key: str,
@@ -673,29 +780,16 @@ class PositionReconciler:
         if not correlation_id:
             return False
 
-        exchange_positions = await self._fetch_positions_for_reconciliation()
-        if exchange_positions is not None:
-            exchange_pos = next(
-                (
-                    pos
-                    for pos in exchange_positions
-                    if self.trades.normalize_symbol(
-                        pos.get("symbol") or pos.get("info", {}).get("symbol")
-                    )
-                    == trade.symbol
-                ),
-                None,
+        if await self._exchange_reports_position_closed(trade):
+            logger.info(
+                f"{position_key}: position already closed on exchange; "
+                "finalizing instead of recreating protection"
             )
-            if exchange_pos is None or abs(self._position_size(exchange_pos)) < trade.quantity * 0.5:
-                logger.info(
-                    f"{position_key}: position already closed on exchange; "
-                    "finalizing instead of recreating protection"
+            if notify_trade_completed:
+                await self._finalize_exchange_closed_position(
+                    position_key, notify_trade_completed
                 )
-                if notify_trade_completed:
-                    await self._finalize_exchange_closed_position(
-                        position_key, notify_trade_completed
-                    )
-                return True
+            return True
 
         sl, tp = self.audit_store.get_trade_protection_levels(correlation_id)
         if sl is None:
@@ -709,29 +803,16 @@ class PositionReconciler:
             levels,
         )
         if protection is None:
-            exchange_positions = await self._fetch_positions_for_reconciliation()
-            if exchange_positions is not None:
-                exchange_pos = next(
-                    (
-                        pos
-                        for pos in exchange_positions
-                        if self.trades.normalize_symbol(
-                            pos.get("symbol") or pos.get("info", {}).get("symbol")
-                        )
-                        == trade.symbol
-                    ),
-                    None,
+            if await self._exchange_reports_position_closed(trade):
+                logger.info(
+                    f"{position_key}: position closed on exchange after protection "
+                    "recreation failure; finalizing trade"
                 )
-                if exchange_pos is None or abs(self._position_size(exchange_pos)) < trade.quantity * 0.5:
-                    logger.info(
-                        f"{position_key}: position closed on exchange after protection "
-                        "recreation failure; finalizing trade"
+                if notify_trade_completed:
+                    await self._finalize_exchange_closed_position(
+                        position_key, notify_trade_completed
                     )
-                    if notify_trade_completed:
-                        await self._finalize_exchange_closed_position(
-                            position_key, notify_trade_completed
-                        )
-                    return True
+                return True
             return False
         sl_order, tp_order = protection
         stop_order_id = sl_order.get("id", "")
@@ -816,7 +897,7 @@ class PositionReconciler:
             exchange_positions, order_snapshots = state
 
         await self._clear_missing_exchange_positions(
-            set(exchange_positions), notify_trade_completed
+            self._exchange_symbols(exchange_positions), notify_trade_completed
         )
 
         if not await self._verify_exchange_position_details(exchange_positions):
@@ -825,7 +906,9 @@ class PositionReconciler:
         for position_key in list(self.trades.open_trades):
             trade = self.trades.open_trades[position_key]
             symbol = trade.symbol
-            exchange_pos = exchange_positions.get(symbol)
+            exchange_pos = self._select_position(
+                exchange_positions, symbol, preferred_side=trade.side.upper()
+            )
             if (
                 exchange_pos is None
                 or abs(self._position_size(exchange_pos)) < trade.quantity * 0.5

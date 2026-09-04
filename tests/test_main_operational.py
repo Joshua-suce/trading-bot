@@ -4,7 +4,7 @@ import pytest
 
 from src.audit import AuditStore
 from src.governance import StrategyApprovalStore
-from src.main import run_admin, run_alert_test, run_health
+from src.main import run_admin, run_alert_test, run_demo_report, run_health
 
 
 def test_run_health_uses_configured_audit_store(tmp_path, monkeypatch, capsys):
@@ -51,6 +51,21 @@ def test_run_admin_updates_controls_and_strategy_state(tmp_path, monkeypatch):
     assert approval.approved is False
     assert approval.reason == "approval expired"
     assert audit.load_recent_events(1)[0]["event_type"] == "strategy_approval_revoked"
+
+
+def test_run_demo_report_writes_configured_output(tmp_path, monkeypatch, capsys):
+    report_path = tmp_path / "demo.json"
+    monkeypatch.setattr(
+        "src.governance.rollout.build_demo_canary_report",
+        lambda _audit, **_kwargs: {"status": "collecting", "trades": 0},
+    )
+
+    exit_code = run_demo_report(str(report_path), window_hours=24)
+
+    assert exit_code == 1
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "collecting"
+    assert json.loads(capsys.readouterr().out)["trades"] == 0
 
 
 @pytest.mark.asyncio

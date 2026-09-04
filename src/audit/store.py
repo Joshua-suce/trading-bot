@@ -152,9 +152,10 @@ class AuditStore:
                     outcome_horizon_seconds REAL,
                     evaluated_at TEXT,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(symbol, timeframe, candle_timestamp)
+                    UNIQUE(symbol, timeframe, candle_timestamp, strategy)
                 )
                 """)
+            self._migrate_signal_observation_strategy_uniqueness(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS execution_attempts (
                     id TEXT PRIMARY KEY,
@@ -212,7 +213,9 @@ class AuditStore:
                 """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_signal_observations_scope_time
-                ON signal_observations(symbol, timeframe, candle_timestamp DESC)
+                ON signal_observations(
+                    symbol, timeframe, strategy, candle_timestamp DESC
+                )
                 """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_signal_observations_outcome
@@ -226,6 +229,84 @@ class AuditStore:
                 CREATE INDEX IF NOT EXISTS idx_execution_attempts_status_time
                 ON execution_attempts(status, started_at DESC)
                 """)
+
+    def _migrate_signal_observation_strategy_uniqueness(self, conn: sqlite3.Connection):
+        legacy_unique = False
+        for index in conn.execute("PRAGMA index_list(signal_observations)").fetchall():
+            if not bool(index[2]):
+                continue
+            columns = [
+                row[2]
+                for row in conn.execute(
+                    f"PRAGMA index_info({self._quote_identifier(index[1])})"
+                ).fetchall()
+            ]
+            if columns == ["symbol", "timeframe", "candle_timestamp"]:
+                legacy_unique = True
+                break
+        if not legacy_unique:
+            return
+
+        conn.execute(
+            "ALTER TABLE signal_observations RENAME TO signal_observations_old"
+        )
+        conn.execute("""
+            CREATE TABLE signal_observations (
+                id TEXT PRIMARY KEY,
+                observed_at TEXT NOT NULL,
+                candle_timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                direction INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                minimum_confidence REAL NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                signal_price REAL NOT NULL,
+                ta_source TEXT NOT NULL,
+                ml_strength REAL NOT NULL,
+                ml_confidence REAL NOT NULL,
+                quality_score REAL,
+                quality_reason TEXT,
+                metrics_json TEXT NOT NULL,
+                execution_status TEXT NOT NULL DEFAULT 'not_attempted',
+                outcome_status TEXT NOT NULL DEFAULT 'pending',
+                outcome_price REAL,
+                raw_return_bps REAL,
+                directional_return_bps REAL,
+                direction_correct INTEGER,
+                outcome_horizon_seconds REAL,
+                evaluated_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(symbol, timeframe, candle_timestamp, strategy)
+            )
+            """)
+        conn.execute("""
+            INSERT OR IGNORE INTO signal_observations (
+                id, observed_at, candle_timestamp, symbol, timeframe, strategy,
+                direction, confidence, minimum_confidence, decision, reason,
+                signal_price, ta_source, ml_strength, ml_confidence,
+                quality_score, quality_reason, metrics_json, execution_status,
+                outcome_status, outcome_price, raw_return_bps,
+                directional_return_bps, direction_correct,
+                outcome_horizon_seconds, evaluated_at, updated_at
+            )
+            SELECT
+                id, observed_at, candle_timestamp, symbol, timeframe, strategy,
+                direction, confidence, minimum_confidence, decision, reason,
+                signal_price, ta_source, ml_strength, ml_confidence,
+                quality_score, quality_reason, metrics_json, execution_status,
+                outcome_status, outcome_price, raw_return_bps,
+                directional_return_bps, direction_correct,
+                outcome_horizon_seconds, evaluated_at, updated_at
+            FROM signal_observations_old
+            """)
+        conn.execute("DROP TABLE signal_observations_old")
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
 
     @staticmethod
     def _ensure_column(
@@ -904,17 +985,18 @@ class AuditStore:
         reason: str,
         signal_price: float,
         ta_source: str,
-        ml_strength: float,
-        ml_confidence: float,
+        ml_strength: float = 0.0,
+        ml_confidence: float = 0.0,
         quality_score: float | None = None,
         quality_reason: str | None = None,
         metrics: dict[str, Any] | None = None,
     ) -> str:
         timestamp_text = self._timestamp_text(candle_timestamp)
+        strategy_key = strategy or "unknown"
         observation_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f"signal:{symbol.upper()}:{timeframe}:{timestamp_text}",
+                f"signal:{symbol.upper()}:{timeframe}:{strategy_key}:{timestamp_text}",
             )
         )
         now = self._now()
@@ -929,7 +1011,8 @@ class AuditStore:
                     updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, timeframe, candle_timestamp) DO UPDATE SET
+                ON CONFLICT(symbol, timeframe, candle_timestamp, strategy)
+                DO UPDATE SET
                     strategy=excluded.strategy,
                     direction=excluded.direction,
                     confidence=excluded.confidence,
@@ -951,7 +1034,7 @@ class AuditStore:
                     timestamp_text,
                     symbol.upper(),
                     timeframe,
-                    strategy or "unknown",
+                    strategy_key,
                     int(direction),
                     float(confidence),
                     float(minimum_confidence),

@@ -354,7 +354,7 @@ class TestProtectiveExecutionAttribution:
         )
 
         changed = await reconciler._reconcile_partial_exchange_exits(
-            {"BNBUSDT": {"contracts": 0.32}},
+            {"BNBUSDT": {"BOTH": {"contracts": 0.32}}},
             {"BNBUSDT": (set(), set())},
             AsyncMock(),
         )

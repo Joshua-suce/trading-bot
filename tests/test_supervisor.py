@@ -20,11 +20,11 @@ def test_runtime_heartbeat_round_trips_state(tmp_path, monkeypatch):
 
 
 def test_runtime_heartbeat_overwrites_while_readable(tmp_path):
-    """Direct write succeeds even when file is already open for reading (Windows compat)."""
+    """Direct write succeeds while the file is open for reading (Windows compat)."""
     heartbeat = RuntimeHeartbeat(str(tmp_path / "heartbeat.json"))
     heartbeat.write("first")
     # Simulate supervisor holding a read handle while we write
-    data = heartbeat.path.read_text(encoding="utf-8")
+    heartbeat.path.read_text(encoding="utf-8")
     heartbeat.write("second")
     assert heartbeat.path.exists()
     assert heartbeat.read().state == "second"
@@ -177,9 +177,9 @@ def test_supervisor_allows_longer_staleness_while_child_bootstraps(
             self.polls += 1
             return None if self.polls == 1 else 0
 
-    assert supervisor._monitor(
-        Process(), started=0.0, instance_id="instance-123"
-    ) is False
+    assert (
+        supervisor._monitor(Process(), started=0.0, instance_id="instance-123") is False
+    )
 
 
 def test_supervisor_forces_child_tree_after_interrupt_timeout(tmp_path, monkeypatch):

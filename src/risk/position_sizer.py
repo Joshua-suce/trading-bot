@@ -69,11 +69,12 @@ class PositionSizer:
         max_pos = max_position_fraction * equity / entry_price
         quantity = min(quantity, max_pos)
         quantity = max(quantity, 0)
+        actual_risk_amount = quantity * risk_per_unit
 
         return PositionSize(
             quantity=round(quantity, 6),
             # Exchange leverage changes margin use, not stop-defined loss risk.
             leveraged_quantity=round(quantity, 6),
-            risk_amount=round(risk_per_trade, 2),
+            risk_amount=round(actual_risk_amount, 2),
             size_type="risk_based",
         )

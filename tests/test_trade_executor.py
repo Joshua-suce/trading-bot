@@ -222,6 +222,42 @@ class TestEnterPosition:
         )
 
     @pytest.mark.asyncio
+    async def test_post_fill_cost_recheck_flattens_weak_edge(
+        self,
+        mock_deps,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(settings, "max_entry_slippage_bps", 100.0)
+        monkeypatch.setattr(settings, "adaptive_limit_entry_enabled", False)
+        mock_deps["fill_resolver"].resolve_entry_fill_price.return_value = 100.5
+
+        def risk_levels(entry_price, side, atr, strategy=None):
+            if entry_price == 100.0:
+                return MagicMock(stop_loss=99.0, take_profit=104.0)
+            return MagicMock(stop_loss=98.0, take_profit=100.6)
+
+        mock_deps["sl_manager"].calculate.side_effect = risk_levels
+
+        opened = await mock_deps["executor"].enter_long(
+            "BTCUSDT",
+            100.0,
+            2.0,
+            strategy="trend",
+        )
+
+        assert opened is False
+        mock_deps["protection"].place_entry_protection.assert_not_awaited()
+        mock_deps["orders"].market_order.assert_any_call(
+            "BTCUSDT",
+            "sell",
+            1.0,
+            reduce_only=True,
+        )
+        metrics = mock_deps["audit_store"].record_execution_attempt.call_args.kwargs
+        assert metrics["status"] == "post_fill_cost_rejected"
+        assert "target edge too small" in metrics["reason"]
+
+    @pytest.mark.asyncio
     async def test_scalp_fill_slippage_uses_strict_limit(
         self,
         mock_deps,
@@ -270,7 +306,7 @@ class TestEnterPosition:
         assert await mock_deps["executor"].enter_long(
             "BTCUSDT", 100.0, 2.0, timeframe="15m"
         )
-        mock_deps["trades"].position_key.assert_called_with("BTCUSDT", "15m")
+        mock_deps["trades"].position_key.assert_called_with("BTCUSDT", "15m", None)
 
     @pytest.mark.asyncio
     async def test_enter_sends_notifications(self, mock_deps):
@@ -356,7 +392,7 @@ class TestEnterPosition:
             strategy="scalp",
         )
 
-        assert mock_deps["client"].fetch_order_book.await_count == 2
+        assert mock_deps["client"].fetch_order_book.await_count == 3
         mock_deps["client"].fetch_order_book.assert_any_await("BTCUSDT", limit=5)
         mock_deps["client"].fetch_order_book.assert_any_await(
             "BTCUSDT",
@@ -509,6 +545,16 @@ class TestEntryPreflight:
         assert await mock_deps["executor"]._entry_policy_blocks("BTCUSDT")
 
     @pytest.mark.asyncio
+    async def test_policy_bypasses_reentry_cooldown_for_reversal(self, mock_deps):
+        mock_deps["trades"].reentry_cooldown_reason.return_value = "cooldown active"
+        blocked = await mock_deps["executor"]._entry_policy_blocks(
+            "BTCUSDT",
+            ignore_reentry_cooldown=True,
+        )
+
+        assert blocked is False
+
+    @pytest.mark.asyncio
     async def test_policy_passes_when_no_block(self, mock_deps):
         assert not await mock_deps["executor"]._entry_policy_blocks("BTCUSDT")
 
@@ -549,7 +595,7 @@ class TestEntryPreflight:
             ("short", "bid", 101.0),
         ],
     )
-    async def test_favorable_price_drift_is_not_slippage(
+    async def test_small_favorable_price_drift_can_pass(
         self,
         mock_deps,
         monkeypatch,
@@ -557,7 +603,7 @@ class TestEntryPreflight:
         quote_key,
         quote,
     ):
-        monkeypatch.setattr(settings, "max_entry_slippage_bps", 5.0)
+        monkeypatch.setattr(settings, "max_entry_slippage_bps", 150.0)
         mock_deps["client"].fetch_ticker.return_value[quote_key] = quote
 
         reason = await mock_deps["executor"]._entry_price_drift_reason(
@@ -567,6 +613,24 @@ class TestEntryPreflight:
         )
 
         assert reason == ""
+
+    @pytest.mark.asyncio
+    async def test_excessive_favorable_price_drift_is_stale(
+        self,
+        mock_deps,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(settings, "max_entry_slippage_bps", 45.0)
+        mock_deps["client"].fetch_ticker.return_value["bid"] = 101.0
+
+        reason = await mock_deps["executor"]._entry_price_drift_reason(
+            "BTCUSDT",
+            "short",
+            100.0,
+        )
+
+        assert "signal price drift above limit" in reason
+        assert "100.00bps > 45.00bps" in reason
 
     @pytest.mark.parametrize(
         ("side", "signal_price", "fill_price", "expected"),
@@ -625,7 +689,7 @@ async def test_scalp_cost_rejects_take_profit_on_losing_side(
 
 @pytest.mark.asyncio
 async def test_trend_cost_gate_requires_edge_after_fees_and_spread(mock_deps):
-    levels = MagicMock(take_profit=100.1)
+    levels = MagicMock(take_profit=100.1, stop_loss=99.0)
 
     reason = await mock_deps["executor"]._strategy_cost_reason(
         "BTCUSDT",
@@ -640,7 +704,7 @@ async def test_trend_cost_gate_requires_edge_after_fees_and_spread(mock_deps):
 
 @pytest.mark.asyncio
 async def test_trend_cost_gate_accepts_sufficient_after_cost_edge(mock_deps):
-    levels = MagicMock(take_profit=104.0)
+    levels = MagicMock(take_profit=104.0, stop_loss=99.0)
 
     reason = await mock_deps["executor"]._strategy_cost_reason(
         "BTCUSDT",
@@ -651,6 +715,21 @@ async def test_trend_cost_gate_accepts_sufficient_after_cost_edge(mock_deps):
     )
 
     assert reason == ""
+
+
+@pytest.mark.asyncio
+async def test_trend_cost_gate_rejects_weak_after_cost_reward_risk(mock_deps):
+    levels = MagicMock(take_profit=104.0, stop_loss=97.0)
+
+    reason = await mock_deps["executor"]._strategy_cost_reason(
+        "BTCUSDT",
+        "long",
+        100.0,
+        levels,
+        "trend",
+    )
+
+    assert "after-cost reward/risk too weak" in reason
 
 
 class TestReportEntryLimitBlock:
@@ -700,3 +779,24 @@ class TestCloseAll:
 
         await mock_deps["executor"].close_all()
         assert mock_deps["orders"].market_order.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_close_all_records_symbol_failure_without_raising(self, mock_deps):
+        trade = TradeRecord(
+            symbol="BTCUSDT",
+            side="long",
+            entry_price=100.0,
+            quantity=1.0,
+            timestamp=datetime.now(),
+        )
+        mock_deps["trades"].open_trades["BTCUSDT"] = trade
+        mock_deps["trades"].trades_for_symbol.return_value = [("BTCUSDT", trade)]
+        mock_deps["orders"].market_order.side_effect = RuntimeError(
+            "exchange unavailable"
+        )
+
+        result = await mock_deps["executor"].close_all()
+
+        assert result is False
+        mock_deps["audit_store"].activate_emergency_stop.assert_called_once()
+        mock_deps["audit_store"].safe_record_event.assert_called()

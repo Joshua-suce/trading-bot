@@ -127,6 +127,8 @@ class PositionManager:
         timeframe: str | None = None,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
         return await self.executor.enter_long(
             symbol,
@@ -136,6 +138,8 @@ class PositionManager:
             timeframe,
             signal_timestamp=signal_timestamp,
             strategy=strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
+            market_context=market_context,
         )
 
     async def enter_short(
@@ -147,6 +151,8 @@ class PositionManager:
         timeframe: str | None = None,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
         return await self.executor.enter_short(
             symbol,
@@ -156,6 +162,8 @@ class PositionManager:
             timeframe,
             signal_timestamp=signal_timestamp,
             strategy=strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
+            market_context=market_context,
         )
 
     # Exit a position: market order, record PnL, cancel related SL/TP orders

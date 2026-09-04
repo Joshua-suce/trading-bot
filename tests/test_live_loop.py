@@ -3,7 +3,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -14,6 +13,7 @@ from src.live.loop import LiveTradingLoop
 from src.risk.portfolio import TradeRecord
 from src.signals.aggregator import FinalSignal
 from src.signals.quality_gate import StrategyQuality
+from src.signals.signal_gate import SignalGateResult
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +54,37 @@ def test_live_loop_uses_injected_audit_store(tmp_path):
     assert bot.audit_store is audit
     assert bot.order_mgr.audit_store is audit
     assert bot.pos_mgr.audit_store is audit
+
+
+def test_signal_observation_records_evaluated_strategy(tmp_path):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "strategy-observation.db")
+    bot = LiveTradingLoop(audit_store=audit)
+    signal = FinalSignal(
+        direction=1,
+        confidence=0.8,
+        ta_source="trend_structure_bull+structure_score_1.00",
+        strategy="trend",
+    )
+    candle = {
+        "symbol": "BTCUSDT",
+        "timeframe": "5m",
+        "timestamp": pd.Timestamp("2026-01-01T00:00:00Z"),
+        "close": 100.0,
+    }
+
+    bot._record_signal_observation(
+        candle,
+        signal,
+        strategy="breakout",
+        minimum_confidence=0.5,
+        decision="accepted",
+        reason="test",
+    )
+
+    rows = audit.load_signal_observations(limit=1)
+    assert rows[0]["strategy"] == "breakout"
 
 
 def test_candle_cache_deduplicates_and_keeps_latest_rows():
@@ -175,17 +206,20 @@ def test_due_scan_pairs_prioritizes_scalp_timeframes(monkeypatch):
 @pytest.mark.asyncio
 async def test_rest_scalp_uses_fallback_latency_budget(monkeypatch):
     bot = LiveTradingLoop()
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "strategy_quality_gate_enforced",
+        True,
+    )
     signal = FinalSignal(
         direction=1,
         confidence=0.9,
         ta_source="scalp",
-        ml_strength=0.0,
-        ml_confidence=0.0,
         strategy="scalp",
     )
     bot._entry_runtime_blocked = MagicMock(return_value=False)
-    bot._aggregator_for = MagicMock()
-    bot._aggregator_for.return_value.generate.return_value = signal
+    bot.aggregator = MagicMock()
+    bot.aggregator.generate.return_value = [signal]
     bot._record_signal_observation = MagicMock()
     bot.strategy_quality.evaluate = MagicMock(
         return_value=StrategyQuality(False, 0.0, "stop after latency check", {})
@@ -203,7 +237,10 @@ async def test_rest_scalp_uses_fallback_latency_budget(monkeypatch):
         "market_data_source": "rest",
     }
 
-    await bot._execute_trade(candle, df_ind=pd.DataFrame({"atr": [1.0]}))
+    await bot._execute_trade(
+        candle,
+        df_ind=pd.DataFrame({"close": [100.0], "atr": [1.0]}),
+    )
 
     assert bot.strategy_quality.evaluate.called
 
@@ -298,29 +335,6 @@ def test_non_scalp_holding_period_is_timeframe_aware():
 
     assert bot._strategy_max_hold_reached(five_minute_trade)
     assert not bot._strategy_max_hold_reached(hourly_trade)
-
-
-def test_disabled_scope_model_is_not_loaded(tmp_path, monkeypatch):
-    model_path = tmp_path / "xgb_BTCUSDT_5m.json"
-    model_path.write_text("unused", encoding="utf-8")
-    monkeypatch.setattr(live_loop_module.settings, "model_dir", str(tmp_path))
-    monkeypatch.setattr(
-        live_loop_module.settings,
-        "disabled_strategy_scopes",
-        "BTCUSDT:5m",
-    )
-    monkeypatch.setattr(
-        live_loop_module.settings,
-        "symbols",
-        "BTCUSDT",
-    )
-    monkeypatch.setattr(
-        live_loop_module.settings,
-        "timeframes",
-        "5m",
-    )
-
-    assert LiveTradingLoop._load_scoped_aggregators() == {}
 
 
 class NoopAlerter:
@@ -672,6 +686,93 @@ async def test_startup_reconciliation_unavailable_preserves_positions(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_restored_position_exposure_cleanup_closes_oldest_excess_position(
+    tmp_path,
+    monkeypatch,
+):
+    from src.audit import AuditStore
+
+    monkeypatch.setattr(live_loop_module.settings, "max_positions_per_symbol", 2)
+    monkeypatch.setattr(live_loop_module.settings, "max_same_direction_positions", 2)
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "restored_position_exposure_cleanup_enabled",
+        True,
+    )
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "restore-cleanup.db"))
+    now = datetime.now(timezone.utc)
+    bot.pos_mgr.open_trades["BTCUSDT:old:trend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="short",
+        entry_price=100.0,
+        quantity=0.1,
+        timestamp=now - timedelta(hours=3),
+        timeframe="5m",
+        strategy="trend",
+    )
+    bot.pos_mgr.open_trades["ETHUSDT:mid:trend"] = TradeRecord(
+        symbol="ETHUSDT",
+        side="short",
+        entry_price=100.0,
+        quantity=0.1,
+        timestamp=now - timedelta(hours=2),
+        timeframe="15m",
+        strategy="trend",
+    )
+    bot.pos_mgr.open_trades["BNBUSDT:new:trend"] = TradeRecord(
+        symbol="BNBUSDT",
+        side="short",
+        entry_price=100.0,
+        quantity=0.1,
+        timestamp=now - timedelta(hours=1),
+        timeframe="15m",
+        strategy="trend",
+    )
+
+    async def exit_position(position_key, _reason):
+        bot.pos_mgr.open_trades.pop(position_key, None)
+
+    bot.pos_mgr.exit_position = AsyncMock(side_effect=exit_position)
+
+    await bot._cleanup_restored_position_exposure()
+
+    bot.pos_mgr.exit_position.assert_awaited_once_with(
+        "BTCUSDT:old:trend",
+        "startup restored exposure limit",
+    )
+    assert set(bot.pos_mgr.open_trades) == {
+        "ETHUSDT:mid:trend",
+        "BNBUSDT:new:trend",
+    }
+
+
+@pytest.mark.asyncio
+async def test_directional_entry_reservation_counts_pending_entries(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "max_same_direction_positions", 2)
+    bot = LiveTradingLoop()
+    bot.pos_mgr.open_trades["BTCUSDT:5m:trend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="short",
+        entry_price=100.0,
+        quantity=0.1,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="5m",
+        strategy="trend",
+    )
+
+    first_reserved, first_reason = await bot._reserve_directional_entry("short")
+    second_reserved, second_reason = await bot._reserve_directional_entry("short")
+
+    assert first_reserved is True
+    assert first_reason == ""
+    assert second_reserved is False
+    assert "existing/pending short" in second_reason
+
+    await bot._release_directional_entry("short")
+    assert bot._pending_entry_sides["short"] == 0
+
+
+@pytest.mark.asyncio
 async def test_trade_start_stops_cleanly_when_demo_account_is_inactive(monkeypatch):
     bot = LiveTradingLoop()
     bot.client = NoopClient()
@@ -748,15 +849,54 @@ async def test_fatal_shutdown_flattens_positions(monkeypatch):
     assert closed == [True]
 
 
-def test_heartbeat_failure_does_not_escape_live_loop(monkeypatch):
+@pytest.mark.asyncio
+async def test_fatal_shutdown_preserves_positions_when_close_all_fails(monkeypatch):
+    bot = LiveTradingLoop()
+    bot.client = NoopClient()
+    bot.alerter = LifecycleAlerter()
+    bot.pos_mgr.open_trades["BTCUSDT:1m:scalp"] = object()
+
+    async def close_all():
+        raise RuntimeError("exchange unavailable")
+
+    monkeypatch.setattr(bot.pos_mgr, "close_all", close_all)
+
+    await bot.stop("fatal error")
+
+    assert bot.pos_mgr.open_trades
+    events = bot.audit_store.load_recent_events(5)
+    assert any(event["event_type"] == "shutdown_close_all_failed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_failure_does_not_escape_live_loop(monkeypatch):
     bot = LiveTradingLoop()
 
-    def fail_write(*args, **kwargs):
+    async def fail_write(*args, **kwargs):
         raise PermissionError("temporarily locked")
 
-    monkeypatch.setattr(bot._heartbeat, "write", fail_write)
+    monkeypatch.setattr(bot._heartbeat, "write_async", fail_write)
 
-    bot._write_heartbeat("running", open_positions=0)
+    await bot._write_heartbeat("running", open_positions=0)
+
+
+@pytest.mark.asyncio
+async def test_managed_exit_failure_does_not_escape_loop(tmp_path):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "managed-exit-failed.db")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    async def exit_position(_position_key, _reason):
+        raise RuntimeError("exchange unavailable")
+
+    bot.pos_mgr.exit_position = AsyncMock(side_effect=exit_position)
+
+    result = await bot._exit_position_safely("ETHUSDT:15m:trend", "maximum hold")
+
+    assert result is False
+    events = audit.load_recent_events(1)
+    assert events[0]["event_type"] == "managed_exit_failed"
 
 
 @pytest.mark.asyncio
@@ -1020,6 +1160,541 @@ async def test_disabled_strategy_scope_skips_signal_generation(
 
 
 @pytest.mark.asyncio
+async def test_strategy_specific_disabled_scope_does_not_block_other_strategies(
+    tmp_path,
+    monkeypatch,
+):
+    from src.audit import AuditStore
+    from src.live import loop as live_loop_module
+
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "disabled_strategy_scopes",
+        "BTCUSDT:30m:breakout",
+    )
+    audit = AuditStore(tmp_path / "strategy-specific-disabled.db")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=1,
+                    confidence=0.90,
+                    ta_source="donchian_breakout_bull",
+                    strategy="breakout",
+                ),
+                FinalSignal(
+                    direction=1,
+                    confidence=0.80,
+                    ta_source="trend_structure_bull",
+                    strategy="trend",
+                ),
+            ]
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(True, 0.90, "confirmed", {})
+    )
+    bot.pos_mgr.enter_long = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "30m",
+            "close": 100.0,
+            "timestamp": pd.Timestamp("2026-06-20T10:00:00Z"),
+        },
+        df_ind=pd.DataFrame(
+            {
+                "close": [100.0],
+                "atr": [2.0],
+                "ema_50": [98.0],
+                "ema_200": [95.0],
+                "ema_50_slope": [0.01],
+                "plus_di": [28.0],
+                "minus_di": [12.0],
+                "adx": [30.0],
+                "bb_upper": [110.0],
+                "bb_lower": [90.0],
+                "vol_ratio": [1.2],
+            }
+        ),
+    )
+
+    bot.pos_mgr.enter_long.assert_awaited_once()
+    assert bot.pos_mgr.enter_long.await_args.kwargs["strategy"] == "trend"
+    observations = audit.load_signal_observations(10)
+    decisions = {row["strategy"]: row["decision"] for row in observations}
+    assert decisions["breakout"] == "disabled"
+    assert decisions["trend"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_independent_strategy_signal_is_not_hard_blocked_by_regime(
+    tmp_path,
+):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "regime-advisory.db")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=1,
+                    confidence=0.85,
+                    ta_source="bb_lower_bounce",
+                    strategy="range",
+                )
+            ]
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(True, 0.90, "range confirmed", {})
+    )
+    bot.pos_mgr.enter_long = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "30m",
+            "close": 100.0,
+            "timestamp": pd.Timestamp("2026-06-20T11:00:00Z"),
+        },
+        df_ind=pd.DataFrame(
+            {
+                "close": [100.0],
+                "atr": [2.0],
+                "ema_50": [98.0],
+                "ema_200": [95.0],
+                "ema_50_slope": [0.01],
+                "plus_di": [28.0],
+                "minus_di": [12.0],
+                "adx": [30.0],
+                "bb_upper": [110.0],
+                "bb_lower": [90.0],
+                "vol_ratio": [1.2],
+            }
+        ),
+    )
+
+    bot.strategy_quality.evaluate.assert_called_once()
+    bot.pos_mgr.enter_long.assert_awaited_once()
+    assert bot.pos_mgr.enter_long.await_args.kwargs["strategy"] == "range"
+
+
+@pytest.mark.asyncio
+async def test_source_gate_hard_block_skips_quality_and_entry(tmp_path, monkeypatch):
+    from src.audit import AuditStore
+
+    monkeypatch.setattr(live_loop_module.settings, "signal_source_gate_enabled", True)
+    audit = AuditStore(tmp_path / "source-gate-block.db")
+    bot = LiveTradingLoop(audit_store=audit)
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=-1,
+                    confidence=0.90,
+                    ta_source="trend_structure_bear+structure_score_0.90",
+                    strategy="trend",
+                )
+            ]
+
+    bot.aggregator = Aggregator()
+    bot.signal_gate.evaluate = MagicMock(
+        return_value=SignalGateResult(
+            passed=False,
+            confidence_multiplier=0.70,
+            win_rate=0.25,
+            total_samples=8,
+            avg_directional_bps=-6.0,
+            reason="win rate and edge below threshold",
+        )
+    )
+    bot.strategy_quality.evaluate = MagicMock()
+    bot.pos_mgr.enter_short = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "30m",
+            "close": 100.0,
+            "timestamp": pd.Timestamp("2026-06-20T11:30:00Z"),
+        },
+        df_ind=pd.DataFrame(
+            {
+                "close": [100.0],
+                "atr": [2.0],
+                "ema_50": [102.0],
+                "ema_200": [105.0],
+                "ema_50_slope": [-0.01],
+                "plus_di": [12.0],
+                "minus_di": [28.0],
+                "adx": [30.0],
+                "bb_upper": [110.0],
+                "bb_lower": [90.0],
+                "vol_ratio": [1.2],
+            }
+        ),
+    )
+
+    bot.strategy_quality.evaluate.assert_not_called()
+    bot.pos_mgr.enter_short.assert_not_awaited()
+    observations = audit.load_signal_observations(10)
+    assert observations[0]["decision"] == "source_gate_rejected"
+
+
+@pytest.mark.asyncio
+async def test_accepted_opposite_signal_closes_existing_position_before_entry(
+    tmp_path,
+):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "reverse-opposite.db")
+    bot = LiveTradingLoop(audit_store=audit)
+    bot.pos_mgr.open_trades["BTCUSDT:old:trend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="short",
+        entry_price=101.0,
+        quantity=0.1,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="1h",
+        strategy="trend",
+    )
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=1,
+                    confidence=0.90,
+                    ta_source="trend_structure_bull",
+                    strategy="trend",
+                )
+            ]
+
+    async def exit_position(position_key, _reason):
+        bot.pos_mgr.open_trades.pop(position_key, None)
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(True, 0.90, "trend confirmed", {})
+    )
+    bot.pos_mgr.exit_position = AsyncMock(side_effect=exit_position)
+    bot.pos_mgr.enter_long = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "1h",
+            "close": 100.0,
+            "timestamp": pd.Timestamp("2026-06-20T12:00:00Z"),
+        },
+        df_ind=pd.DataFrame(
+            {
+                "close": [100.0],
+                "atr": [2.0],
+                "ema_50": [98.0],
+                "ema_200": [95.0],
+                "ema_50_slope": [0.01],
+                "plus_di": [28.0],
+                "minus_di": [12.0],
+                "adx": [30.0],
+                "bb_upper": [110.0],
+                "bb_lower": [90.0],
+                "vol_ratio": [1.2],
+            }
+        ),
+    )
+
+    bot.pos_mgr.exit_position.assert_awaited_once()
+    bot.pos_mgr.enter_long.assert_awaited_once()
+    assert bot.pos_mgr.enter_long.await_args.kwargs["ignore_reentry_cooldown"] is True
+    assert "BTCUSDT:old:trend" not in bot.pos_mgr.open_trades
+
+
+@pytest.mark.asyncio
+async def test_opposite_reversal_close_is_serialized_per_symbol(tmp_path):
+    from src.audit import AuditStore
+
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "reverse-lock.db"))
+    bot.pos_mgr.open_trades["BTCUSDT:4h:trend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="short",
+        entry_price=101.0,
+        quantity=0.1,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="4h",
+        strategy="trend",
+    )
+    signal = FinalSignal(
+        direction=1,
+        confidence=0.90,
+        ta_source="trend_structure_bull",
+        strategy="trend",
+    )
+
+    async def exit_position(position_key, _reason):
+        await asyncio.sleep(0)
+        bot.pos_mgr.open_trades.pop(position_key, None)
+
+    bot.pos_mgr.exit_position = AsyncMock(side_effect=exit_position)
+
+    results = await asyncio.gather(
+        bot._close_opposite_symbol_trades_if_needed(
+            "BTCUSDT",
+            signal,
+            "trend",
+            "BTCUSDT:5m",
+        ),
+        bot._close_opposite_symbol_trades_if_needed(
+            "BTCUSDT",
+            signal,
+            "trend",
+            "BTCUSDT:15m",
+        ),
+    )
+
+    assert bot.pos_mgr.exit_position.await_count == 1
+    assert results == [(True, True), (True, False)]
+
+
+@pytest.mark.asyncio
+async def test_lower_timeframe_signal_rejects_higher_timeframe_reversal_without_quality(
+    tmp_path,
+):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "lower-timeframe-reversal-deferred.db")
+    bot = LiveTradingLoop(audit_store=audit)
+    bot.pos_mgr.open_trades["BTCUSDT:1d:countertrend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=0.1,
+        timestamp=datetime.now(timezone.utc) - timedelta(minutes=10),
+        timeframe="1d",
+        strategy="countertrend",
+    )
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=-1,
+                    confidence=0.92,
+                    ta_source="scalp_momentum_bear",
+                    strategy="scalp",
+                )
+            ]
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(False, 0.20, "weak bearish quality", {})
+    )
+    bot.pos_mgr.exit_position = AsyncMock()
+    bot.pos_mgr.enter_short = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "1m",
+            "close": 99.0,
+            "timestamp": pd.Timestamp.now(tz="UTC"),
+            "market_data_source": "websocket",
+        },
+        df_ind=pd.DataFrame({"close": [99.0], "atr": [1.0]}),
+    )
+
+    bot.pos_mgr.exit_position.assert_not_awaited()
+    bot.pos_mgr.enter_short.assert_not_awaited()
+    observation = audit.load_signal_observations(1)[0]
+    assert observation["decision"] == "quality_rejected"
+    assert observation["reason"] == "weak bearish quality"
+
+
+@pytest.mark.asyncio
+async def test_lower_timeframe_signal_cannot_reverse_distant_higher_timeframe_position(
+    tmp_path,
+):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "lower-timeframe-reversal-confirmed.db")
+    bot = LiveTradingLoop(audit_store=audit)
+    bot.pos_mgr.open_trades["BTCUSDT:1d:countertrend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=0.1,
+        timestamp=datetime.now(timezone.utc) - timedelta(minutes=10),
+        timeframe="1d",
+        strategy="countertrend",
+    )
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=-1,
+                    confidence=0.92,
+                    ta_source="scalp_momentum_bear",
+                    strategy="scalp",
+                )
+            ]
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(True, 0.80, "bearish reversal confirmed", {})
+    )
+    bot.pos_mgr.exit_position = AsyncMock()
+    bot.pos_mgr.enter_short = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "1m",
+            "close": 99.0,
+            "timestamp": pd.Timestamp.now(tz="UTC"),
+            "market_data_source": "websocket",
+        },
+        df_ind=pd.DataFrame({"close": [99.0], "atr": [1.0]}),
+    )
+
+    bot.pos_mgr.exit_position.assert_not_awaited()
+    bot.pos_mgr.enter_short.assert_not_awaited()
+    observation = audit.load_signal_observations(1)[0]
+    assert observation["decision"] == "reversal_deferred"
+    assert "timeframe ratio" in observation["reason"]
+
+
+def test_fifteen_minute_signal_cannot_reverse_four_hour_position(tmp_path):
+    from src.audit import AuditStore
+
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "15m-vs-4h.db"))
+    bot.pos_mgr.open_trades["BTCUSDT:4h:trend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="short",
+        entry_price=59_500.0,
+        quantity=0.001,
+        timestamp=datetime.now(timezone.utc) - timedelta(hours=8),
+        timeframe="4h",
+        strategy="trend",
+    )
+
+    allowed, reason = bot._same_symbol_reversal_allowed(
+        symbol="BTCUSDT",
+        timeframe="15m",
+        signal=FinalSignal(
+            direction=1,
+            confidence=0.95,
+            ta_source="trend_structure_bull",
+            strategy="trend",
+        ),
+        quality=StrategyQuality(True, 0.95, "trend confirmed", {}),
+    )
+
+    assert allowed is False
+    assert "timeframe ratio" in reason
+
+
+def test_reversal_guard_requires_accepted_quality_even_when_gate_is_advisory(
+    tmp_path,
+    monkeypatch,
+):
+    from src.audit import AuditStore
+
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "strategy_quality_gate_enforced",
+        False,
+    )
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "reversal-quality.db"))
+    bot.pos_mgr.open_trades["BTCUSDT:5m:trend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="short",
+        entry_price=100.0,
+        quantity=0.1,
+        timestamp=datetime.now(timezone.utc) - timedelta(minutes=10),
+        timeframe="5m",
+        strategy="trend",
+    )
+
+    allowed, reason = bot._same_symbol_reversal_allowed(
+        symbol="BTCUSDT",
+        timeframe="5m",
+        signal=FinalSignal(
+            direction=1,
+            confidence=0.95,
+            ta_source="countertrend",
+            strategy="countertrend",
+        ),
+        quality=StrategyQuality(False, 0.0, "countertrend quality below threshold", {}),
+    )
+
+    assert allowed is False
+    assert "requires accepted strategy quality" in reason
+
+
+@pytest.mark.asyncio
+async def test_reversal_does_not_close_position_when_target_entry_policy_is_blocked(
+    tmp_path,
+):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "reversal-entry-policy.db")
+    bot = LiveTradingLoop(audit_store=audit)
+    bot.pos_mgr.open_trades["BTCUSDT:15m:reversal"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=59_400.0,
+        quantity=0.001,
+        timestamp=datetime.now(timezone.utc) - timedelta(minutes=20),
+        timeframe="15m",
+        strategy="reversal",
+    )
+    bot.portfolio.strategy_consecutive_losses["trend"] = 10
+    bot.portfolio.strategy_last_loss_at["trend"] = datetime.now(timezone.utc)
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=-1,
+                    confidence=0.92,
+                    ta_source="trend_structure_bear",
+                    strategy="trend",
+                )
+            ]
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(True, 0.90, "trend confirmed", {})
+    )
+    bot.pos_mgr.exit_position = AsyncMock()
+    bot.pos_mgr.enter_short = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "close": 59_458.80,
+            "timestamp": pd.Timestamp("2026-06-28T20:26:10Z"),
+        },
+        df_ind=pd.DataFrame({"close": [59_458.80], "atr": [300.0]}),
+    )
+
+    bot.pos_mgr.exit_position.assert_not_awaited()
+    bot.pos_mgr.enter_short.assert_not_awaited()
+    observation = audit.load_signal_observations(1)[0]
+    assert observation["decision"] == "risk_rejected"
+    assert "entry policy blocks reversal" in observation["reason"]
+
+
+@pytest.mark.asyncio
 async def test_accepted_signal_records_decision_context(tmp_path):
     from src.audit import AuditStore
 
@@ -1028,15 +1703,15 @@ async def test_accepted_signal_records_decision_context(tmp_path):
 
     class Aggregator:
         def generate(self, _df):
-            return FinalSignal(
-                direction=1,
-                confidence=0.72,
-                ta_source="ema_fibonacci",
-                ml_strength=0.70,
-                ml_confidence=0.81,
-                decision_reason="aligned signal ready",
-                strategy="breakout",
-            )
+            return [
+                FinalSignal(
+                    direction=1,
+                    confidence=0.72,
+                    ta_source="ema_fibonacci",
+                    decision_reason="aligned signal ready",
+                    strategy="breakout",
+                )
+            ]
 
     bot.aggregator = Aggregator()
     bot.strategy_quality.evaluate = MagicMock(
@@ -1076,6 +1751,79 @@ async def test_accepted_signal_records_decision_context(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_same_direction_limit_is_recorded_as_risk_rejected(tmp_path, monkeypatch):
+    from src.audit import AuditStore
+
+    audit = AuditStore(tmp_path / "same-direction-limit.db")
+    bot = LiveTradingLoop(audit_store=audit)
+    monkeypatch.setattr(live_loop_module.settings, "max_same_direction_positions", 1)
+
+    bot.pos_mgr.open_trades["BTCUSDT:old:trend"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="1h",
+        strategy="trend",
+    )
+
+    class Aggregator:
+        def generate(self, _df):
+            return [
+                FinalSignal(
+                    direction=1,
+                    confidence=0.90,
+                    ta_source="trend_structure_bull+structure_score_1.00",
+                    decision_reason="aligned signal ready",
+                    strategy="trend",
+                )
+            ]
+
+    bot.aggregator = Aggregator()
+    bot.strategy_quality.evaluate = MagicMock(
+        return_value=StrategyQuality(
+            accepted=True,
+            score=0.90,
+            reason="confirmed",
+            metrics={"adx": 30.0},
+        )
+    )
+    bot.pos_mgr.enter_long = AsyncMock(return_value=True)
+
+    await bot._execute_trade(
+        {
+            "symbol": "ETHUSDT",
+            "timeframe": "1h",
+            "close": 1700.0,
+            "timestamp": pd.Timestamp("2026-06-13T10:00:00Z"),
+        },
+        df_ind=pd.DataFrame(
+            {
+                "close": [1700.0],
+                "atr": [12.0],
+                "ema_50": [1680.0],
+                "ema_200": [1650.0],
+                "ema_50_slope": [0.01],
+                "plus_di": [30.0],
+                "minus_di": [12.0],
+                "trend_regime": [1],
+                "adx": [30.0],
+            }
+        ),
+    )
+
+    bot.pos_mgr.enter_long.assert_not_awaited()
+    observation = audit.load_signal_observations(1)[0]
+    assert observation["decision"] == "risk_rejected"
+    assert "same-direction limit reached" in observation["reason"]
+    assert all(
+        event["event_type"] != "signal_accepted"
+        for event in audit.load_recent_events(10)
+    )
+
+
+@pytest.mark.asyncio
 async def test_skipped_signal_is_recorded_for_forward_analysis(tmp_path):
     from src.audit import AuditStore
 
@@ -1084,15 +1832,15 @@ async def test_skipped_signal_is_recorded_for_forward_analysis(tmp_path):
 
     class Aggregator:
         def generate(self, _df):
-            return FinalSignal(
-                direction=-1,
-                confidence=0.10,
-                ta_source="ema_fibonacci",
-                ml_strength=-0.30,
-                ml_confidence=0.40,
-                decision_reason="confidence below threshold",
-                strategy="trend",
-            )
+            return [
+                FinalSignal(
+                    direction=-1,
+                    confidence=0.10,
+                    ta_source="ema_fibonacci",
+                    decision_reason="confidence below threshold",
+                    strategy="trend",
+                )
+            ]
 
     bot.aggregator = Aggregator()
     await bot._execute_trade(
@@ -1241,99 +1989,6 @@ def test_streamed_scalp_scan_keeps_standard_close_grace(monkeypatch):
     assert due == 100.0 + 30.0 + 2.0
 
 
-def test_live_loop_loads_configured_xgboost_model(monkeypatch, tmp_path):
-    model_path = tmp_path / "xgb_BTCUSDT_5m.json"
-    model_path.write_text("{}", encoding="utf-8")
-
-    class FakeClassifier:
-        def load(self, path):
-            assert path == str(model_path)
-            self.metadata = {
-                "symbol": "BTCUSDT",
-                "timeframe": "5m",
-                "label_schema": "cost_adjusted_horizon_v3",
-                "prediction_horizon": str(
-                    live_loop_module.settings.prediction_horizon
-                ),
-                "label_atr_multiplier": str(
-                    live_loop_module.settings.ml_label_atr_multiplier
-                ),
-                "label_min_return": str(
-                    live_loop_module.settings.ml_effective_label_min_return
-                ),
-            }
-
-        def predict_with_confidence(self, X):
-            return np.array([1]), np.array([0.9])
-
-    monkeypatch.setattr(live_loop_module.settings, "model_dir", str(tmp_path))
-    monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT")
-    monkeypatch.setattr(live_loop_module.settings, "timeframes", "5m")
-    monkeypatch.setattr(live_loop_module, "XGBoostClassifier", FakeClassifier)
-
-    aggregators = LiveTradingLoop._load_scoped_aggregators()
-
-    assert set(aggregators) == {"BTCUSDT:5m"}
-    assert (
-        aggregators["BTCUSDT:5m"].ensemble.confidence_threshold
-        == live_loop_module.settings.ml_confidence_threshold
-    )
-
-
-def test_live_loop_skips_legacy_xgboost_model(monkeypatch, tmp_path):
-    model_path = tmp_path / "xgb_BTCUSDT_5m.json"
-    model_path.write_text("{}", encoding="utf-8")
-
-    class FakeClassifier:
-        def load(self, _path):
-            self.metadata = {
-                "symbol": "BTCUSDT",
-                "timeframe": "5m",
-            }
-
-    monkeypatch.setattr(live_loop_module.settings, "model_dir", str(tmp_path))
-    monkeypatch.setattr(live_loop_module.settings, "symbols", "BTCUSDT")
-    monkeypatch.setattr(live_loop_module.settings, "timeframes", "5m")
-    monkeypatch.setattr(live_loop_module, "XGBoostClassifier", FakeClassifier)
-
-    aggregators = LiveTradingLoop._load_scoped_aggregators()
-
-    assert aggregators == {}
-
-
-def test_live_loop_rejects_model_with_sub_cost_training_labels():
-    model = type(
-        "Model",
-        (),
-        {
-            "metadata": {
-                "symbol": "BTCUSDT",
-                "timeframe": "1m",
-                "label_schema": "cost_adjusted_horizon_v3",
-                "prediction_horizon": str(
-                    live_loop_module.settings.prediction_horizon
-                ),
-                "label_atr_multiplier": str(
-                    live_loop_module.settings.ml_label_atr_multiplier
-                ),
-                "label_min_return": "0.001",
-            }
-        },
-    )()
-
-    assert not LiveTradingLoop._model_is_compatible(model, "BTCUSDT", "1m")
-
-
-def test_scoped_model_is_not_reused_for_other_markets():
-    bot = LiveTradingLoop()
-    scoped = object()
-    bot._scoped_aggregators = {"BTCUSDT:5m": scoped}
-
-    assert bot._aggregator_for("BTCUSDT", "5m") is scoped
-    assert bot._aggregator_for("ETHUSDT", "5m") is bot.aggregator
-    assert bot._aggregator_for("BTCUSDT", "1h") is bot.aggregator
-
-
 @pytest.mark.asyncio
 async def test_scan_timeframes_runs_in_configured_sequence(monkeypatch):
     bot = LiveTradingLoop()
@@ -1448,6 +2103,59 @@ async def test_process_timeframe_reports_market_data_failure(monkeypatch):
     assert event["payload"]["timeframe"] == "5m"
 
 
+@pytest.mark.asyncio
+async def test_network_outage_circuit_breaker_suppresses_feed_alerts(monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "network_outage_failure_threshold",
+        1,
+    )
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "network_outage_cooldown_seconds",
+        60.0,
+    )
+    bot = LiveTradingLoop()
+    bot.client.fetch_ohlcv = AsyncMock(side_effect=RuntimeError("dns unavailable"))
+    bot.alerter.data_feed_alert = AsyncMock()
+    bot.alerter.error_alert = AsyncMock()
+
+    await bot._process_timeframe("BTCUSDT", "1m")
+    await bot._process_timeframe("ETHUSDT", "1m")
+
+    assert bot._network_outage_active()
+    bot.alerter.error_alert.assert_awaited_once()
+    bot.alerter.data_feed_alert.assert_not_awaited()
+    events = bot.audit_store.load_recent_events(10)
+    assert any(event["event_type"] == "network_outage_detected" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_network_outage_blocks_new_entries(monkeypatch):
+    monkeypatch.setattr(
+        live_loop_module.settings,
+        "network_outage_cooldown_seconds",
+        60.0,
+    )
+    bot = LiveTradingLoop()
+    bot.alerter = NoopAlerter()
+    bot._connectivity_outage_until = time.monotonic() + 60.0
+    called = False
+
+    async def fail_if_called(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(bot.aggregator, "generate", fail_if_called)
+
+    await bot._execute_trade(
+        {"symbol": "BTCUSDT", "timeframe": "1m", "close": 100.0},
+        df_ind=pd.DataFrame({"close": [100.0]}),
+    )
+
+    assert called is False
+
+
 def test_scalp_cost_floor_delays_partial_until_fees_and_edge_are_covered(
     monkeypatch,
 ):
@@ -1559,11 +2267,20 @@ async def test_stale_rest_scalp_refetch_is_bounded(monkeypatch):
     now = pd.Timestamp.now(tz="UTC").floor("min")
     stale = pd.DataFrame(
         {"close": [100.0, 100.0, 100.0]},
-        index=[now - pd.Timedelta(minutes=3), now - pd.Timedelta(minutes=2), now],
+        index=[
+            now - pd.Timedelta(minutes=4),
+            now - pd.Timedelta(minutes=3),
+            now - pd.Timedelta(minutes=2),
+        ],
     )
     bot.client.fetch_ohlcv = AsyncMock(return_value=stale)
     sleep = AsyncMock()
     monkeypatch.setattr(live_loop_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        bot,
+        "_latest_expected_closed_candle_timestamp",
+        lambda timeframe: now - pd.Timedelta(minutes=1),
+    )
     monkeypatch.setattr(
         live_loop_module.settings,
         "scalp_rest_freshness_attempts",

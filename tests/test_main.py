@@ -15,7 +15,7 @@ def test_parse_args_custom_options():
     args = parse_args(
         [
             "--mode",
-            "train",
+            "trade",
             "--symbol",
             "ETHUSDT",
             "--timeframe",
@@ -24,7 +24,7 @@ def test_parse_args_custom_options():
             "200",
         ]
     )
-    assert args.mode == "train"
+    assert args.mode == "trade"
     assert args.symbol == "ETHUSDT"
     assert args.timeframe == "4h"
     assert args.limit == 200
@@ -38,6 +38,25 @@ def test_parse_args_accepts_rollout_evidence_path():
     args = parse_args(["--mode", "rollout", "--rollout-evidence", "evidence.json"])
     assert args.mode == "rollout"
     assert args.rollout_evidence == "evidence.json"
+
+
+def test_parse_args_accepts_demo_report_path():
+    args = parse_args(
+        [
+            "--mode",
+            "demo-report",
+            "--demo-report",
+            "demo-report.json",
+            "--demo-report-window-hours",
+            "24",
+            "--demo-report-since",
+            "2026-07-02T00:00:00+00:00",
+        ]
+    )
+    assert args.mode == "demo-report"
+    assert args.demo_report == "demo-report.json"
+    assert args.demo_report_window_hours == 24
+    assert args.demo_report_since == "2026-07-02T00:00:00+00:00"
 
 
 def test_parse_args_rejects_removed_backtest_mode():

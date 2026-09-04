@@ -69,6 +69,16 @@ class FakeOrderManager:
             "price": None,
         }
 
+    async def limit_order(self, symbol, side, quantity, price, post_only=False):
+        self.counter += 1
+        return {
+            "id": f"limit-{self.counter}",
+            "filled": quantity,
+            "average": price,
+            "price": price,
+            "status": "closed",
+        }
+
     async def stop_loss_order(self, symbol, side, quantity, stop_price, price=None):
         self.protective_quantities.append(quantity)
         self.stop_prices.append(stop_price)
@@ -147,6 +157,22 @@ async def test_entry_records_actual_fill_and_protects_filled_quantity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_entry_accepts_strategy_market_context(tmp_path):
+    manager = build_manager(FakeAlerter(), tmp_path)
+
+    opened = await manager.enter_long(
+        "BTCUSDT",
+        price=100.0,
+        atr=2.0,
+        strategy="range",
+        market_context={"bb_middle": 103.0, "vwap": 102.0},
+    )
+
+    assert opened is True
+    assert manager.orders.target_prices == [103.0]
+
+
+@pytest.mark.asyncio
 async def test_protective_levels_are_recalculated_from_actual_fill(tmp_path):
     alerter = FakeAlerter()
     manager = build_manager(alerter, tmp_path)
@@ -168,6 +194,9 @@ async def test_adverse_fill_slippage_is_immediately_flattened(monkeypatch, tmp_p
 
     monkeypatch.setattr(
         position_manager_module.settings, "max_entry_slippage_bps", 25.0
+    )
+    monkeypatch.setattr(
+        position_manager_module.settings, "reentry_cooldown_seconds", 900
     )
     alerter = FakeAlerter()
     manager = build_manager(alerter, tmp_path)
@@ -381,6 +410,9 @@ async def test_reentry_cooldown_blocks_same_symbol(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         position_manager_module.settings, "max_entry_slippage_bps", 25.0
+    )
+    monkeypatch.setattr(
+        position_manager_module.settings, "reentry_cooldown_seconds", 900
     )
     manager = build_manager(FakeAlerter(), tmp_path)
     manager.trades.last_symbol_exit_at["BTCUSDT"] = datetime.now(timezone.utc)

@@ -48,6 +48,10 @@ class StrategyPolicy:
     def required_target_edge_bps(self) -> float:
         return self.estimated_round_trip_fee_bps + self.minimum_net_edge_bps
 
+    @property
+    def minimum_after_cost_reward_risk(self) -> float:
+        return max(1.0, self.reward_risk_ratio * 0.65)
+
 
 class StrategyRegistry:
     def __init__(self, cfg: Settings = settings) -> None:
@@ -58,8 +62,15 @@ class StrategyRegistry:
         key = str(strategy or "trend").lower()
         return self._policies.get(key, self._policies["trend"])
 
+    def is_enabled(self, strategy: str | None) -> bool:
+        key = str(strategy or "trend").lower()
+        return key in self.cfg.enabled_strategies_set and key in self._policies
+
     def all(self) -> tuple[StrategyPolicy, ...]:
         return tuple(self._policies.values())
+
+    def enabled(self) -> tuple[StrategyPolicy, ...]:
+        return tuple(policy for policy in self.all() if self.is_enabled(policy.name))
 
     @staticmethod
     def _build(cfg: Settings) -> dict[str, StrategyPolicy]:

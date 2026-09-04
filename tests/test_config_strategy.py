@@ -7,18 +7,39 @@ from src.config import Settings
 def test_disabled_strategy_scopes_are_normalized():
     cfg = Settings(
         _env_file=None,
-        disabled_strategy_scopes="btcusdt:5m,ETHUSDT:1h",
+        disabled_strategy_scopes="btcusdt:5m,ETHUSDT:1h:Breakout",
     )
 
     assert cfg.disabled_strategy_scopes_set == {
         "BTCUSDT:5m",
-        "ETHUSDT:1h",
+        "ETHUSDT:1h:breakout",
     }
 
 
 def test_disabled_strategy_scope_rejects_invalid_format():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, disabled_strategy_scopes="BTCUSDT")
+
+
+def test_enabled_strategies_are_independently_configurable():
+    cfg = Settings(_env_file=None, enabled_strategies="trend,breakout,Scalp")
+
+    assert cfg.enabled_strategies_set == {"trend", "breakout", "scalp"}
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, enabled_strategies="trend,moonshot")
+
+
+def test_strategy_defaults_require_quality_and_control_exposure():
+    cfg = Settings(_env_file=None)
+
+    assert cfg.signal_source_gate_enabled is True
+    assert cfg.strategy_quality_gate_enforced is True
+    assert cfg.reentry_cooldown_seconds == 0
+    assert cfg.scalp_reentry_cooldown_seconds == 0
+    assert cfg.max_positions_per_symbol == 2
+    assert cfg.max_same_direction_positions == 2
+    assert cfg.restored_position_exposure_cleanup_enabled is True
 
 
 def test_ml_confidence_threshold_is_configurable():
@@ -89,8 +110,8 @@ def test_demo_scalp_fee_estimate_uses_observed_demo_multiplier():
 
     assert demo.scalp_effective_round_trip_fee_bps == 16.0
     assert mainnet.scalp_effective_round_trip_fee_bps == 8.0
-    assert demo.ml_effective_label_min_return == 0.0021
-    assert mainnet.ml_effective_label_min_return == 0.0013
+    assert demo.ml_effective_label_min_return == 0.0028
+    assert mainnet.ml_effective_label_min_return == 0.002
 
 
 def test_trade_defaults_keep_model_training_out_of_process():

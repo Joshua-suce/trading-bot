@@ -45,9 +45,28 @@ class ExposureLimiter:
         if account is None or account.total_equity <= 0:
             return False, "account equity unavailable for exposure check"
 
-        proposed_notional = entry_price * quantity
+        allowed, reason = self._check_notional_limits(
+            symbol,
+            side,
+            entry_price * quantity,
+            open_notional,
+            account.total_equity,
+        )
+        if not allowed:
+            return False, reason
+
+        return self._check_leg_count_limits(symbol, symbol_trades, timeframe)
+
+    def _check_notional_limits(
+        self,
+        symbol: str,
+        side: str,
+        proposed_notional: float,
+        open_notional: Callable[..., float],
+        total_equity: float,
+    ) -> tuple[bool, str]:
         total_notional = open_notional() + proposed_notional
-        max_total = account.total_equity * settings.max_total_open_notional_pct
+        max_total = total_equity * settings.max_total_open_notional_pct
         if total_notional > max_total:
             return (
                 False,
@@ -56,13 +75,14 @@ class ExposureLimiter:
             )
 
         symbol_notional = open_notional(symbol=symbol) + proposed_notional
-        max_symbol = account.total_equity * settings.max_symbol_open_notional_pct
+        max_symbol = total_equity * settings.max_symbol_open_notional_pct
         if symbol_notional > max_symbol:
             return (
                 False,
                 "symbol exposure limit exceeded: "
                 f"{symbol_notional:.2f} > {max_symbol:.2f}",
             )
+
         correlated_symbols = settings.correlated_symbols_set
         if symbol in correlated_symbols:
             correlated_notional = proposed_notional + sum(
@@ -70,15 +90,23 @@ class ExposureLimiter:
                 for trade in self.open_trades.values()
                 if trade.symbol in correlated_symbols and trade.side == side
             )
-            max_correlated = (
-                account.total_equity * settings.max_correlated_open_notional_pct
-            )
+            max_correlated = total_equity * settings.max_correlated_open_notional_pct
             if correlated_notional > max_correlated:
                 return (
                     False,
                     "correlated exposure limit exceeded: "
                     f"{correlated_notional:.2f} > {max_correlated:.2f}",
                 )
+        return True, "ok"
+
+    @staticmethod
+    def _check_leg_count_limits(
+        symbol: str,
+        symbol_trades: list[tuple[str, TradeRecord]],
+        timeframe: str | None,
+    ) -> tuple[bool, str]:
+        # Per-timeframe-group cap. Narrower than the per-symbol cap below, and
+        # only applicable when the caller supplies a timeframe.
         group = PositionRegistry.timeframe_group(timeframe) if timeframe else None
         if group:
             group_trades = [
@@ -92,7 +120,10 @@ class ExposureLimiter:
                     False,
                     f"max {group} legs for {symbol}: {len(group_trades)}",
                 )
-        elif len(symbol_trades) >= settings.max_positions_per_symbol:
+        # Per-symbol cap across all timeframe groups. This must be evaluated
+        # even when a group cap was checked above, otherwise legs spread across
+        # groups can exceed max_positions_per_symbol for the symbol as a whole.
+        if len(symbol_trades) >= settings.max_positions_per_symbol:
             return (
                 False,
                 f"max trade legs for {symbol} reached: {len(symbol_trades)}",

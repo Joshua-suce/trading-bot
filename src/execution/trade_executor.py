@@ -192,6 +192,8 @@ class TradeExecutor:
         self,
         symbol: str,
         strategy: str | None = None,
+        *,
+        ignore_reentry_cooldown: bool = False,
     ) -> bool:
         can_trade, reason = self.portfolio.can_trade(symbol, strategy)
         if not can_trade:
@@ -200,6 +202,9 @@ class TradeExecutor:
                 await self._notify_trade_failed(symbol, reason)
                 self._audit("trade_blocked", reason, severity="warning", symbol=symbol)
             return True
+
+        if ignore_reentry_cooldown:
+            return False
 
         reason = self.trades.reentry_cooldown_reason(symbol, strategy)
         if not reason:
@@ -339,21 +344,21 @@ class TradeExecutor:
             signal_price,
             executable_price,
         )
+        absolute_drift_bps = (
+            abs(executable_price - signal_price) / signal_price * 10_000
+        )
         max_drift = self._max_slippage_for(symbol)
         if strategy == "scalp":
             max_drift = min(
                 max_drift,
                 settings.scalp_max_entry_slippage_bps,
             )
-        if signal_timestamp is not None and strategy != "scalp":
-            now = datetime.now(timezone.utc)
-            ts = signal_timestamp
-            if hasattr(ts, "tzinfo") and ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            signal_age = (now - ts).total_seconds()
-            signal_age_hours = signal_age / 3600
-            age_multiplier = min(1.0 + signal_age_hours * 0.5, 10.0)
-            max_drift = max_drift * age_multiplier
+        if absolute_drift_bps > max_drift:
+            return (
+                f"signal price drift above limit: {absolute_drift_bps:.2f}bps "
+                f"> {max_drift:.2f}bps "
+                f"(signal={signal_price:.8f}, quote={executable_price:.8f})"
+            )
         if drift_bps <= max_drift:
             return ""
         return (
@@ -377,8 +382,14 @@ class TradeExecutor:
         signal_price: float,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
-        if await self._entry_policy_blocks(symbol, strategy):
+        if await self._entry_policy_blocks(
+            symbol,
+            strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
+        ):
             return True
         if self.portfolio.loss_cooldown_seconds > 0:
             last_loss = self.portfolio.last_symbol_loss_at.get(symbol)
@@ -424,9 +435,7 @@ class TradeExecutor:
         stop_order_id: str | None = None,
         take_profit_order_id: str | None = None,
     ) -> None:
-        self.trades.last_symbol_exit_at[self.trades.normalize_symbol(symbol)] = (
-            datetime.now(timezone.utc)
-        )
+        self.trades.record_exit_time(symbol)
         logger.critical(f"{reason}; attempting emergency flatten for {symbol}")
         self._audit(
             "unprotected_entry",
@@ -478,6 +487,7 @@ class TradeExecutor:
         price: float,
         signal_timestamp,
         strategy: str | None,
+        ignore_reentry_cooldown: bool = False,
     ) -> bool:
         allowed, reason = self.audit_store.trading_allowed(symbol=symbol)
         if not allowed:
@@ -491,6 +501,7 @@ class TradeExecutor:
             price,
             signal_timestamp=signal_timestamp,
             strategy=strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
         )
 
     async def _enter_position(  # noqa: C901
@@ -503,6 +514,8 @@ class TradeExecutor:
         timeframe: str | None = None,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
         position_key = self.trades.position_key(symbol, timeframe, strategy)
         if symbol in self._entries_in_progress:
@@ -517,6 +530,7 @@ class TradeExecutor:
             price,
             signal_timestamp,
             strategy,
+            ignore_reentry_cooldown,
         ):
             self._entries_in_progress.discard(symbol)
             return False
@@ -527,6 +541,7 @@ class TradeExecutor:
             side,
             atr,
             strategy,
+            market_context=market_context,
         )
         if levels is None:
             self._entries_in_progress.discard(symbol)
@@ -651,12 +666,51 @@ class TradeExecutor:
                 fallback_notional=entry_price * filled_quantity,
                 fallback_fee_bps=policy.estimated_round_trip_fee_bps / 2,
             )
-            levels = self.sl_manager.calculate(
+            levels = self._calculate_risk_levels(
                 entry_price,
                 side,
                 atr,
                 strategy=strategy,
+                market_context=market_context,
             )
+            post_fill_cost_reason = await self._strategy_cost_reason(
+                symbol,
+                side,
+                entry_price,
+                levels,
+                strategy,
+            )
+            if post_fill_cost_reason:
+                self._record_execution_attempt(
+                    execution_id=execution_id,
+                    correlation_id=correlation_id,
+                    phase="entry",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    strategy=strategy,
+                    side=side,
+                    status="post_fill_cost_rejected",
+                    expected_price=price,
+                    actual_price=entry_price,
+                    quantity=filled_quantity,
+                    slippage_bps=slippage_bps,
+                    order_latency_ms=order_latency_ms,
+                    fill_resolution_latency_ms=resolution_latency_ms,
+                    fill_source=fill_source,
+                    order=order,
+                    reason=post_fill_cost_reason,
+                    started_at=execution_started_at,
+                    completed=True,
+                )
+                await self._handle_unprotected_entry(
+                    symbol,
+                    exit_side,
+                    filled_quantity,
+                    f"post-fill cost check failed: {post_fill_cost_reason}",
+                    correlation_id,
+                )
+                self._entries_in_progress.discard(symbol)
+                return False
             trade = TradeRecord(
                 symbol=symbol,
                 side=side,
@@ -874,7 +928,15 @@ class TradeExecutor:
                 f"scalp target edge too small: {target_bps:.2f}bps "
                 f"< {required_bps:.2f}bps including fees and spread"
             )
-        return ""
+        return self._after_cost_reward_risk_reason(
+            name="scalp",
+            entry_price=entry_price,
+            stop_loss=float(levels.stop_loss or entry_price),
+            target_bps=target_bps,
+            fee_bps=estimated_fee_bps,
+            spread_bps=spread_bps,
+            minimum_after_cost_rr=max(1.0, settings.scalp_risk_reward_ratio * 0.65),
+        )
 
     async def _strategy_cost_reason(
         self,
@@ -928,6 +990,37 @@ class TradeExecutor:
                 f"{policy.name} target edge too small: {target_bps:.2f}bps "
                 f"< {required_bps:.2f}bps after fees and spread"
             )
+        return self._after_cost_reward_risk_reason(
+            name=policy.name,
+            entry_price=entry_price,
+            stop_loss=float(levels.stop_loss or entry_price),
+            target_bps=target_bps,
+            fee_bps=policy.estimated_round_trip_fee_bps,
+            spread_bps=spread_bps,
+            minimum_after_cost_rr=policy.minimum_after_cost_reward_risk,
+        )
+
+    @staticmethod
+    def _after_cost_reward_risk_reason(
+        *,
+        name: str,
+        entry_price: float,
+        stop_loss: float,
+        target_bps: float,
+        fee_bps: float,
+        spread_bps: float,
+        minimum_after_cost_rr: float,
+    ) -> str:
+        risk_bps = abs(entry_price - stop_loss) / entry_price * 10_000
+        if risk_bps <= 0:
+            return f"{name} stop-loss is invalid for after-cost " "reward/risk check"
+        after_cost_reward_bps = target_bps - fee_bps - spread_bps
+        after_cost_rr = after_cost_reward_bps / (risk_bps + spread_bps)
+        if after_cost_rr < minimum_after_cost_rr:
+            return (
+                f"{name} after-cost reward/risk too weak: "
+                f"{after_cost_rr:.2f}R < {minimum_after_cost_rr:.2f}R"
+            )
         return ""
 
     async def _entry_risk_levels(
@@ -937,12 +1030,14 @@ class TradeExecutor:
         side: str,
         atr: float,
         strategy: str | None,
+        market_context: dict | None = None,
     ):
-        levels = self.sl_manager.calculate(
+        levels = self._calculate_risk_levels(
             entry_price,
             side,
             atr,
             strategy=strategy,
+            market_context=market_context,
         )
         reason = await self._strategy_cost_reason(
             symbol,
@@ -955,6 +1050,33 @@ class TradeExecutor:
             return levels
         await self._block_strategy_entry(symbol, strategy, reason)
         return None
+
+    def _calculate_risk_levels(
+        self,
+        entry_price: float,
+        side: str,
+        atr: float,
+        *,
+        strategy: str | None,
+        market_context: dict | None,
+    ):
+        try:
+            return self.sl_manager.calculate(
+                entry_price,
+                side,
+                atr,
+                strategy=strategy,
+                market_context=market_context,
+            )
+        except TypeError as exc:
+            if "market_context" not in str(exc):
+                raise
+            return self.sl_manager.calculate(
+                entry_price,
+                side,
+                atr,
+                strategy=strategy,
+            )
 
     async def _block_strategy_entry(
         self,
@@ -1003,6 +1125,8 @@ class TradeExecutor:
         timeframe: str | None = None,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
         return await self._enter_position(
             symbol,
@@ -1013,6 +1137,8 @@ class TradeExecutor:
             timeframe,
             signal_timestamp=signal_timestamp,
             strategy=strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
+            market_context=market_context,
         )
 
     async def enter_short(
@@ -1024,6 +1150,8 @@ class TradeExecutor:
         timeframe: str | None = None,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
         return await self._enter_position(
             symbol,
@@ -1034,6 +1162,8 @@ class TradeExecutor:
             timeframe,
             signal_timestamp=signal_timestamp,
             strategy=strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
+            market_context=market_context,
         )
 
     async def exit_position(self, position_key: str, reason: str = "manual"):
@@ -1113,9 +1243,9 @@ class TradeExecutor:
                 started_at=execution_started_at,
                 completed=True,
             )
-            del self.trades.open_trades[position_key]
+            self.trades.open_trades.pop(position_key, None)
             self.trades.trade_correlation_ids.pop(position_key, None)
-            self.trades.last_symbol_exit_at[symbol] = datetime.now(timezone.utc)
+            self.trades.record_exit_time(symbol)
             await self._notify_trade_completed(trade, exit_price, reason)
             if position_key in self.protection.active_stops:
                 await self.orders.cancel_order(
@@ -1123,16 +1253,24 @@ class TradeExecutor:
                     self.protection.active_stops[position_key],
                     conditional=True,
                 )
-                del self.protection.active_stops[position_key]
+                self.protection.active_stops.pop(position_key, None)
             if position_key in self.protection.active_tps:
                 await self.orders.cancel_order(
                     symbol, self.protection.active_tps[position_key]
                 )
-                del self.protection.active_tps[position_key]
+                self.protection.active_tps.pop(position_key, None)
         else:
-            exchange_positions = await self._fetch_positions()
-            position_exists = self._exchange_position_still_open(
-                exchange_positions, symbol, trade.quantity
+            exchange_positions = await self._fetch_positions_or_none()
+            # Treat the leg as still open unless the exchange positively
+            # reports it gone AND the exit order is no longer working. An
+            # unreadable snapshot (None) or a live exit order both mean
+            # "unknown", and unknown must never close the book.
+            position_exists = (
+                exchange_positions is None
+                or self._exit_order_is_working(order)
+                or self._exchange_position_still_open(
+                    exchange_positions, symbol, trade.quantity
+                )
             )
             if not position_exists:
                 exit_price = trade.entry_price
@@ -1166,9 +1304,9 @@ class TradeExecutor:
                     started_at=execution_started_at,
                     completed=True,
                 )
-                del self.trades.open_trades[position_key]
+                self.trades.open_trades.pop(position_key, None)
                 self.trades.trade_correlation_ids.pop(position_key, None)
-                self.trades.last_symbol_exit_at[symbol] = datetime.now(timezone.utc)
+                self.trades.record_exit_time(symbol)
                 await self._notify_trade_completed(trade, exit_price, reason)
                 if position_key in self.protection.active_stops:
                     await self.orders.cancel_order(
@@ -1176,12 +1314,12 @@ class TradeExecutor:
                         self.protection.active_stops[position_key],
                         conditional=True,
                     )
-                    del self.protection.active_stops[position_key]
+                    self.protection.active_stops.pop(position_key, None)
                 if position_key in self.protection.active_tps:
                     await self.orders.cancel_order(
                         symbol, self.protection.active_tps[position_key]
                     )
-                    del self.protection.active_tps[position_key]
+                    self.protection.active_tps.pop(position_key, None)
                 return
             msg = f"exit order failed for {symbol}"
             self._record_execution_attempt(
@@ -1444,11 +1582,30 @@ class TradeExecutor:
             )
         return True
 
-    async def _fetch_positions(self) -> list[dict]:
+    async def _fetch_positions_or_none(self) -> list[dict] | None:
+        """Exchange positions, or None when the exchange could not be read.
+
+        A failed read must stay distinguishable from a genuinely empty list:
+        callers that decide whether a position is still open would otherwise
+        read an API error as "flat" and drop a live position from the book.
+        """
         try:
             return await self.client.fetch_positions()
-        except Exception:
-            return []
+        except Exception as exc:
+            logger.warning(f"position snapshot unavailable: {exc}")
+            return None
+
+    @staticmethod
+    def _exit_order_is_working(order: dict | None) -> bool:
+        """True when the exit order is still live on the exchange.
+
+        An unfilled order that has not reached a terminal state may still fill,
+        so the position it is closing must not be assumed gone.
+        """
+        if not order:
+            return False
+        status = str(order.get("status") or "").strip().lower()
+        return status in {"open", "new", "pending", "partially_filled", "accepted"}
 
     @staticmethod
     def _exchange_position_still_open(
@@ -1457,22 +1614,47 @@ class TradeExecutor:
         expected_quantity: float,
     ) -> bool:
         for position in positions:
-            pos_symbol = str(position.get("symbol") or position.get("info", {}).get("symbol") or "")
+            pos_symbol = str(
+                position.get("symbol") or position.get("info", {}).get("symbol") or ""
+            )
             if pos_symbol.upper() != symbol.upper():
                 continue
             for key in ("contracts",):
                 value = position.get(key)
-                if value not in (None, ""):
-                    return abs(float(value)) >= expected_quantity * 0.5
+                if value is None or value == "":
+                    continue
+                return abs(float(value)) >= expected_quantity * 0.5
             info = position.get("info", {})
-            for key in ("positionAmt", "positionAmt".lower()):
+            for key in ("positionAmt", "positionamt"):
                 value = info.get(key)
-                if value not in (None, ""):
-                    return abs(float(value)) >= expected_quantity * 0.5
+                if value is None or value == "":
+                    continue
+                return abs(float(value)) >= expected_quantity * 0.5
             return False
         return False
 
     async def close_all(self):
         symbols = {trade.symbol for trade in self.trades.open_trades.values()}
+        failed: list[str] = []
         for symbol in symbols:
-            await self._close_symbol_positions(symbol, "close_all")
+            try:
+                closed = await self._close_symbol_positions(symbol, "close_all")
+            except Exception as exc:
+                message = f"close_all failed for {symbol}: {redact_text(exc)}"
+                logger.critical(message)
+                self._audit(
+                    "close_all_symbol_failed",
+                    message,
+                    severity="critical",
+                    symbol=symbol,
+                )
+                failed.append(symbol)
+                continue
+            if not closed:
+                failed.append(symbol)
+        if failed:
+            self.audit_store.activate_emergency_stop(
+                "close_all could not close: " + ", ".join(sorted(failed))
+            )
+            return False
+        return True

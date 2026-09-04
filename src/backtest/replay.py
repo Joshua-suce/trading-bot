@@ -41,9 +41,7 @@ class DecisionReplayEngine:
         self.aggregator = aggregator
         self.quality_gate = quality_gate or strategy_quality_gate_from_settings()
         self.backtest_engine = backtest_engine or BacktestEngine(
-            commission=(
-                settings.scalp_effective_round_trip_fee_bps / 2 / 10_000
-            )
+            commission=(settings.scalp_effective_round_trip_fee_bps / 2 / 10_000)
         )
         self.min_history = max(min_history, 2)
 
@@ -54,11 +52,13 @@ class DecisionReplayEngine:
         symbol: str,
         timeframe: str,
         higher_timeframe_df: pd.DataFrame | None = None,
+        strategy: str | None = None,
     ) -> ReplayResult:
         observations = self.evaluate(
             df,
             timeframe=timeframe,
             higher_timeframe_df=higher_timeframe_df,
+            strategy=strategy,
         )
         accepted = {
             observation.timestamp: observation
@@ -92,6 +92,7 @@ class DecisionReplayEngine:
         *,
         timeframe: str,
         higher_timeframe_df: pd.DataFrame | None = None,
+        strategy: str | None = None,
     ) -> list[ReplayObservation]:
         if len(df) <= self.min_history:
             return []
@@ -105,11 +106,18 @@ class DecisionReplayEngine:
             indicators = compute_all_indicators(window)
             timestamp = pd.Timestamp(window.index[-1])
             higher_regime = higher_regimes.get(timestamp)
-            signal = generate_with_context(
+            signals = generate_with_context(
                 self.aggregator,
                 window,
                 higher_regime or 0,
             )
+            if strategy is not None:
+                signals = [signal for signal in signals if signal.strategy == strategy]
+            if not signals:
+                continue
+            signal = max(signals, key=lambda s: s.confidence)
+            if signal.direction == 0:
+                continue
             decision = evaluate_signal_decision(
                 indicators,
                 signal,

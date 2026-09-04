@@ -214,8 +214,6 @@ def test_signal_observations_are_idempotent_and_resolve_forward_outcomes(tmp_pat
         reason="confirmed",
         signal_price=100.0,
         ta_source="ema_fibonacci",
-        ml_strength=0.65,
-        ml_confidence=0.80,
         quality_score=0.84,
         quality_reason="confirmed",
         metrics={"adx": 31.0},
@@ -232,8 +230,6 @@ def test_signal_observations_are_idempotent_and_resolve_forward_outcomes(tmp_pat
         reason="updated",
         signal_price=100.0,
         ta_source="ema_fibonacci",
-        ml_strength=0.68,
-        ml_confidence=0.82,
     )
     audit.update_signal_execution(observation_id, "opened")
     resolved = audit.resolve_signal_observations(
@@ -270,8 +266,6 @@ def test_signal_dashboard_reports_strategy_decision_quality(tmp_path):
         reason="volume too low",
         signal_price=100.0,
         ta_source="range",
-        ml_strength=-0.20,
-        ml_confidence=0.60,
     )
     audit.resolve_signal_observations(
         symbol="ETHUSDT",

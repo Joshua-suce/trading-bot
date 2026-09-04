@@ -48,7 +48,11 @@ class PositionRegistry:
         return raw.replace("/", "").upper()
 
     @staticmethod
-    def position_key(symbol: str, timeframe: str | None = None, strategy: str | None = None) -> str:
+    def position_key(
+        symbol: str,
+        timeframe: str | None = None,
+        strategy: str | None = None,
+    ) -> str:
         normalized_symbol = PositionRegistry.normalize_symbol(symbol)
         normalized_timeframe = str(timeframe or "").strip()
         if not normalized_timeframe:

@@ -17,7 +17,7 @@ class FakeResponse:
 
 
 class FakeAsyncClient:
-    posts = []
+    posts: list[tuple[str, dict, float]] = []
     failures_before_success = 0
 
     def __init__(self, timeout):

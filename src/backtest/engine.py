@@ -121,6 +121,7 @@ class BacktestEngine:
                             side,
                             atr_val,
                             strategy=position_strategy,
+                            market_context=row.to_dict(),
                         )
                         stop_loss = levels.stop_loss
                         take_profit = float(levels.take_profit or entry_price)
