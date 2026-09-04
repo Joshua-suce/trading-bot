@@ -30,6 +30,13 @@ class ReplayResult:
 
 
 class DecisionReplayEngine:
+    # Must stay >= the largest lookback used anywhere in the per-bar
+    # evaluate() call path (currently 60, from
+    # StrategyQualityGate._dynamic_percentile). See the comment at its use
+    # site in evaluate() for why this can be small despite indicators
+    # themselves needing much longer warmup (e.g. ema_200).
+    _REPLAY_WINDOW_ROWS = 120
+
     def __init__(
         self,
         aggregator: SignalAggregator,
@@ -115,7 +122,19 @@ class DecisionReplayEngine:
         full_indicators = compute_all_indicators(df)
         observations = []
         for end in range(self.min_history, len(df)):
-            window_indicators = full_indicators.iloc[: end + 1]
+            # A trailing window, not the full history-to-date: every rolling
+            # indicator's own warmup is already baked into full_indicators
+            # above, so a slice only needs to be long enough to satisfy
+            # per-bar lookback logic - the largest is
+            # StrategyQualityGate._dynamic_percentile's lookback=60.
+            # _REPLAY_WINDOW_ROWS gives comfortable margin above that.
+            # Bounding this (instead of an ever-growing df.iloc[:end+1])
+            # turns each iteration's slice cost from O(end) into O(1),
+            # making the whole loop O(n) instead of O(n^2) - the
+            # difference between an hour-long 1m/scalp backtest and one
+            # that finishes in a couple of minutes.
+            start = max(0, end + 1 - self._REPLAY_WINDOW_ROWS)
+            window_indicators = full_indicators.iloc[start : end + 1]
             timestamp = pd.Timestamp(window_indicators.index[-1])
             higher_regime = higher_regimes.get(timestamp)
             signals = generate_with_context(
