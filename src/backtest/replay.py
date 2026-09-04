@@ -100,15 +100,27 @@ class DecisionReplayEngine:
             df.index,
             higher_timeframe_df,
         )
+        # Every column compute_all_indicators produces is causal (rolling
+        # windows / ewm / shift(N>=0) only look backward - verified across
+        # src/indicators/*.py; the one non-causal computation, Ichimoku's
+        # chikou span, is dead code compute_all_indicators never calls).
+        # That means indicators for row i are unaffected by any row after i,
+        # so computing the full series once here and slicing per iteration
+        # below produces identical values to recomputing from scratch on
+        # every growing window, at a fraction of the cost: this used to be
+        # O(n^2) (every one of ~30 indicators recomputed on an ever-larger
+        # window every bar, and then recomputed AGAIN inside the aggregator
+        # since it was handed the raw window, not this precomputed frame),
+        # which made anything past a few hundred bars impractically slow.
+        full_indicators = compute_all_indicators(df)
         observations = []
         for end in range(self.min_history, len(df)):
-            window = df.iloc[: end + 1]
-            indicators = compute_all_indicators(window)
-            timestamp = pd.Timestamp(window.index[-1])
+            window_indicators = full_indicators.iloc[: end + 1]
+            timestamp = pd.Timestamp(window_indicators.index[-1])
             higher_regime = higher_regimes.get(timestamp)
             signals = generate_with_context(
                 self.aggregator,
-                window,
+                window_indicators,
                 higher_regime or 0,
             )
             if strategy is not None:
@@ -119,7 +131,7 @@ class DecisionReplayEngine:
             if signal.direction == 0:
                 continue
             decision = evaluate_signal_decision(
-                indicators,
+                window_indicators,
                 signal,
                 timeframe=timeframe,
                 higher_timeframe_regime=higher_regime,
