@@ -35,11 +35,20 @@ def parse_args(argv: Optional[list[str]] = None):
     parser.add_argument(
         "--symbol",
         type=str,
-        default="BTCUSDT",
-        help="Trading symbol (default: BTCUSDT)",
+        default=None,
+        help=(
+            "Restrict --mode trade to this symbol only (default: trade every "
+            "symbol from the SYMBOLS env var/config)"
+        ),
     )
     parser.add_argument(
-        "--timeframe", type=str, default="1h", help="Timeframe (default: 1h)"
+        "--timeframe",
+        type=str,
+        default=None,
+        help=(
+            "Restrict --mode trade to this timeframe only (default: trade "
+            "every timeframe from the TIMEFRAMES env var/config)"
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -384,13 +393,41 @@ def run_demo_report(
     return 0 if report["status"] == "promotion_candidate" else 1
 
 
+def _apply_cli_symbol_timeframe_override(
+    symbol: Optional[str], timeframe: Optional[str]
+) -> None:
+    """Restrict live trading to a single symbol/timeframe when passed on the CLI.
+
+    Without this, --symbol/--timeframe were parsed and logged but never
+    actually reached LiveTradingLoop, which scans settings.symbols_list/
+    settings.timeframes_list unconditionally - an operator restricting
+    exposure via the CLI would silently still trade every configured
+    symbol/timeframe with real capital.
+    """
+    if symbol is None and timeframe is None:
+        return
+    from src.config import Settings, settings
+
+    if symbol is not None:
+        settings.symbols = Settings.validate_symbols(symbol)
+        logger.warning(f"CLI override: trading restricted to symbol {settings.symbols}")
+    if timeframe is not None:
+        settings.timeframes = Settings.validate_timeframes(timeframe)
+        logger.warning(
+            f"CLI override: trading restricted to timeframe {settings.timeframes}"
+        )
+
+
 # Top-level dispatch: parse args, set up logging, route to the chosen mode
 def main():
     args = parse_args()
     setup_logging("DEBUG" if args.verbose else None)
 
     logger.info(f"Starting AI Trading Bot - Mode: {args.mode}")
-    logger.info(f"Symbol: {args.symbol}, Timeframe: {args.timeframe}")
+    logger.info(
+        f"Symbol: {args.symbol or 'all configured symbols'}, "
+        f"Timeframe: {args.timeframe or 'all configured timeframes'}"
+    )
     preflight = run_preflight(args.mode)
     logger.info(f"Preflight passed: environment={preflight.environment}")
 
@@ -411,6 +448,7 @@ def main():
             )
         )
     if args.mode == "trade":
+        _apply_cli_symbol_timeframe_override(args.symbol, args.timeframe)
         asyncio.run(run_trade())
     elif args.mode == "dashboard":
         run_dashboard()

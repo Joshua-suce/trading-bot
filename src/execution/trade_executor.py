@@ -524,213 +524,314 @@ class TradeExecutor:
             )
             return False
         self._entries_in_progress.add(symbol)
-        if await self._entry_start_blocked(
-            symbol,
-            side,
-            price,
-            signal_timestamp,
-            strategy,
-            ignore_reentry_cooldown,
-        ):
-            self._entries_in_progress.discard(symbol)
-            return False
-
-        levels = await self._entry_risk_levels(
-            symbol,
-            price,
-            side,
-            atr,
-            strategy,
-            market_context=market_context,
-        )
-        if levels is None:
-            self._entries_in_progress.discard(symbol)
-            return False
-        pos_size = self.sizer.calculate(
-            price,
-            levels.stop_loss,
-            leverage,
-            side,
-            strategy=strategy,
-        )
-        if pos_size.quantity <= 0:
-            logger.warning(f"Position size zero for {symbol}")
-            await self._notify_trade_failed(symbol, "position size is zero")
-            self._audit(
-                "trade_blocked",
-                "position size is zero",
-                severity="warning",
-                symbol=symbol,
-            )
-            self._entries_in_progress.discard(symbol)
-            return False
-
-        depth_reason = await self._market_depth_reason(
-            symbol,
-            side,
-            pos_size.quantity,
-            strategy,
-        )
-        if depth_reason:
-            await self._block_market_entry(symbol, depth_reason)
-            self._entries_in_progress.discard(symbol)
-            return False
-
-        exposure_ok, exposure_reason = self.check_exposure_limits(
-            symbol,
-            side,
-            price,
-            pos_size.quantity,
-            position_key,
-            timeframe=timeframe,
-        )
-        if not exposure_ok:
-            await self._report_entry_limit_block(
+        try:
+            if await self._entry_start_blocked(
                 symbol,
-                exposure_reason,
-                payload={
-                    "price": price,
-                    "quantity": pos_size.quantity,
-                    "position_key": position_key,
-                },
-            )
-            self._entries_in_progress.discard(symbol)
-            return False
-
-        correlation_id = self._new_correlation_id()
-        execution_id = self._new_correlation_id()
-        execution_started_at = datetime.now(timezone.utc).isoformat()
-        buy_side = "buy" if side == "long" else "sell"
-        order_started = time.monotonic()
-        order = await self.entry_router.submit(
-            symbol,
-            buy_side,
-            pos_size.quantity,
-            strategy=strategy,
-        )
-        order_latency_ms = (
-            float(order.get("_bot_order_latency_ms"))
-            if order and order.get("_bot_order_latency_ms") is not None
-            else (time.monotonic() - order_started) * 1000
-        )
-        if order and order.get("filled", 0) > 0:
-            filled_quantity = float(order["filled"])
-            exit_side = "sell" if side == "long" else "buy"
-            fill_source = (
-                "order_payload"
-                if self._fill_resolver.positive_order_price(order) is not None
-                else "exchange_recovery"
-            )
-            resolution_started = time.monotonic()
-            entry_price = await self._validated_entry_fill_price(
-                order,
-                symbol,
-                price,
-                exit_side,
-                filled_quantity,
-                correlation_id,
-                strategy=strategy,
-            )
-            resolution_latency_ms = (time.monotonic() - resolution_started) * 1000
-            if entry_price is None:
-                self._record_execution_attempt(
-                    execution_id=execution_id,
-                    correlation_id=correlation_id,
-                    phase="entry",
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    strategy=strategy,
-                    side=side,
-                    status="fill_rejected",
-                    expected_price=price,
-                    quantity=filled_quantity,
-                    order_latency_ms=order_latency_ms,
-                    fill_resolution_latency_ms=resolution_latency_ms,
-                    fill_source=fill_source,
-                    order=order,
-                    reason="entry fill validation failed; position flattened",
-                    started_at=execution_started_at,
-                    completed=True,
-                )
-                self._entries_in_progress.discard(symbol)
-                return False
-            slippage_bps = self._adverse_entry_drift_bps(
                 side,
                 price,
-                entry_price,
-            )
-            policy = self.strategy_registry.get(strategy)
-            entry_fee = await self._fill_resolver.order_fee(
-                order,
+                signal_timestamp,
+                strategy,
+                ignore_reentry_cooldown,
+            ):
+                self._entries_in_progress.discard(symbol)
+                return False
+
+            levels = await self._entry_risk_levels(
                 symbol,
-                fallback_notional=entry_price * filled_quantity,
-                fallback_fee_bps=policy.estimated_round_trip_fee_bps / 2,
-            )
-            levels = self._calculate_risk_levels(
-                entry_price,
+                price,
                 side,
                 atr,
-                strategy=strategy,
+                strategy,
                 market_context=market_context,
             )
-            post_fill_cost_reason = await self._strategy_cost_reason(
+            if levels is None:
+                self._entries_in_progress.discard(symbol)
+                return False
+            pos_size = self.sizer.calculate(
+                price,
+                levels.stop_loss,
+                leverage,
+                side,
+                strategy=strategy,
+            )
+            if pos_size.quantity <= 0:
+                logger.warning(f"Position size zero for {symbol}")
+                await self._notify_trade_failed(symbol, "position size is zero")
+                self._audit(
+                    "trade_blocked",
+                    "position size is zero",
+                    severity="warning",
+                    symbol=symbol,
+                )
+                self._entries_in_progress.discard(symbol)
+                return False
+
+            depth_reason = await self._market_depth_reason(
                 symbol,
                 side,
-                entry_price,
-                levels,
+                pos_size.quantity,
                 strategy,
             )
-            if post_fill_cost_reason:
-                self._record_execution_attempt(
-                    execution_id=execution_id,
-                    correlation_id=correlation_id,
-                    phase="entry",
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    strategy=strategy,
-                    side=side,
-                    status="post_fill_cost_rejected",
-                    expected_price=price,
-                    actual_price=entry_price,
-                    quantity=filled_quantity,
-                    slippage_bps=slippage_bps,
-                    order_latency_ms=order_latency_ms,
-                    fill_resolution_latency_ms=resolution_latency_ms,
-                    fill_source=fill_source,
-                    order=order,
-                    reason=post_fill_cost_reason,
-                    started_at=execution_started_at,
-                    completed=True,
-                )
-                await self._handle_unprotected_entry(
-                    symbol,
-                    exit_side,
-                    filled_quantity,
-                    f"post-fill cost check failed: {post_fill_cost_reason}",
-                    correlation_id,
-                )
+            if depth_reason:
+                await self._block_market_entry(symbol, depth_reason)
                 self._entries_in_progress.discard(symbol)
                 return False
-            trade = TradeRecord(
-                symbol=symbol,
-                side=side,
-                entry_price=entry_price,
-                quantity=filled_quantity,
-                timestamp=datetime.now(),
-                timeframe=timeframe,
-                strategy=strategy,
-                entry_fee=entry_fee,
-            )
 
-            protection_started = time.monotonic()
-            protection = await self.protection.place_entry_protection(
+            exposure_ok, exposure_reason = self.check_exposure_limits(
                 symbol,
                 side,
-                filled_quantity,
-                levels,
+                price,
+                pos_size.quantity,
+                position_key,
+                timeframe=timeframe,
             )
-            protection_latency_ms = (time.monotonic() - protection_started) * 1000
-            if protection is None:
+            if not exposure_ok:
+                await self._report_entry_limit_block(
+                    symbol,
+                    exposure_reason,
+                    payload={
+                        "price": price,
+                        "quantity": pos_size.quantity,
+                        "position_key": position_key,
+                    },
+                )
+                self._entries_in_progress.discard(symbol)
+                return False
+
+            correlation_id = self._new_correlation_id()
+            execution_id = self._new_correlation_id()
+            execution_started_at = datetime.now(timezone.utc).isoformat()
+            buy_side = "buy" if side == "long" else "sell"
+            order_started = time.monotonic()
+            order = await self.entry_router.submit(
+                symbol,
+                buy_side,
+                pos_size.quantity,
+                strategy=strategy,
+            )
+            order_latency_ms = (
+                float(order.get("_bot_order_latency_ms"))
+                if order and order.get("_bot_order_latency_ms") is not None
+                else (time.monotonic() - order_started) * 1000
+            )
+            if order and order.get("filled", 0) > 0:
+                filled_quantity = float(order["filled"])
+                exit_side = "sell" if side == "long" else "buy"
+                fill_source = (
+                    "order_payload"
+                    if self._fill_resolver.positive_order_price(order) is not None
+                    else "exchange_recovery"
+                )
+                resolution_started = time.monotonic()
+                entry_price = await self._validated_entry_fill_price(
+                    order,
+                    symbol,
+                    price,
+                    exit_side,
+                    filled_quantity,
+                    correlation_id,
+                    strategy=strategy,
+                )
+                resolution_latency_ms = (time.monotonic() - resolution_started) * 1000
+                if entry_price is None:
+                    self._record_execution_attempt(
+                        execution_id=execution_id,
+                        correlation_id=correlation_id,
+                        phase="entry",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        strategy=strategy,
+                        side=side,
+                        status="fill_rejected",
+                        expected_price=price,
+                        quantity=filled_quantity,
+                        order_latency_ms=order_latency_ms,
+                        fill_resolution_latency_ms=resolution_latency_ms,
+                        fill_source=fill_source,
+                        order=order,
+                        reason="entry fill validation failed; position flattened",
+                        started_at=execution_started_at,
+                        completed=True,
+                    )
+                    self._entries_in_progress.discard(symbol)
+                    return False
+                slippage_bps = self._adverse_entry_drift_bps(
+                    side,
+                    price,
+                    entry_price,
+                )
+                policy = self.strategy_registry.get(strategy)
+                entry_fee = await self._fill_resolver.order_fee(
+                    order,
+                    symbol,
+                    fallback_notional=entry_price * filled_quantity,
+                    fallback_fee_bps=policy.estimated_round_trip_fee_bps / 2,
+                )
+                levels = self._calculate_risk_levels(
+                    entry_price,
+                    side,
+                    atr,
+                    strategy=strategy,
+                    market_context=market_context,
+                )
+                post_fill_cost_reason = await self._strategy_cost_reason(
+                    symbol,
+                    side,
+                    entry_price,
+                    levels,
+                    strategy,
+                )
+                if post_fill_cost_reason:
+                    self._record_execution_attempt(
+                        execution_id=execution_id,
+                        correlation_id=correlation_id,
+                        phase="entry",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        strategy=strategy,
+                        side=side,
+                        status="post_fill_cost_rejected",
+                        expected_price=price,
+                        actual_price=entry_price,
+                        quantity=filled_quantity,
+                        slippage_bps=slippage_bps,
+                        order_latency_ms=order_latency_ms,
+                        fill_resolution_latency_ms=resolution_latency_ms,
+                        fill_source=fill_source,
+                        order=order,
+                        reason=post_fill_cost_reason,
+                        started_at=execution_started_at,
+                        completed=True,
+                    )
+                    await self._handle_unprotected_entry(
+                        symbol,
+                        exit_side,
+                        filled_quantity,
+                        f"post-fill cost check failed: {post_fill_cost_reason}",
+                        correlation_id,
+                    )
+                    self._entries_in_progress.discard(symbol)
+                    return False
+                trade = TradeRecord(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_price,
+                    quantity=filled_quantity,
+                    timestamp=datetime.now(),
+                    timeframe=timeframe,
+                    strategy=strategy,
+                    entry_fee=entry_fee,
+                )
+
+                protection_started = time.monotonic()
+                try:
+                    protection = await self.protection.place_entry_protection(
+                        symbol,
+                        side,
+                        filled_quantity,
+                        levels,
+                    )
+                except Exception as exc:
+                    # An exception here (e.g. a network/exchange error surfaced
+                    # by ExecutionGuard.prepare before the retry loop even
+                    # starts) must be treated the same as a failed placement -
+                    # otherwise it propagates past the `protection is None`
+                    # branch below and skips the emergency-flatten path,
+                    # leaving a filled, unprotected position untracked by the
+                    # bot.
+                    logger.error(
+                        f"Protective order placement raised for {symbol}: "
+                        f"{redact_text(exc)}"
+                    )
+                    protection = None
+                protection_latency_ms = (time.monotonic() - protection_started) * 1000
+                if protection is None:
+                    self._record_execution_attempt(
+                        execution_id=execution_id,
+                        correlation_id=correlation_id,
+                        phase="entry",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        strategy=strategy,
+                        side=side,
+                        status="protection_failed",
+                        expected_price=price,
+                        actual_price=entry_price,
+                        quantity=filled_quantity,
+                        slippage_bps=slippage_bps,
+                        order_latency_ms=order_latency_ms,
+                        fill_resolution_latency_ms=resolution_latency_ms,
+                        protection_latency_ms=protection_latency_ms,
+                        fill_source=fill_source,
+                        order=order,
+                        reason="protective order placement failed; position flattened",
+                        started_at=execution_started_at,
+                        completed=True,
+                    )
+                    await self._handle_unprotected_entry(
+                        symbol,
+                        exit_side,
+                        filled_quantity,
+                        f"protective order placement failed after {side} entry",
+                        correlation_id,
+                    )
+                    self._entries_in_progress.discard(symbol)
+                    return False
+                sl_order, tp_order = protection
+
+                stop_order_id = sl_order.get("id", "")
+                take_profit_order_id = tp_order.get("id", "") if tp_order else None
+                try:
+                    self.audit_store.record_open_trade(
+                        trade,
+                        mode=self.mode,
+                        correlation_id=correlation_id,
+                        stop_loss=levels.stop_loss,
+                        take_profit=levels.take_profit,
+                        stop_order_id=stop_order_id,
+                        take_profit_order_id=take_profit_order_id,
+                    )
+                except Exception as exc:
+                    self._record_execution_attempt(
+                        execution_id=execution_id,
+                        correlation_id=correlation_id,
+                        phase="entry",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        strategy=strategy,
+                        side=side,
+                        status="audit_failed",
+                        expected_price=price,
+                        actual_price=entry_price,
+                        quantity=filled_quantity,
+                        slippage_bps=slippage_bps,
+                        order_latency_ms=order_latency_ms,
+                        fill_resolution_latency_ms=resolution_latency_ms,
+                        protection_latency_ms=protection_latency_ms,
+                        fill_source=fill_source,
+                        order=order,
+                        reason=f"trade persistence failed: {redact_text(exc)}",
+                        started_at=execution_started_at,
+                        completed=True,
+                    )
+                    await self._handle_unprotected_entry(
+                        symbol,
+                        exit_side,
+                        filled_quantity,
+                        f"audit persistence failed after {side} entry: {exc}",
+                        correlation_id,
+                        stop_order_id=stop_order_id,
+                        take_profit_order_id=take_profit_order_id,
+                    )
+                    self._entries_in_progress.discard(symbol)
+                    return False
+
+                self.trades.open_trades[position_key] = trade
+                self.trades.trade_correlation_ids[position_key] = correlation_id
+                self.protection.active_stops[position_key] = stop_order_id
+                if take_profit_order_id:
+                    self.protection.active_tps[position_key] = take_profit_order_id
+                self.portfolio.add_trade(trade)
                 self._record_execution_attempt(
                     execution_id=execution_id,
                     correlation_id=correlation_id,
@@ -739,7 +840,7 @@ class TradeExecutor:
                     timeframe=timeframe,
                     strategy=strategy,
                     side=side,
-                    status="protection_failed",
+                    status="completed",
                     expected_price=price,
                     actual_price=entry_price,
                     quantity=filled_quantity,
@@ -749,74 +850,29 @@ class TradeExecutor:
                     protection_latency_ms=protection_latency_ms,
                     fill_source=fill_source,
                     order=order,
-                    reason="protective order placement failed; position flattened",
                     started_at=execution_started_at,
                     completed=True,
                 )
-                await self._handle_unprotected_entry(
+
+                logger.info(
+                    f"Entered {side.upper()} {symbol} qty={filled_quantity} "
+                    f"price={entry_price} "
+                    f"sl={levels.stop_loss} tp={levels.take_profit}"
+                )
+                await self._notify_trade_opened(
                     symbol,
-                    exit_side,
+                    side,
+                    entry_price,
                     filled_quantity,
-                    f"protective order placement failed after {side} entry",
-                    correlation_id,
+                    levels.stop_loss,
+                    levels.take_profit,
                 )
                 self._entries_in_progress.discard(symbol)
-                return False
-            sl_order, tp_order = protection
-
-            stop_order_id = sl_order.get("id", "")
-            take_profit_order_id = tp_order.get("id", "") if tp_order else None
-            try:
-                self.audit_store.record_open_trade(
-                    trade,
-                    mode=self.mode,
-                    correlation_id=correlation_id,
-                    stop_loss=levels.stop_loss,
-                    take_profit=levels.take_profit,
-                    stop_order_id=stop_order_id,
-                    take_profit_order_id=take_profit_order_id,
-                )
-            except Exception as exc:
-                self._record_execution_attempt(
-                    execution_id=execution_id,
-                    correlation_id=correlation_id,
-                    phase="entry",
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    strategy=strategy,
-                    side=side,
-                    status="audit_failed",
-                    expected_price=price,
-                    actual_price=entry_price,
-                    quantity=filled_quantity,
-                    slippage_bps=slippage_bps,
-                    order_latency_ms=order_latency_ms,
-                    fill_resolution_latency_ms=resolution_latency_ms,
-                    protection_latency_ms=protection_latency_ms,
-                    fill_source=fill_source,
-                    order=order,
-                    reason=f"trade persistence failed: {redact_text(exc)}",
-                    started_at=execution_started_at,
-                    completed=True,
-                )
-                await self._handle_unprotected_entry(
-                    symbol,
-                    exit_side,
-                    filled_quantity,
-                    f"audit persistence failed after {side} entry: {exc}",
-                    correlation_id,
-                    stop_order_id=stop_order_id,
-                    take_profit_order_id=take_profit_order_id,
-                )
-                self._entries_in_progress.discard(symbol)
-                return False
-
-            self.trades.open_trades[position_key] = trade
-            self.trades.trade_correlation_ids[position_key] = correlation_id
-            self.protection.active_stops[position_key] = stop_order_id
-            if take_profit_order_id:
-                self.protection.active_tps[position_key] = take_profit_order_id
-            self.portfolio.add_trade(trade)
+                return True
+            failure_reason = self._order_failure_reason(
+                symbol,
+                f"market {buy_side} order was not filled",
+            )
             self._record_execution_attempt(
                 execution_id=execution_id,
                 correlation_id=correlation_id,
@@ -825,60 +881,21 @@ class TradeExecutor:
                 timeframe=timeframe,
                 strategy=strategy,
                 side=side,
-                status="completed",
+                status="order_failed",
                 expected_price=price,
-                actual_price=entry_price,
-                quantity=filled_quantity,
-                slippage_bps=slippage_bps,
+                quantity=pos_size.quantity,
                 order_latency_ms=order_latency_ms,
-                fill_resolution_latency_ms=resolution_latency_ms,
-                protection_latency_ms=protection_latency_ms,
-                fill_source=fill_source,
                 order=order,
+                reason=failure_reason,
                 started_at=execution_started_at,
                 completed=True,
             )
-
-            logger.info(
-                f"Entered {side.upper()} {symbol} qty={filled_quantity} "
-                f"price={entry_price} "
-                f"sl={levels.stop_loss} tp={levels.take_profit}"
-            )
-            await self._notify_trade_opened(
-                symbol,
-                side,
-                entry_price,
-                filled_quantity,
-                levels.stop_loss,
-                levels.take_profit,
-            )
+            await self._notify_trade_failed(symbol, failure_reason)
+            self._audit("trade_failed", failure_reason, severity="error", symbol=symbol)
             self._entries_in_progress.discard(symbol)
-            return True
-        failure_reason = self._order_failure_reason(
-            symbol,
-            f"market {buy_side} order was not filled",
-        )
-        self._record_execution_attempt(
-            execution_id=execution_id,
-            correlation_id=correlation_id,
-            phase="entry",
-            symbol=symbol,
-            timeframe=timeframe,
-            strategy=strategy,
-            side=side,
-            status="order_failed",
-            expected_price=price,
-            quantity=pos_size.quantity,
-            order_latency_ms=order_latency_ms,
-            order=order,
-            reason=failure_reason,
-            started_at=execution_started_at,
-            completed=True,
-        )
-        await self._notify_trade_failed(symbol, failure_reason)
-        self._audit("trade_failed", failure_reason, severity="error", symbol=symbol)
-        self._entries_in_progress.discard(symbol)
-        return False
+            return False
+        finally:
+            self._entries_in_progress.discard(symbol)
 
     async def _scalp_cost_reason(
         self,

@@ -106,6 +106,12 @@ class LiveTradingLoop:
         self._stopped = False
         self._heartbeat = RuntimeHeartbeat(settings.runtime_heartbeat_path)
         self._heartbeat_task: asyncio.Task | None = None
+        # Updated once per completed main-loop iteration; the heartbeat
+        # publisher (a separate asyncio task) checks this before writing a
+        # "running" heartbeat, so a hung main loop (stuck on an await that
+        # never resolves) stops refreshing the heartbeat instead of looking
+        # perpetually healthy to the supervisor.
+        self._last_loop_progress_at = time.monotonic()
 
     # Connect, fetch account, then scan every configured timeframe in sequence
     async def start(self):
@@ -179,6 +185,11 @@ class LiveTradingLoop:
                 settings.symbols_list,
             )
             self._start_scalp_streams()
+            # Reset the clock right as heartbeat publishing begins, not at
+            # __init__ time - construction happens before the (potentially
+            # long) startup sequence above, so an unreset timestamp here
+            # would look falsely stale on the very first stall check below.
+            self._last_loop_progress_at = time.monotonic()
             self._start_heartbeat_publisher()
 
             while True:
@@ -195,6 +206,7 @@ class LiveTradingLoop:
                     await self._reconcile_if_due()
                     await self._manage_scalp_positions_if_due()
                     await self._scan_due_timeframes_once()
+                self._last_loop_progress_at = time.monotonic()
                 await asyncio.sleep(settings.scan_sleep_seconds)
         except asyncio.CancelledError:
             await self.stop("cancelled")
@@ -247,14 +259,31 @@ class LiveTradingLoop:
             1.0,
             min(15.0, settings.supervisor_heartbeat_stale_seconds / 3),
         )
+        # This task runs independently of the main scan loop, so it must not
+        # treat "the event loop is scheduling me" as "the trading loop is
+        # actually working" - a deadlocked await in the main loop would
+        # otherwise leave this publisher writing fresh "running" heartbeats
+        # forever, and the supervisor (which only checks heartbeat age) would
+        # never restart the hung process.
+        stall_after = settings.supervisor_heartbeat_stale_seconds
         while not self._stopped:
             try:
-                await self._emit_heartbeat(
-                    "running",
-                    mode=self.mode,
-                    environment=settings.binance_environment,
-                    open_positions=len(self.pos_mgr.open_trades),
-                )
+                stalled_for = time.monotonic() - self._last_loop_progress_at
+                if stalled_for > stall_after:
+                    logger.error(
+                        "Main scan loop has not progressed in {:.0f}s "
+                        "(> {:.0f}s); withholding heartbeat so the "
+                        "supervisor detects the stall and restarts",
+                        stalled_for,
+                        stall_after,
+                    )
+                else:
+                    await self._emit_heartbeat(
+                        "running",
+                        mode=self.mode,
+                        environment=settings.binance_environment,
+                        open_positions=len(self.pos_mgr.open_trades),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -409,10 +438,20 @@ class LiveTradingLoop:
             return {"success": False, "reason": "symbol is not configured"}
         if timeframe not in settings.timeframes_list:
             return {"success": False, "reason": "timeframe is not configured"}
-        if scope in settings.disabled_strategy_scopes_set:
+        # Manual (dashboard-queued) entries must honor the same
+        # connectivity/account-freshness guards as automated entries -
+        # without this, a queued "open long/short" request could still open
+        # a leveraged position while the bot has itself determined account
+        # or exchange connectivity data is unreliable.
+        if self._network_outage_active():
             return {
                 "success": False,
-                "reason": "strategy scope is disabled by performance review",
+                "reason": "network outage cooldown active",
+            }
+        if self._entry_runtime_blocked({"symbol": symbol, "timeframe": timeframe}, scope):
+            return {
+                "success": False,
+                "reason": "entry blocked: stale account data or disabled scope",
             }
         if side not in {"long", "short"}:
             return {"success": False, "reason": "side must be long or short"}
@@ -587,13 +626,21 @@ class LiveTradingLoop:
     async def _scan_due_timeframes_once(self):
         now = time.monotonic()
         pairs = self._due_scan_pairs(now)
-        await asyncio.gather(
+        processed = await asyncio.gather(
             *(
                 self._bounded_process_timeframe(symbol, timeframe)
                 for symbol, timeframe in pairs
             )
         )
-        for symbol, timeframe in pairs:
+        # Only advance the schedule for pairs actually processed this cycle.
+        # A pair can be skipped mid-gather (_bounded_process_timeframe
+        # short-circuits if a network outage is flagged by a sibling task
+        # while this one was still queued behind the semaphore); advancing
+        # its due-time regardless would permanently skip the candle that was
+        # due this cycle instead of retrying it once the outage clears.
+        for (symbol, timeframe), was_processed in zip(pairs, processed):
+            if not was_processed:
+                continue
             self._next_scan_due[self._scan_key(symbol, timeframe)] = (
                 self._next_candle_scan_due(
                     timeframe,
@@ -626,11 +673,12 @@ class LiveTradingLoop:
         self,
         symbol: str,
         timeframe: str,
-    ) -> None:
+    ) -> bool:
         if self._network_outage_active():
-            return
+            return False
         async with self._market_data_semaphore:
             await self._process_timeframe(symbol, timeframe)
+        return True
 
     async def _process_timeframe(self, symbol: str, timeframe: str):
         try:
@@ -653,9 +701,14 @@ class LiveTradingLoop:
         timeframe: str,
     ) -> pd.DataFrame:
         limit = settings.min_ohlcv_candles + 1
-        attempts = (
-            settings.scalp_rest_freshness_attempts if timeframe in {"1m", "3m"} else 1
-        )
+        # Freshness verification/retry applies to every timeframe, not just
+        # 1m/3m scalp: without it, a candle the exchange publishes late at a
+        # scan boundary is silently treated as fresh, deduped as an
+        # already-seen candle by _process_market_frame, and never retried -
+        # that hour's/day's trade evaluation is then permanently skipped.
+        # Reuses the scalp-tuned retry budget (small, bounded cost) rather
+        # than adding a parallel set of settings for the same mechanism.
+        attempts = settings.scalp_rest_freshness_attempts
         frame = pd.DataFrame()
         for attempt in range(1, attempts + 1):
             frame = await self.client.fetch_ohlcv(
@@ -663,7 +716,7 @@ class LiveTradingLoop:
                 timeframe,
                 limit=limit,
             )
-            if timeframe not in {"1m", "3m"} or len(frame) < 2:
+            if len(frame) < 2:
                 return frame
             candle_timestamp = pd.Timestamp(frame.index[-2])
             expected_timestamp = self._latest_expected_closed_candle_timestamp(
@@ -680,7 +733,7 @@ class LiveTradingLoop:
                     {"timestamp": candle_timestamp, "timeframe": timeframe}
                 )
                 logger.info(
-                    "REST scalp candle stale for {} {}: {:.2f}s; refetching ({}/{})",
+                    "REST candle stale for {} {}: {:.2f}s; refetching ({}/{})",
                     symbol,
                     timeframe,
                     latency,

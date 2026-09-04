@@ -1,13 +1,16 @@
 import pytest
 
-from src.main import parse_args
+from src.config import settings
+from src.main import _apply_cli_symbol_timeframe_override, parse_args
 
 
 def test_parse_args_defaults():
     args = parse_args([])
     assert args.mode == "trade"
-    assert args.symbol == "BTCUSDT"
-    assert args.timeframe == "1h"
+    # None (not a default symbol/timeframe) means "no CLI restriction" -
+    # trade mode falls back to every symbol/timeframe from settings.
+    assert args.symbol is None
+    assert args.timeframe is None
     assert args.limit == 500
 
 
@@ -123,3 +126,39 @@ def test_parse_args_history_options():
     assert args.history_symbol == "ETHUSDT"
     assert args.history_format == "csv"
     assert args.history_output == "history.csv"
+
+
+def test_cli_symbol_timeframe_override_restricts_settings(monkeypatch):
+    monkeypatch.setattr(settings, "symbols", "BTCUSDT,ETHUSDT,BNBUSDT")
+    monkeypatch.setattr(settings, "timeframes", "1m,3m,5m,15m,30m,1h,4h,1d")
+
+    _apply_cli_symbol_timeframe_override("ethusdt", "15m")
+
+    assert settings.symbols_list == ["ETHUSDT"]
+    assert settings.timeframes_list == ["15m"]
+
+
+def test_cli_symbol_timeframe_override_noop_when_not_passed(monkeypatch):
+    monkeypatch.setattr(settings, "symbols", "BTCUSDT,ETHUSDT,BNBUSDT")
+    monkeypatch.setattr(settings, "timeframes", "1m,3m,5m,15m,30m,1h,4h,1d")
+
+    _apply_cli_symbol_timeframe_override(None, None)
+
+    assert settings.symbols_list == ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+    assert settings.timeframes_list == [
+        "1m",
+        "3m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h",
+        "1d",
+    ]
+
+
+def test_cli_symbol_timeframe_override_rejects_invalid_timeframe(monkeypatch):
+    monkeypatch.setattr(settings, "timeframes", "1h")
+
+    with pytest.raises(ValueError):
+        _apply_cli_symbol_timeframe_override(None, "99x")

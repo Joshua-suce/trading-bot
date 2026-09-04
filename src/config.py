@@ -481,6 +481,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "STRATEGY_MIN_ATR_PCT must be lower than STRATEGY_MAX_ATR_PCT"
             )
+        if (
+            self.strategy_breakout_min_close_location
+            >= self.strategy_breakout_max_close_location
+        ):
+            # With min >= max, quality_gate's min <= close_location <= max
+            # check (and its mirrored short-side range) is unsatisfiable for
+            # every possible candle, silently rejecting every breakout
+            # signal regardless of price action even though the strategy
+            # stays listed as enabled.
+            raise ValueError(
+                "STRATEGY_BREAKOUT_MIN_CLOSE_LOCATION must be lower than "
+                "STRATEGY_BREAKOUT_MAX_CLOSE_LOCATION"
+            )
         minimum_training_rows = (
             self.min_ohlcv_candles + self.prediction_horizon + self.feature_lookback + 1
         )
