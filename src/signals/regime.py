@@ -16,8 +16,20 @@ class MarketRegime:
     volume_ratio: float
 
 
+_REQUIRED_COLUMNS = ("close", "adx", "bb_upper", "bb_lower", "ema_50", "ema_200")
+
+
 def detect_regime(df: pd.DataFrame) -> MarketRegime:  # noqa: C901
-    if df.empty:
+    # Missing (not just NaN - see the safe_float comment below for that
+    # case) indicator columns must not be silently read as "the indicator
+    # value is 0". adx=0 and bb_upper=bb_lower=0 (zero-width bands) both
+    # independently satisfy the "squeeze" branch below, so a frame that's
+    # simply missing these columns (e.g. a test or caller passing a
+    # partial indicator set) would be classified as a real market
+    # condition - "squeeze" - instead of "we don't have enough data to
+    # classify this", silently gating every strategy's entries against a
+    # market state that was never actually observed.
+    if df.empty or not all(column in df.columns for column in _REQUIRED_COLUMNS):
         return MarketRegime(0, "unknown", 0.0, 0.0, 0.0, 0.0, 0.0)
 
     last = df.iloc[-1]
@@ -91,8 +103,25 @@ def detect_regime(df: pd.DataFrame) -> MarketRegime:  # noqa: C901
     )
 
 
+_ALL_STRATEGIES = [
+    "trend",
+    "range",
+    "breakout",
+    "reversal",
+    "countertrend",
+    "scalp",
+    "transition",
+]
+
+
 def regime_appropriate_strategies(regime: MarketRegime) -> list[str]:
     match regime.market_type:
+        case "unknown":
+            # Insufficient data to classify (see detect_regime's required-
+            # column check) is not itself a market condition to restrict
+            # against - unlike the specific regimes below, there is no
+            # basis here to exclude any strategy, so don't.
+            return list(_ALL_STRATEGIES)
         case "trending":
             if regime.trend_direction != 0:
                 # Pullback entries are generated under the "trend" strategy
@@ -119,4 +148,7 @@ def regime_appropriate_strategies(regime: MarketRegime) -> list[str]:
         case "transition":
             return ["transition", "trend", "breakout"]
         case _:
-            return ["trend", "range"]
+            # Defensive catch-all for a market_type detect_regime doesn't
+            # actually produce; treated the same as "unknown" above - no
+            # basis to restrict, so don't.
+            return list(_ALL_STRATEGIES)

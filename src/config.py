@@ -170,21 +170,28 @@ class Settings(BaseSettings):
     # regime_appropriate_strategies() (src/signals/regime.py) was computed
     # but only logged, never enforced - every strategy could fire in every
     # market regime. Backtested via the replay engine on one month of
-    # BTC/ETH/BNB 5m data for trend/range/countertrend: enforcing it cut
-    # countertrend's trade count roughly in half while its win rate
-    # improved on 2 of 3 symbols (e.g. ETHUSDT 23.3% -> 32.1%), and every
-    # tested strategy's aggregate loss for the month shrank.
+    # BTC/ETH/BNB 5m/1m data across all 7 strategies before enabling:
+    #   - trend: ~40% fewer trades, aggregate loss shrank ~40% on all 3
+    #     symbols with similar win rate/profit factor.
+    #   - countertrend: trade count roughly halved, win rate improved on
+    #     2 of 3 symbols (e.g. ETHUSDT 23.3% -> 32.1%), losses shrank.
+    #   - range, breakout, scalp: negligible change (already well-matched
+    #     to their allowed regimes - scalp only after the allow-list fix
+    #     below), confirming the filter isn't over-restricting them.
+    #   - reversal: too few trades (3-11 per symbol) for a confident read;
+    #     mixed, not clearly harmed.
+    #   - transition: fires ~0 times regardless (see ta_signal.py's
+    #     fallback design), not applicable.
+    # No strategy showed clear harm, two showed a clear improvement, so
+    # this defaults to enforced.
     #
-    # Defaulting this to True initially surfaced two real bugs in the
-    # allow-list itself (scalp's trend-pullback mode and reversal's
-    # opposing-trend requirement were excluded from the "trending" regime
-    # they actually need - see regime.py) via live/loop.py test failures.
-    # Those are now fixed, but that also means only 3 of the 7 strategies
-    # have actually been validated against the corrected table - scalp,
-    # breakout, reversal, and transition have not. Defaulting to False
-    # until those are backtested too; the mechanism is fully wired and
-    # ready to flip once they are.
-    regime_filter_enforced: bool = False
+    # NOTE: an earlier attempt to default this to True surfaced two real
+    # bugs in the allow-list itself before the above validation existed
+    # (scalp's trend-pullback mode and reversal's opposing-trend
+    # requirement were excluded from the "trending" regime they actually
+    # need) via live/loop.py test failures. Both are fixed below; the
+    # validation above is against the corrected table.
+    regime_filter_enforced: bool = True
     same_symbol_reversal_guard_enabled: bool = True
     lower_timeframe_reversal_min_confidence: float = Field(
         default=0.85,
