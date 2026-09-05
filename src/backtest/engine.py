@@ -169,8 +169,14 @@ class BacktestEngine:
                         )
                         equity -= entry_fee
 
-            # In position — check for exit (SL/TP/reversal)
-            else:
+            # In position — check for exit (SL/TP/reversal). Deliberately
+            # `if`, not `elif`/`else`: a position opened above in this same
+            # iteration must still have its exposure to next_row (the very
+            # next bar) checked here, or that bar's high/low is skipped
+            # entirely - a stop-loss (or take-profit) breach on the first
+            # bar after entry would never be detected, silently turning a
+            # real loss (or win) into whatever happens to occur bars later.
+            if in_position:
                 exit_reason = None
                 exit_price = None
                 next_close = next_row["close"]
