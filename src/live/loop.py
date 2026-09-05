@@ -1972,9 +1972,24 @@ class LiveTradingLoop:
                     continue
 
                 if strategy not in allowed_by_regime:
+                    reason = (
+                        f"{regime.market_type} regime does not permit {strategy} "
+                        f"(allowed: {', '.join(allowed_by_regime) or 'none'})"
+                    )
+                    if settings.regime_filter_enforced:
+                        logger.debug(f"Signal skipped for {scope} {strategy}: {reason}")
+                        self._record_signal_observation(
+                            candle,
+                            signal,
+                            strategy=strategy,
+                            minimum_confidence=minimum_confidence,
+                            decision="regime_rejected",
+                            reason=reason,
+                        )
+                        continue
                     logger.debug(
-                        f"Regime {regime.market_type} does not prefer {strategy} "
-                        f"for {scope}; evaluating independent strategy rules"
+                        f"{reason}; evaluating independent strategy rules "
+                        f"(regime_filter_enforced=False)"
                     )
 
                 position_key = self.pos_mgr.trades.position_key(

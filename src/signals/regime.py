@@ -98,7 +98,17 @@ def regime_appropriate_strategies(regime: MarketRegime) -> list[str]:
                 # Pullback entries are generated under the "trend" strategy
                 # (TrendStrategy.pullback_signal); there is no separate
                 # "pullback" strategy name to allow-list here.
-                return ["trend", "breakout", "transition"]
+                #
+                # "scalp" and "reversal" belong here too, not just under
+                # "ranging"/"volatile" below: ScalpStrategy's trend-pullback
+                # mode requires adx>=16 (squarely a trending condition, its
+                # primary use case - excluding it here disabled that mode
+                # whenever it could actually fire), and
+                # ReversalStrategy.structure_score requires trend_regime ==
+                # -direction with adx>=22 - an established, opposing trend,
+                # which is a "trending" condition, not a "ranging" one where
+                # trend_regime is typically 0 and that check can't pass.
+                return ["trend", "breakout", "transition", "scalp", "reversal"]
             return ["range", "transition"]
         case "ranging":
             return ["range", "reversal", "scalp"]

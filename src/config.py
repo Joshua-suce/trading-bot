@@ -167,6 +167,24 @@ class Settings(BaseSettings):
     require_signal_confluence: bool = False
     strategy_quality_min_score: float = Field(default=0.68, ge=0.0, le=1.0)
     strategy_quality_gate_enforced: bool = True
+    # regime_appropriate_strategies() (src/signals/regime.py) was computed
+    # but only logged, never enforced - every strategy could fire in every
+    # market regime. Backtested via the replay engine on one month of
+    # BTC/ETH/BNB 5m data for trend/range/countertrend: enforcing it cut
+    # countertrend's trade count roughly in half while its win rate
+    # improved on 2 of 3 symbols (e.g. ETHUSDT 23.3% -> 32.1%), and every
+    # tested strategy's aggregate loss for the month shrank.
+    #
+    # Defaulting this to True initially surfaced two real bugs in the
+    # allow-list itself (scalp's trend-pullback mode and reversal's
+    # opposing-trend requirement were excluded from the "trending" regime
+    # they actually need - see regime.py) via live/loop.py test failures.
+    # Those are now fixed, but that also means only 3 of the 7 strategies
+    # have actually been validated against the corrected table - scalp,
+    # breakout, reversal, and transition have not. Defaulting to False
+    # until those are backtested too; the mechanism is fully wired and
+    # ready to flip once they are.
+    regime_filter_enforced: bool = False
     same_symbol_reversal_guard_enabled: bool = True
     lower_timeframe_reversal_min_confidence: float = Field(
         default=0.85,

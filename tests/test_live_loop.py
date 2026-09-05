@@ -1300,13 +1300,10 @@ async def test_strategy_specific_disabled_scope_does_not_block_other_strategies(
     assert decisions["trend"] == "accepted"
 
 
-@pytest.mark.asyncio
-async def test_independent_strategy_signal_is_not_hard_blocked_by_regime(
-    tmp_path,
-):
+def _regime_mismatch_bot(tmp_path, *, db_name: str) -> LiveTradingLoop:
     from src.audit import AuditStore
 
-    audit = AuditStore(tmp_path / "regime-advisory.db")
+    audit = AuditStore(tmp_path / db_name)
     bot = LiveTradingLoop(audit_store=audit)
 
     class Aggregator:
@@ -1325,6 +1322,39 @@ async def test_independent_strategy_signal_is_not_hard_blocked_by_regime(
         return_value=StrategyQuality(True, 0.90, "range confirmed", {})
     )
     bot.pos_mgr.enter_long = AsyncMock(return_value=True)
+    return bot
+
+
+REGIME_MISMATCH_DF_IND = pd.DataFrame(
+    {
+        "close": [100.0],
+        "atr": [2.0],
+        "ema_50": [98.0],
+        "ema_200": [95.0],
+        "ema_50_slope": [0.01],
+        "plus_di": [28.0],
+        "minus_di": [12.0],
+        "adx": [30.0],
+        "bb_upper": [110.0],
+        "bb_lower": [90.0],
+        "vol_ratio": [1.2],
+    }
+)
+
+
+@pytest.mark.asyncio
+async def test_mismatched_regime_signal_is_rejected_when_regime_filter_enforced(
+    tmp_path, monkeypatch
+):
+    # A "range" signal fires while the regime detector reads a strong,
+    # clearly-directional trend (adx=30, close>ema_50>ema_200) - range is
+    # not in regime_appropriate_strategies() for a trending market. With
+    # regime_filter_enforced on, this must be rejected before quality-gate
+    # evaluation or entry, not just logged and let through. (Defaults to
+    # off pending backtest validation for scalp/breakout/reversal/
+    # transition - see config.py - so this test sets it explicitly.)
+    monkeypatch.setattr(live_loop_module.settings, "regime_filter_enforced", True)
+    bot = _regime_mismatch_bot(tmp_path, db_name="regime-enforced.db")
 
     await bot._execute_trade(
         {
@@ -1333,21 +1363,31 @@ async def test_independent_strategy_signal_is_not_hard_blocked_by_regime(
             "close": 100.0,
             "timestamp": pd.Timestamp("2026-06-20T11:00:00Z"),
         },
-        df_ind=pd.DataFrame(
-            {
-                "close": [100.0],
-                "atr": [2.0],
-                "ema_50": [98.0],
-                "ema_200": [95.0],
-                "ema_50_slope": [0.01],
-                "plus_di": [28.0],
-                "minus_di": [12.0],
-                "adx": [30.0],
-                "bb_upper": [110.0],
-                "bb_lower": [90.0],
-                "vol_ratio": [1.2],
-            }
-        ),
+        df_ind=REGIME_MISMATCH_DF_IND,
+    )
+
+    bot.strategy_quality.evaluate.assert_not_called()
+    bot.pos_mgr.enter_long.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mismatched_regime_signal_is_advisory_when_filter_disabled(
+    tmp_path, monkeypatch
+):
+    # Same setup as above, but with the enforcement toggle off: this
+    # preserves the old advisory-only behavior (logged, not blocked) for
+    # anyone who needs to revert it.
+    monkeypatch.setattr(live_loop_module.settings, "regime_filter_enforced", False)
+    bot = _regime_mismatch_bot(tmp_path, db_name="regime-advisory.db")
+
+    await bot._execute_trade(
+        {
+            "symbol": "BTCUSDT",
+            "timeframe": "30m",
+            "close": 100.0,
+            "timestamp": pd.Timestamp("2026-06-20T11:00:00Z"),
+        },
+        df_ind=REGIME_MISMATCH_DF_IND,
     )
 
     bot.strategy_quality.evaluate.assert_called_once()

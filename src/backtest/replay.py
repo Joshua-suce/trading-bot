@@ -13,6 +13,7 @@ from src.signals.decision_policy import (
 )
 from src.signals.invocation import generate_with_context
 from src.signals.quality_gate import StrategyQualityGate
+from src.signals.regime import detect_regime, regime_appropriate_strategies
 
 
 @dataclass(frozen=True)
@@ -60,12 +61,14 @@ class DecisionReplayEngine:
         timeframe: str,
         higher_timeframe_df: pd.DataFrame | None = None,
         strategy: str | None = None,
+        enforce_regime_filter: bool = False,
     ) -> ReplayResult:
         observations = self.evaluate(
             df,
             timeframe=timeframe,
             higher_timeframe_df=higher_timeframe_df,
             strategy=strategy,
+            enforce_regime_filter=enforce_regime_filter,
         )
         accepted = {
             observation.timestamp: observation
@@ -100,6 +103,13 @@ class DecisionReplayEngine:
         timeframe: str,
         higher_timeframe_df: pd.DataFrame | None = None,
         strategy: str | None = None,
+        # Deliberately opt-in, not defaulted from settings.regime_filter_enforced
+        # (which live/loop.py does read by default): this engine is also
+        # exercised with minimal synthetic frames that don't carry a full
+        # indicator set, and detect_regime() would silently classify those
+        # as e.g. "squeeze" and filter out signals the caller never meant
+        # to have regime-checked. Pass True explicitly to test this filter.
+        enforce_regime_filter: bool = False,
     ) -> list[ReplayObservation]:
         if len(df) <= self.min_history:
             return []
@@ -144,6 +154,11 @@ class DecisionReplayEngine:
             )
             if strategy is not None:
                 signals = [signal for signal in signals if signal.strategy == strategy]
+            if enforce_regime_filter:
+                allowed = set(
+                    regime_appropriate_strategies(detect_regime(window_indicators))
+                )
+                signals = [s for s in signals if s.strategy in allowed]
             if not signals:
                 continue
             signal = max(signals, key=lambda s: s.confidence)
