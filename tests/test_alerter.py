@@ -189,6 +189,41 @@ async def test_telegram_commands_require_authorized_chat_and_user():
 
 
 @pytest.mark.asyncio
+async def test_permanent_http_status_disables_channel_without_further_retries(
+    monkeypatch,
+):
+    import httpx as httpx_module
+
+    class UnauthorizedResponse:
+        def raise_for_status(self):
+            request = httpx_module.Request("POST", "https://api.telegram.org/x")
+            response = httpx_module.Response(401, request=request)
+            raise httpx_module.HTTPStatusError(
+                "401 Unauthorized", request=request, response=response
+            )
+
+    class UnauthorizedClient(FakeAsyncClient):
+        async def post(self, url, json, timeout=None):
+            self.posts.append((url, json, self.timeout))
+            return UnauthorizedResponse()
+
+    UnauthorizedClient.posts = []
+    monkeypatch.setattr("src.monitoring.alerter.httpx.AsyncClient", UnauthorizedClient)
+    alerter = Alerter(telegram_token="secret-token", telegram_chat_id="chat-1")
+
+    first = await alerter.send("first alert")
+    second = await alerter.send("second alert")
+
+    assert first is False
+    assert second is False
+    # One POST attempt total: no in-call retries after a permanent (401)
+    # failure, and the second send() skips the network call entirely
+    # because the channel is now disabled.
+    assert len(UnauthorizedClient.posts) == 1
+    assert "Telegram" in alerter._disabled_channels
+
+
+@pytest.mark.asyncio
 async def test_telegram_api_level_rejection_is_delivery_failure(monkeypatch):
     class RejectingClient(FakeAsyncClient):
         async def post(self, url, json, timeout=None):

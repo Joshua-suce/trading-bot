@@ -45,6 +45,12 @@ class Alerter:
         self.delivery_successes = 0
         self.delivery_failures = 0
         self.dropped_messages = 0
+        # Channels that returned a permanent (non-retryable) HTTP status -
+        # bad token/webhook, not a network blip. Retrying those wastes 3
+        # attempts with backoff on every single alert for the entire
+        # process lifetime, since a fixed .env doesn't get reloaded until
+        # restart. See _request_with_retries.
+        self._disabled_channels: set[str] = set()
 
     @property
     def telegram_enabled(self) -> bool:
@@ -199,6 +205,12 @@ class Alerter:
             is not None
         )
 
+    # HTTP statuses where retrying the identical request can never succeed
+    # (bad/expired credentials, malformed payload, gone/deleted webhook) -
+    # distinct from 429 (rate limit) and 5xx (server-side), which are
+    # genuinely transient and worth the existing retry/backoff.
+    _PERMANENT_HTTP_STATUSES = frozenset({400, 401, 403, 404, 405, 410, 422})
+
     async def _request_with_retries(
         self,
         channel: str,
@@ -208,6 +220,8 @@ class Alerter:
         *,
         timeout: float | None = None,
     ) -> httpx.Response | None:
+        if channel in self._disabled_channels:
+            return None
         last_error = ""
         for attempt in range(1, attempts + 1):
             try:
@@ -224,6 +238,25 @@ class Alerter:
                         )
                 response.raise_for_status()
                 return response
+            except httpx.HTTPStatusError as exc:
+                last_error = self._redact(str(exc))
+                logger.warning(
+                    f"{channel} alert failed attempt {attempt}/{attempts}: "
+                    f"{last_error}"
+                )
+                if exc.response.status_code in self._PERMANENT_HTTP_STATUSES:
+                    self._disabled_channels.add(channel)
+                    logger.error(
+                        f"{channel} alert delivery disabled for the rest of "
+                        f"this process: HTTP {exc.response.status_code} is a "
+                        "permanent failure (bad credentials/webhook, not a "
+                        "network blip) - retrying would never succeed. Fix "
+                        "the configured token/webhook and restart to "
+                        "re-enable."
+                    )
+                    return None
+                if attempt < attempts:
+                    await asyncio.sleep(0.5 * attempt)
             except Exception as exc:
                 last_error = self._redact(str(exc))
                 logger.warning(
