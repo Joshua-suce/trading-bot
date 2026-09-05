@@ -103,6 +103,12 @@ class LiveTradingLoop:
         self._scalp_peak_prices: dict[str, float] = {}
         self._scalp_initial_risk: dict[str, float] = {}
         self._scalp_partial_completed: set[str] = set()
+        # Break-even/trailing state for non-scalp (swing) positions - see
+        # _manage_swing_position. Previously these strategies had no
+        # analogous mechanism at all: a fixed stop/target set at entry,
+        # never adjusted until stop, target, or max-hold timeout.
+        self._swing_peak_prices: dict[str, float] = {}
+        self._swing_initial_risk: dict[str, float] = {}
         self._stopped = False
         self._heartbeat = RuntimeHeartbeat(settings.runtime_heartbeat_path)
         self._heartbeat_task: asyncio.Task | None = None
@@ -1061,6 +1067,12 @@ class LiveTradingLoop:
             if key not in active:
                 del self._scalp_initial_risk[key]
         self._scalp_partial_completed.intersection_update(active)
+        for key in list(self._swing_peak_prices):
+            if key not in active:
+                del self._swing_peak_prices[key]
+        for key in list(self._swing_initial_risk):
+            if key not in active:
+                del self._swing_initial_risk[key]
 
     async def _manage_scalp_positions_if_due(self) -> None:
         now = time.monotonic()
@@ -1076,13 +1088,30 @@ class LiveTradingLoop:
             for key, trade in list(self.pos_mgr.open_trades.items())
             if trade.strategy == "scalp"
         ]
-        stale_positions = [
+        non_scalp_positions = [
             (key, trade)
             for key, trade in list(self.pos_mgr.open_trades.items())
-            if trade.strategy != "scalp" and self._strategy_max_hold_reached(trade)
+            if trade.strategy != "scalp"
+        ]
+        stale_keys = {
+            key
+            for key, trade in non_scalp_positions
+            if self._strategy_max_hold_reached(trade)
+        }
+        stale_positions = [
+            (key, trade) for key, trade in non_scalp_positions if key in stale_keys
+        ]
+        swing_positions = [
+            (key, trade)
+            for key, trade in non_scalp_positions
+            if key not in stale_keys
         ]
         await asyncio.gather(
             *(self._manage_scalp_position(key, trade) for key, trade in positions),
+            *(
+                self._manage_swing_position(key, trade)
+                for key, trade in swing_positions
+            ),
             *(
                 self._exit_position_safely(key, "maximum hold")
                 for key, _ in stale_positions
@@ -1211,6 +1240,128 @@ class LiveTradingLoop:
                 position_key,
                 self._describe_exception(exc),
             )
+
+    async def _manage_swing_position(self, position_key: str, trade) -> None:
+        """Break-even/trailing management for non-scalp strategies.
+
+        Mirrors _manage_scalp_position's break-even and trailing logic
+        (minus partial-profit-taking, which stays scalp-only) so a trend/
+        range/breakout/reversal/countertrend/transition trade that moves
+        meaningfully favorable and then reverses captures some of that
+        move instead of riding a static, never-adjusted stop all the way
+        back to a full loss.
+        """
+        try:
+            ticker = await self.client.fetch_ticker(trade.symbol)
+            price = float(ticker.get("mark") or ticker.get("last") or 0)
+            if price <= 0:
+                return
+            correlation_id = self.pos_mgr.trades.trade_correlation_ids.get(
+                position_key,
+                "",
+            )
+            stop_loss, take_profit = self.audit_store.get_trade_protection_levels(
+                correlation_id
+            )
+            if stop_loss is None:
+                return
+            initial_risk = self._swing_initial_risk.setdefault(
+                position_key,
+                abs(trade.entry_price - float(stop_loss)),
+            )
+            if initial_risk <= 0:
+                return
+            favorable_move = (
+                price - trade.entry_price
+                if trade.side == "long"
+                else trade.entry_price - price
+            )
+            favorable_r = favorable_move / initial_risk
+            peak = self._swing_peak_prices.get(position_key, trade.entry_price)
+            peak = max(peak, price) if trade.side == "long" else min(peak, price)
+            self._swing_peak_prices[position_key] = peak
+
+            new_stop = self._responsive_swing_stop(
+                trade,
+                price,
+                peak,
+                float(stop_loss),
+                initial_risk,
+                favorable_r,
+            )
+            if new_stop is None:
+                return
+            replacement_id = await self.pos_mgr.protection.replace_stop(
+                position_key,
+                trade,
+                new_stop,
+            )
+            if not replacement_id:
+                return
+            target_id = self.pos_mgr.protection.active_tps.get(position_key)
+            self.audit_store.update_open_trade_state(
+                correlation_id,
+                quantity=trade.quantity,
+                stop_loss=new_stop,
+                take_profit=take_profit,
+                stop_order_id=replacement_id,
+                take_profit_order_id=target_id,
+            )
+            self.audit_store.safe_record_event(
+                "swing_stop_advanced",
+                "Swing protective stop advanced",
+                symbol=trade.symbol,
+                mode=self.mode,
+                correlation_id=correlation_id or None,
+                payload={
+                    "position_key": position_key,
+                    "strategy": trade.strategy,
+                    "price": price,
+                    "stop_loss": new_stop,
+                    "favorable_r": favorable_r,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Swing position management failed for {}: {}",
+                position_key,
+                self._describe_exception(exc),
+            )
+
+    @staticmethod
+    def _responsive_swing_stop(
+        trade,
+        price: float,
+        peak: float,
+        current_stop: float,
+        initial_risk: float,
+        favorable_r: float,
+    ) -> float | None:
+        candidates = [current_stop]
+        if favorable_r >= settings.swing_break_even_trigger_r:
+            offset = trade.entry_price * settings.swing_break_even_offset_bps / 10_000
+            candidates.append(
+                trade.entry_price + offset
+                if trade.side == "long"
+                else trade.entry_price - offset
+            )
+        if favorable_r >= settings.swing_trailing_trigger_r:
+            distance = initial_risk * settings.swing_trailing_distance_r
+            candidates.append(
+                peak - distance if trade.side == "long" else peak + distance
+            )
+        proposed = max(candidates) if trade.side == "long" else min(candidates)
+        improvement = (
+            proposed - current_stop if trade.side == "long" else current_stop - proposed
+        )
+        minimum = price * settings.swing_stop_update_min_bps / 10_000
+        if improvement < minimum:
+            return None
+        if (trade.side == "long" and proposed >= price) or (
+            trade.side == "short" and proposed <= price
+        ):
+            return None
+        return round(proposed, 8)
 
     def _scalp_max_hold_reached(self, trade) -> bool:
         timestamp = trade.timestamp

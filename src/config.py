@@ -275,6 +275,20 @@ class Settings(BaseSettings):
     scalp_partial_profit_enabled: bool = True
     scalp_partial_profit_trigger_r: float = Field(default=1.0, ge=0.25, le=10.0)
     scalp_partial_profit_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+
+    # Swing strategies (trend/range/breakout/reversal/countertrend/transition)
+    # had no analogous position management at all: a fixed stop and target
+    # set at entry, never adjusted, unlike scalp's break-even/trailing/
+    # partial-profit handling in live/loop.py's _manage_scalp_position.
+    # A trade that goes meaningfully favorable and then reverses all the way
+    # back captures none of that unrealized move. These give swing trades
+    # the same class of protection scalp already has, at slightly wider
+    # triggers reflecting their larger stop distances and longer hold times.
+    swing_break_even_trigger_r: float = Field(default=0.75, ge=0.25, le=5.0)
+    swing_break_even_offset_bps: float = Field(default=5.0, ge=0.0, le=100.0)
+    swing_trailing_trigger_r: float = Field(default=1.25, ge=0.5, le=10.0)
+    swing_trailing_distance_r: float = Field(default=0.75, ge=0.1, le=5.0)
+    swing_stop_update_min_bps: float = Field(default=2.0, ge=0.1, le=100.0)
     performance_governance_window_days: int = Field(default=30, ge=7, le=365)
     walk_forward_min_trades: int = Field(default=30, ge=5, le=10000)
     walk_forward_max_drawdown_pct: float = Field(default=15.0, gt=0.0, le=100.0)

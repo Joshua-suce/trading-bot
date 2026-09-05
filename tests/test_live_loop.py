@@ -311,6 +311,76 @@ async def test_scalp_max_hold_exits_position(monkeypatch):
     )
 
 
+def test_responsive_swing_stop_advances_to_break_even(monkeypatch):
+    monkeypatch.setattr(live_loop_module.settings, "swing_break_even_offset_bps", 5.0)
+    trade = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="5m",
+        strategy="trend",
+    )
+
+    stop = LiveTradingLoop._responsive_swing_stop(
+        trade,
+        price=101.0,
+        peak=101.0,
+        current_stop=99.0,
+        initial_risk=1.0,
+        favorable_r=1.0,
+    )
+
+    assert stop == 100.05
+
+
+@pytest.mark.asyncio
+async def test_manage_scalp_positions_if_due_also_manages_swing_positions():
+    bot = LiveTradingLoop()
+    now = datetime.now(timezone.utc)
+    bot.pos_mgr.open_trades["BTCUSDT:1m:scalp"] = TradeRecord(
+        symbol="BTCUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=now,
+        timeframe="1m",
+        strategy="scalp",
+    )
+    bot.pos_mgr.open_trades["ETHUSDT:5m:trend"] = TradeRecord(
+        symbol="ETHUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=now,
+        timeframe="5m",
+        strategy="trend",
+    )
+    bot.pos_mgr.open_trades["BNBUSDT:5m:trend"] = TradeRecord(
+        symbol="BNBUSDT",
+        side="long",
+        entry_price=100.0,
+        quantity=1.0,
+        timestamp=now - timedelta(hours=6),
+        timeframe="5m",
+        strategy="trend",
+    )
+    bot._manage_scalp_position = AsyncMock()
+    bot._manage_swing_position = AsyncMock()
+    bot._exit_position_safely = AsyncMock(return_value=True)
+
+    await bot._manage_scalp_positions_if_due()
+
+    bot._manage_scalp_position.assert_awaited_once()
+    assert bot._manage_scalp_position.await_args.args[0] == "BTCUSDT:1m:scalp"
+    bot._manage_swing_position.assert_awaited_once()
+    assert bot._manage_swing_position.await_args.args[0] == "ETHUSDT:5m:trend"
+    bot._exit_position_safely.assert_awaited_once_with(
+        "BNBUSDT:5m:trend", "maximum hold"
+    )
+
+
 def test_non_scalp_holding_period_is_timeframe_aware():
     bot = LiveTradingLoop()
     now = datetime.now(timezone.utc)
