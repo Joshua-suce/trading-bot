@@ -455,3 +455,148 @@ class TestFinalizeTradeLeg:
             notify_trade_completed=notify,
         )
         reconciler.audit_store.record_closed_trade.assert_not_called()
+
+
+class TestRecreateProtectionForTrade:
+    @pytest.mark.asyncio
+    async def test_recreate_cancels_previously_tracked_orders_before_overwriting(
+        self, reconciler
+    ):
+        # A sibling same-symbol scope's exit reducing the shared exchange
+        # position can invalidate just ONE leg (e.g. only the take-profit).
+        # verify_protective_orders() still routes both legs through this
+        # recreate path - the previously-tracked, still-valid order must be
+        # cancelled, not left resting live and untracked on the exchange.
+        trade = MagicMock(symbol="ETHUSDT", side="long", quantity=0.5)
+        reconciler.trades.open_trades = {"ETHUSDT:4h:trend": trade}
+        reconciler.trades.trade_correlation_ids = {"ETHUSDT:4h:trend": "corr-1"}
+        reconciler._exchange_reports_position_closed = AsyncMock(return_value=False)
+        reconciler.audit_store.get_trade_protection_levels = MagicMock(
+            return_value=(95.0, 110.0)
+        )
+        reconciler.protection.active_stops = {"ETHUSDT:4h:trend": "old-sl"}
+        reconciler.protection.active_tps = {"ETHUSDT:4h:trend": "old-tp"}
+        reconciler.protection.place_entry_protection = AsyncMock(
+            return_value=({"id": "new-sl"}, {"id": "new-tp"})
+        )
+
+        result = await reconciler._recreate_protection_for_trade("ETHUSDT:4h:trend")
+
+        assert result is True
+        reconciler.orders.cancel_order.assert_any_call(
+            "ETHUSDT", "old-sl", conditional=True
+        )
+        reconciler.orders.cancel_order.assert_any_call("ETHUSDT", "old-tp")
+        assert reconciler.protection.active_stops["ETHUSDT:4h:trend"] == "new-sl"
+        assert reconciler.protection.active_tps["ETHUSDT:4h:trend"] == "new-tp"
+
+    @pytest.mark.asyncio
+    async def test_recreate_does_not_cancel_when_no_previous_order_tracked(
+        self, reconciler
+    ):
+        trade = MagicMock(symbol="ETHUSDT", side="long", quantity=0.5)
+        reconciler.trades.open_trades = {"ETHUSDT:4h:trend": trade}
+        reconciler.trades.trade_correlation_ids = {"ETHUSDT:4h:trend": "corr-1"}
+        reconciler._exchange_reports_position_closed = AsyncMock(return_value=False)
+        reconciler.audit_store.get_trade_protection_levels = MagicMock(
+            return_value=(95.0, 110.0)
+        )
+        reconciler.protection.active_stops = {}
+        reconciler.protection.active_tps = {}
+        reconciler.protection.place_entry_protection = AsyncMock(
+            return_value=({"id": "new-sl"}, {"id": "new-tp"})
+        )
+
+        await reconciler._recreate_protection_for_trade("ETHUSDT:4h:trend")
+
+        reconciler.orders.cancel_order.assert_not_called()
+
+
+class TestCloseUnmanagedPosition:
+    @pytest.mark.asyncio
+    async def test_successful_close_is_fee_audited(self, reconciler):
+        # Previously the only trail for a successful forced close was a
+        # generic order_placed row indistinguishable from the bot's own
+        # strategy entries - its real fee never reached the bot's own P&L
+        # accounting.
+        reconciler.orders.cancel_all_orders = AsyncMock()
+        reconciler.orders.market_order = AsyncMock(
+            return_value={"id": "close-1", "average": 0.75}
+        )
+        reconciler._fill_resolver.order_fee = AsyncMock(return_value=0.05)
+        audited = []
+        reconciler._audit = MagicMock(
+            side_effect=lambda *args, **kwargs: audited.append((args, kwargs))
+        )
+
+        await reconciler._close_unmanaged_position(
+            {"symbol": "ADAUSDT", "size": -10.0, "side": "short", "position_side": None}
+        )
+
+        assert len(audited) == 1
+        args, kwargs = audited[0]
+        assert args[0] == "unmanaged_position_closed"
+        assert kwargs["symbol"] == "ADAUSDT"
+        assert kwargs["payload"]["fee"] == 0.05
+        assert kwargs["payload"]["quantity"] == 10.0
+        assert kwargs["payload"]["side"] == "buy"
+
+    @pytest.mark.asyncio
+    async def test_failed_close_is_not_audited_as_successful(self, reconciler):
+        reconciler.orders.cancel_all_orders = AsyncMock()
+        reconciler.orders.market_order = AsyncMock(return_value=None)
+        reconciler.orders.failure_reason = MagicMock(return_value="insufficient margin")
+        audited = []
+        reconciler._audit = MagicMock(
+            side_effect=lambda *args, **kwargs: audited.append((args, kwargs))
+        )
+
+        await reconciler._close_unmanaged_position(
+            {"symbol": "ADAUSDT", "size": 10.0, "side": "long", "position_side": None}
+        )
+
+        assert audited == []
+
+
+class TestUnmanagedPositionBlastRadius:
+    @pytest.mark.asyncio
+    async def test_unmanaged_position_degrades_only_its_own_symbol(self, reconciler):
+        # A stray position on a symbol outside settings.symbols must not
+        # halt entries on every other configured trading pair.
+        reconciler._fetch_positions_for_reconciliation = AsyncMock(return_value=[{}])
+        unmanaged = [
+            {"symbol": "ADAUSDT", "size": -10.0, "side": "short", "position_side": None}
+        ]
+        reconciler._classify_exchange_positions = MagicMock(
+            return_value=({}, unmanaged)
+        )
+        reconciler._fail_reconciliation = AsyncMock()
+
+        result = await reconciler._reconciliation_state(auto_close_unmanaged=False)
+
+        assert result is False
+        reconciler._fail_reconciliation.assert_awaited_once()
+        _, kwargs = reconciler._fail_reconciliation.call_args
+        assert kwargs.get("symbol") == "ADAUSDT"
+
+    @pytest.mark.asyncio
+    async def test_multiple_unmanaged_symbols_each_degrade_independently(
+        self, reconciler
+    ):
+        reconciler._fetch_positions_for_reconciliation = AsyncMock(return_value=[{}])
+        unmanaged = [
+            {"symbol": "ADAUSDT", "size": -10.0, "side": "short", "position_side": None},
+            {"symbol": "DOGEUSDT", "size": 5.0, "side": "long", "position_side": None},
+        ]
+        reconciler._classify_exchange_positions = MagicMock(
+            return_value=({}, unmanaged)
+        )
+        reconciler._fail_reconciliation = AsyncMock()
+
+        await reconciler._reconciliation_state(auto_close_unmanaged=False)
+
+        degraded_symbols = {
+            call.kwargs.get("symbol")
+            for call in reconciler._fail_reconciliation.await_args_list
+        }
+        assert degraded_symbols == {"ADAUSDT", "DOGEUSDT"}

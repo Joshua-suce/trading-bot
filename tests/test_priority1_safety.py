@@ -260,9 +260,15 @@ async def test_reconciliation_blocks_unmanaged_exchange_position(tmp_path):
     reconciled = await manager.reconcile_exchange_state()
 
     assert reconciled is False
-    allowed, reason = manager.audit_store.trading_allowed()
+    # A stray position on BTCUSDT must block entries on BTCUSDT specifically
+    # ...
+    allowed, reason = manager.audit_store.trading_allowed(symbol="BTCUSDT")
     assert allowed is False
-    assert "trading degraded (level 1)" in reason
+    assert "blocked" in reason
+    # ...but must not halt the whole account: an unrelated symbol, and the
+    # bare global check, both stay allowed.
+    assert manager.audit_store.trading_allowed(symbol="ETHUSDT") == (True, "ok")
+    assert manager.audit_store.trading_allowed() == (True, "ok")
 
 
 @pytest.mark.asyncio

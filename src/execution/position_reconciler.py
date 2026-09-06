@@ -210,6 +210,7 @@ class PositionReconciler:
             position_side=position_side,
         )
         if order is not None:
+            await self._audit_unmanaged_close(symbol, side, qty, order)
             return
 
         failure_reason = self.orders.failure_reason(symbol, "")
@@ -225,6 +226,36 @@ class PositionReconciler:
             qty,
             reduce_only=False,
             position_side=position_side,
+        )
+
+    async def _audit_unmanaged_close(
+        self, symbol: str, side: str, qty: float, order: dict
+    ) -> None:
+        # Without this, a forced close of a position the bot never opened
+        # (e.g. left over from another process, or on a symbol outside
+        # settings.symbols) is only visible as a generic order_placed row
+        # indistinguishable from the bot's own strategy entries - its real
+        # cost never reaches the trades/execution_attempts tables the rest
+        # of the P&L accounting reads from.
+        price = float(order.get("average") or order.get("price") or 0.0)
+        fee = await self._fill_resolver.order_fee(
+            order,
+            symbol,
+            fallback_notional=price * qty,
+            fallback_fee_bps=settings.scalp_effective_round_trip_fee_bps / 2,
+        )
+        self._audit(
+            "unmanaged_position_closed",
+            f"Closed unmanaged {symbol} {side} {qty}",
+            severity="warning",
+            symbol=symbol,
+            payload={
+                "quantity": qty,
+                "side": side,
+                "price": price,
+                "fee": fee,
+                "order_id": order.get("id"),
+            },
         )
 
     async def _reconciliation_state(
@@ -267,11 +298,18 @@ class PositionReconciler:
                         return False
                     return exchange_positions, order_snapshots
             reason = f"unmanaged exchange positions detected: {unmanaged}"
-            await self._fail_reconciliation(
-                "unmanaged_positions",
-                reason,
-                payload={"positions": unmanaged},
-            )
+            # Scope the degrade to the symbol(s) actually carrying the
+            # unmanaged position, matching _verify_exchange_position_details
+            # below - a stray position on one symbol (even one outside
+            # settings.symbols entirely) must not block entries on every
+            # other configured symbol account-wide.
+            for symbol in {item["symbol"] for item in unmanaged}:
+                await self._fail_reconciliation(
+                    "unmanaged_positions",
+                    reason,
+                    symbol=symbol,
+                    payload={"positions": unmanaged},
+                )
             return False
 
         order_snapshots = await self.protection.protective_order_snapshots(
@@ -817,9 +855,22 @@ class PositionReconciler:
         sl_order, tp_order = protection
         stop_order_id = sl_order.get("id", "")
         take_profit_order_id = tp_order.get("id", "") if tp_order else None
+        previous_stop_id = self.protection.active_stops.get(position_key)
+        previous_tp_id = self.protection.active_tps.get(position_key)
         self.protection.active_stops[position_key] = stop_order_id
         if take_profit_order_id:
             self.protection.active_tps[position_key] = take_profit_order_id
+        # verify_protective_orders() (which routed us here) treats a single
+        # missing leg - e.g. only the take-profit invalidated by a sibling
+        # scope's exit reducing the shared net position - as a reason to
+        # recreate BOTH legs. The still-valid old leg would otherwise be left
+        # resting live and untracked on the exchange (a duplicate order),
+        # relying on the unrelated orphan-order sweep to clean it up minutes
+        # later instead of being cancelled deliberately now.
+        if previous_stop_id and previous_stop_id != stop_order_id:
+            await self.orders.cancel_order(trade.symbol, previous_stop_id, conditional=True)
+        if previous_tp_id and previous_tp_id != take_profit_order_id:
+            await self.orders.cancel_order(trade.symbol, previous_tp_id)
         self.audit_store.record_open_trade(
             trade,
             mode=self.mode,
