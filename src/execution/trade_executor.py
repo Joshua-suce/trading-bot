@@ -717,7 +717,7 @@ class TradeExecutor:
                     side=side,
                     entry_price=entry_price,
                     quantity=filled_quantity,
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now(timezone.utc),
                     timeframe=timeframe,
                     strategy=strategy,
                     entry_fee=entry_fee,

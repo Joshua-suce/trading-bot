@@ -139,6 +139,18 @@ class TestEnterPosition:
         mock_deps["portfolio"].add_trade.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_enter_records_timezone_aware_utc_timestamp(self, mock_deps):
+        # A naive local datetime.now() here is silently mislabeled as UTC by
+        # every downstream max-hold-age consumer (src/live/loop.py) and by
+        # FillResolver.latest_exit_order - it must be UTC-aware so those
+        # consumers' assumption actually holds on hosts whose local time
+        # isn't UTC.
+        assert await mock_deps["executor"].enter_long("BTCUSDT", 100.0, 2.0)
+        trade = mock_deps["portfolio"].add_trade.call_args.args[0]
+        assert trade.timestamp.tzinfo is not None
+        assert trade.timestamp.utcoffset().total_seconds() == 0
+
+    @pytest.mark.asyncio
     async def test_enter_short_success(self, mock_deps):
         assert await mock_deps["executor"].enter_short("BTCUSDT", 100.0, 2.0)
         mock_deps["orders"].market_order.assert_called_once_with("BTCUSDT", "sell", 1.0)
