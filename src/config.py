@@ -99,7 +99,17 @@ class Settings(BaseSettings):
     reentry_cooldown_seconds: int = Field(default=0, ge=0, le=86_400)
     min_order_notional: float = Field(default=5.0, ge=0.0, le=100000.0)
     max_leverage: int = Field(default=3, ge=1, le=20)
-    max_position_size: float = Field(default=0.02, gt=0, le=0.10)
+    # Per-trade notional cap as a fraction of equity. This is the practical
+    # governing constraint on position size at the stop distances this bot
+    # actually uses (0.35%-2%): the risk_fraction-based sizing in
+    # position_sizer.py would need notional up to ~60% of equity to hit its
+    # dollar-risk target at the tightest stops, which is a dangerous single-
+    # trade concentration this cap exists to prevent - raising it further
+    # does not improve win rate, only how much a given win or loss is worth
+    # in dollar terms. Kept comfortably under the validation ceiling (0.10)
+    # and under max_symbol_open_notional_pct (0.10) even with the maximum
+    # 2 concurrent legs per symbol.
+    max_position_size: float = Field(default=0.04, gt=0, le=0.10)
     max_open_positions: int = Field(default=6, ge=1, le=100)
     max_same_direction_positions: int = Field(default=2, ge=1, le=100)
     reverse_on_opposite_signal: bool = True
