@@ -52,6 +52,21 @@ class StopLossManager:
         atr_multiplier = policy.atr_stop_multiplier if strategy else self.atr_mult_sl
         min_stop_loss_pct = policy.min_stop_pct if strategy else self.min_stop_loss_pct
         max_stop_loss_pct = policy.max_stop_pct if strategy else self.max_stop_loss_pct
+        if strategy:
+            # Don't let the flat pct floor land so close to the round-trip
+            # fee that fees dominate the risk on every floor-clamped trade -
+            # see settings.min_stop_fee_multiple.
+            fee_floor_pct = (
+                policy.estimated_round_trip_fee_bps
+                / 10_000
+                * settings.min_stop_fee_multiple
+            )
+            # Clamp to max_stop_loss_pct too so an aggressive fee multiple
+            # can never push the floor above the ceiling and invert the
+            # min/max clamp below.
+            min_stop_loss_pct = min(
+                max(min_stop_loss_pct, fee_floor_pct), max_stop_loss_pct
+            )
         risk_reward_ratio = (
             policy.reward_risk_ratio if strategy else self.risk_reward_ratio
         )

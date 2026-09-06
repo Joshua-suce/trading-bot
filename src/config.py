@@ -353,6 +353,14 @@ class Settings(BaseSettings):
     )
     min_stop_loss_pct: float = Field(default=0.0035, gt=0.0, le=0.10)
     max_stop_loss_pct: float = Field(default=0.02, gt=0.0, le=0.20)
+    # A flat percentage floor has no relationship to the round-trip fee
+    # sitting right next to it in each StrategyPolicy - if the floor clamps
+    # a stop to a distance only a few times the fee, fees eat a large slice
+    # of the capital actually at risk regardless of signal quality. This
+    # requires the effective stop to be at least this many multiples of the
+    # strategy's own estimated round-trip fee, bounding fee/risk to roughly
+    # 1/min_stop_fee_multiple (5.0 -> fees capped at ~20% of risked capital).
+    min_stop_fee_multiple: float = Field(default=5.0, ge=1.0, le=20.0)
     risk_block_alert_cooldown_seconds: int = Field(default=900, ge=60, le=86_400)
 
     force_ta_only: bool = True
