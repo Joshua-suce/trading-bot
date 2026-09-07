@@ -78,6 +78,7 @@ class PositionManager:
             trades=self.trades,
             protection=self.protection,
             check_exposure_limits=self._check_exposure_limits,
+            release_exposure_reservation=self._exposure_limiter.release_reservation,
             fail_reconciliation=self._fail_reconciliation,
             finalize_trade_leg=self._finalize_trade_leg,
         )

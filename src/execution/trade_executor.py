@@ -32,6 +32,7 @@ class TradeExecutor:
         check_exposure_limits,
         fail_reconciliation,
         finalize_trade_leg,
+        release_exposure_reservation=None,
     ):
         self.client = client
         self.strategy_registry = StrategyRegistry(settings)
@@ -47,9 +48,23 @@ class TradeExecutor:
         self.trades = trades
         self.protection = protection
         self.check_exposure_limits = check_exposure_limits
+        # Optional: releases the exposure reservation check_exposure_limits
+        # takes out on success (see ExposureLimiter.check_exposure_limits /
+        # release_reservation) - without this, two symbols entered
+        # concurrently in the same scan batch could each pass the same
+        # pre-commit exposure snapshot before either lands in open_trades.
+        # Defaults to a no-op so callers that don't wire it up (tests
+        # constructing TradeExecutor directly) are unaffected.
+        self.release_exposure_reservation = release_exposure_reservation or (
+            lambda position_key: None
+        )
         self.fail_reconciliation = fail_reconciliation
         self.finalize_trade_leg = finalize_trade_leg
         self.entry_router = EntryOrderRouter(client, orders)
+
+    def _discard_entry_progress(self, symbol: str, position_key: str) -> None:
+        self._entries_in_progress.discard(symbol)
+        self.release_exposure_reservation(position_key)
 
     def _audit(
         self,
@@ -539,7 +554,7 @@ class TradeExecutor:
                 strategy,
                 ignore_reentry_cooldown,
             ):
-                self._entries_in_progress.discard(symbol)
+                self._discard_entry_progress(symbol, position_key)
                 return False
 
             levels = await self._entry_risk_levels(
@@ -551,7 +566,7 @@ class TradeExecutor:
                 market_context=market_context,
             )
             if levels is None:
-                self._entries_in_progress.discard(symbol)
+                self._discard_entry_progress(symbol, position_key)
                 return False
             pos_size = self.sizer.calculate(
                 price,
@@ -569,7 +584,7 @@ class TradeExecutor:
                     severity="warning",
                     symbol=symbol,
                 )
-                self._entries_in_progress.discard(symbol)
+                self._discard_entry_progress(symbol, position_key)
                 return False
 
             depth_reason = await self._market_depth_reason(
@@ -580,7 +595,7 @@ class TradeExecutor:
             )
             if depth_reason:
                 await self._block_market_entry(symbol, depth_reason)
-                self._entries_in_progress.discard(symbol)
+                self._discard_entry_progress(symbol, position_key)
                 return False
 
             exposure_ok, exposure_reason = self.check_exposure_limits(
@@ -601,7 +616,7 @@ class TradeExecutor:
                         "position_key": position_key,
                     },
                 )
-                self._entries_in_progress.discard(symbol)
+                self._discard_entry_progress(symbol, position_key)
                 return False
 
             correlation_id = self._new_correlation_id()
@@ -659,7 +674,7 @@ class TradeExecutor:
                         started_at=execution_started_at,
                         completed=True,
                     )
-                    self._entries_in_progress.discard(symbol)
+                    self._discard_entry_progress(symbol, position_key)
                     return False
                 slippage_bps = self._adverse_entry_drift_bps(
                     side,
@@ -716,7 +731,7 @@ class TradeExecutor:
                         f"post-fill cost check failed: {post_fill_cost_reason}",
                         correlation_id,
                     )
-                    self._entries_in_progress.discard(symbol)
+                    self._discard_entry_progress(symbol, position_key)
                     return False
                 trade = TradeRecord(
                     symbol=symbol,
@@ -781,7 +796,7 @@ class TradeExecutor:
                         f"protective order placement failed after {side} entry",
                         correlation_id,
                     )
-                    self._entries_in_progress.discard(symbol)
+                    self._discard_entry_progress(symbol, position_key)
                     return False
                 sl_order, tp_order = protection
 
@@ -829,7 +844,7 @@ class TradeExecutor:
                         stop_order_id=stop_order_id,
                         take_profit_order_id=take_profit_order_id,
                     )
-                    self._entries_in_progress.discard(symbol)
+                    self._discard_entry_progress(symbol, position_key)
                     return False
 
                 self.trades.open_trades[position_key] = trade
@@ -873,7 +888,7 @@ class TradeExecutor:
                     levels.stop_loss,
                     levels.take_profit,
                 )
-                self._entries_in_progress.discard(symbol)
+                self._discard_entry_progress(symbol, position_key)
                 return True
             failure_reason = self._order_failure_reason(
                 symbol,
@@ -898,10 +913,10 @@ class TradeExecutor:
             )
             await self._notify_trade_failed(symbol, failure_reason)
             self._audit("trade_failed", failure_reason, severity="error", symbol=symbol)
-            self._entries_in_progress.discard(symbol)
+            self._discard_entry_progress(symbol, position_key)
             return False
         finally:
-            self._entries_in_progress.discard(symbol)
+            self._discard_entry_progress(symbol, position_key)
 
     async def _scalp_cost_reason(
         self,
