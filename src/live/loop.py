@@ -1953,18 +1953,17 @@ class LiveTradingLoop:
                             reason=reason,
                         )
                         continue
-                    if source_gate.confidence_multiplier < 1.0:
-                        adjusted_confidence *= source_gate.confidence_multiplier
-                        logger.info(
-                            f"Source gate penalty for {scope} {strategy}: "
-                            f"{source_gate.reason}; "
-                            f"samples={source_gate.total_samples} "
-                            f"accuracy={source_gate.win_rate:.2%} "
-                            f"avg_bps={source_gate.avg_directional_bps:.2f} "
-                            f"confidence x{source_gate.confidence_multiplier:.2f} "
-                            f"({signal.confidence:.4f} -> "
-                            f"{adjusted_confidence:.4f})"
-                        )
+                    # SignalGate.evaluate() sets confidence_multiplier < 1.0
+                    # in exactly the cases where passed is also False (both
+                    # driven by the same win_rate_failed/edge_failed check) -
+                    # so this branch was dead: by the time control reaches
+                    # here, passed was True, which means confidence_multiplier
+                    # is always exactly 1.0. Removed rather than "fixed" into
+                    # a real graduated-penalty feature, since that would be a
+                    # behavior change to live signal filtering with no
+                    # evidence backing where the pass/fail boundary should
+                    # sit - SignalGate is a hard pass/fail gate in practice
+                    # today, not a soft one.
 
                 if adjusted_confidence < minimum_confidence:
                     detail = (
