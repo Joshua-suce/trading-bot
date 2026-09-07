@@ -33,8 +33,8 @@ class BreakoutStrategy(StrategyMath):
             and last["close"] > prev_upper + breakout_buffer
             and trend_regime >= 0
             and (trend_regime == 1 or adx >= 24)
-            and volume_ratio >= 1.5
-            and candle["bullish_confirmation"]
+            and volume_ratio >= 1.35
+            and candle["bullish_breakout"]
         ):
             return StrategySignal(
                 1,
@@ -47,8 +47,8 @@ class BreakoutStrategy(StrategyMath):
             and last["close"] < prev_lower - breakout_buffer
             and trend_regime <= 0
             and (trend_regime == -1 or adx >= 24)
-            and volume_ratio >= 1.5
-            and candle["bearish_confirmation"]
+            and volume_ratio >= 1.35
+            and candle["bearish_breakout"]
         ):
             return StrategySignal(
                 -1,

@@ -237,9 +237,9 @@ class ScalpStrategy(StrategyMath):
         )
         rsi_reversal = rsi <= 48 if direction == 1 else rsi >= 52
 
-        pullback_near_ema = 0 <= close_vs_ema * direction <= 0.008
-        pullback_at_vwap = 0 <= close_vs_vwap * direction <= 0.005
-        extended = close_vs_vwap * direction > 0.010
+        pullback_near_ema = 0 <= close_vs_ema * direction <= 0.004
+        pullback_at_vwap = 0 <= close_vs_vwap * direction <= 0.003
+        extended = close_vs_vwap * direction > 0.005
 
         structure_confirmed = (
             pullback_near_ema or (pullback_at_vwap and (slope_aligned or macd_aligned))
@@ -251,7 +251,7 @@ class ScalpStrategy(StrategyMath):
             and slope_aligned
             and momentum_confirmed
             and candle_confirmed
-            and volume_ratio >= 0.80
+            and volume_ratio >= 1.0
         ):
             return direction, 0.0
 

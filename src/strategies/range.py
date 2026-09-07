@@ -18,14 +18,14 @@ class RangeStrategy(StrategyMath):
         adx: float,
         candle: dict[str, float | bool],
     ) -> tuple[str, int, float]:
-        if trend_regime != 0 or adx > 28:
+        if trend_regime != 0 or adx > 25:
             return cls.name, direction, 0.0
         percent_b = cls.safe_float(last.get("bb_percent_b"), 0.5)
         rsi = cls.safe_float(last.get("rsi_14"), 50.0)
         macd = cls.safe_float(last.get("macd_hist"))
         previous_macd = cls.safe_float(prev.get("macd_hist"), macd)
         volume_ratio = cls.safe_float(last.get("vol_ratio"), 0.0)
-        band_edge = percent_b <= 0.30 if direction == 1 else percent_b >= 0.70
+        band_edge = percent_b <= 0.22 if direction == 1 else percent_b >= 0.78
         rsi_edge = rsi <= 42 if direction == 1 else rsi >= 58
         momentum_turn = (macd - previous_macd) * direction > 0
         rejection = bool(
