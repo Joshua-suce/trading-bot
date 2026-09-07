@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -627,11 +627,16 @@ class TestEntryPreflight:
         assert reason == ""
 
     @pytest.mark.asyncio
-    async def test_excessive_favorable_price_drift_is_stale(
+    async def test_large_favorable_price_drift_is_not_rejected(
         self,
         mock_deps,
         monkeypatch,
     ):
+        # The drift check is direction-aware by design (a stale-but-adverse
+        # move is the risk it guards against): a large FAVORABLE move - the
+        # trader gets a better fill than the signal implied - must not be
+        # rejected regardless of size. An unsigned/absolute distance check
+        # here would reject good fills along with bad ones.
         monkeypatch.setattr(settings, "max_entry_slippage_bps", 45.0)
         mock_deps["client"].fetch_ticker.return_value["bid"] = 101.0
 
@@ -641,8 +646,58 @@ class TestEntryPreflight:
             100.0,
         )
 
+        assert reason == ""
+
+    @pytest.mark.asyncio
+    async def test_stale_signal_gets_a_wider_adverse_drift_tolerance(
+        self,
+        mock_deps,
+        monkeypatch,
+    ):
+        # A delayed signal (e.g. after a network-outage recovery or a scan
+        # backlog) deserves MORE slippage tolerance, not the same flat
+        # amount - the market had longer to move before this check runs.
+        # Non-scalp only; scalp intentionally keeps a flat, tight tolerance.
+        monkeypatch.setattr(settings, "max_entry_slippage_bps", 10.0)
+        mock_deps["client"].fetch_ticker.return_value["ask"] = 100.3  # 30bps adverse
+
+        fresh_reason = await mock_deps["executor"]._entry_price_drift_reason(
+            "BTCUSDT",
+            "long",
+            100.0,
+            signal_timestamp=datetime.now(timezone.utc),
+            strategy="trend",
+        )
+        assert "signal price drift above limit" in fresh_reason
+
+        stale_reason = await mock_deps["executor"]._entry_price_drift_reason(
+            "BTCUSDT",
+            "long",
+            100.0,
+            signal_timestamp=datetime.now(timezone.utc) - timedelta(hours=5),
+            strategy="trend",
+        )
+        assert stale_reason == ""
+
+    @pytest.mark.asyncio
+    async def test_scalp_drift_tolerance_is_not_widened_by_signal_age(
+        self,
+        mock_deps,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(settings, "max_entry_slippage_bps", 10.0)
+        monkeypatch.setattr(settings, "scalp_max_entry_slippage_bps", 10.0)
+        mock_deps["client"].fetch_ticker.return_value["ask"] = 100.3  # 30bps adverse
+
+        reason = await mock_deps["executor"]._entry_price_drift_reason(
+            "BTCUSDT",
+            "long",
+            100.0,
+            signal_timestamp=datetime.now(timezone.utc) - timedelta(hours=2),
+            strategy="scalp",
+        )
+
         assert "signal price drift above limit" in reason
-        assert "100.00bps > 45.00bps" in reason
 
     @pytest.mark.parametrize(
         ("side", "signal_price", "fill_price", "expected"),

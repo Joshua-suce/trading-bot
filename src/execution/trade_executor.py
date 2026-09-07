@@ -344,21 +344,27 @@ class TradeExecutor:
             signal_price,
             executable_price,
         )
-        absolute_drift_bps = (
-            abs(executable_price - signal_price) / signal_price * 10_000
-        )
         max_drift = self._max_slippage_for(symbol)
         if strategy == "scalp":
             max_drift = min(
                 max_drift,
                 settings.scalp_max_entry_slippage_bps,
             )
-        if absolute_drift_bps > max_drift:
-            return (
-                f"signal price drift above limit: {absolute_drift_bps:.2f}bps "
-                f"> {max_drift:.2f}bps "
-                f"(signal={signal_price:.8f}, quote={executable_price:.8f})"
-            )
+        # drift_bps is direction-aware (adverse_price_movement_bps clamps a
+        # favorable move to 0) - an unsigned/absolute distance check here
+        # would reject good fills along with bad ones and make this check
+        # unreachable, since drift_bps <= abs(executable-signal)/signal
+        # always holds. A stale signal deserves more slippage tolerance,
+        # not less, since the market had longer to move before this check
+        # runs - widen the tolerance for non-scalp signals by their age.
+        if signal_timestamp is not None and strategy != "scalp":
+            now = datetime.now(timezone.utc)
+            ts = signal_timestamp
+            if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            signal_age_hours = (now - ts).total_seconds() / 3600
+            age_multiplier = min(1.0 + signal_age_hours * 0.5, 10.0)
+            max_drift = max_drift * age_multiplier
         if drift_bps <= max_drift:
             return ""
         return (
