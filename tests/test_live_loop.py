@@ -911,12 +911,43 @@ async def test_fatal_shutdown_flattens_positions(monkeypatch):
 
     async def close_all():
         closed.append(True)
+        return True
 
     monkeypatch.setattr(bot.pos_mgr, "close_all", close_all)
 
     await bot.stop("fatal error")
 
     assert closed == [True]
+    events = bot.audit_store.load_recent_events(5)
+    assert not any(event["event_type"] == "shutdown_close_all_failed" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_fatal_shutdown_preserves_positions_when_close_all_returns_false(
+    monkeypatch,
+):
+    # TradeExecutor.close_all() catches per-symbol failures internally and
+    # returns False instead of raising - this is the path that actually
+    # fires in real operation now, not an exception. Previously
+    # PositionManager.close_all() discarded this bool entirely, so
+    # loop.stop()'s failure handling (the shutdown_close_all_failed audit
+    # event) could never fire for a real failure, only for the exception
+    # path covered by the sibling test below.
+    bot = LiveTradingLoop()
+    bot.client = NoopClient()
+    bot.alerter = LifecycleAlerter()
+    bot.pos_mgr.open_trades["BTCUSDT:1m:scalp"] = object()
+
+    async def close_all():
+        return False
+
+    monkeypatch.setattr(bot.pos_mgr, "close_all", close_all)
+
+    await bot.stop("fatal error")
+
+    assert bot.pos_mgr.open_trades
+    events = bot.audit_store.load_recent_events(5)
+    assert any(event["event_type"] == "shutdown_close_all_failed" for event in events)
 
 
 @pytest.mark.asyncio
@@ -1571,6 +1602,49 @@ async def test_opposite_reversal_close_is_serialized_per_symbol(tmp_path):
 
     assert bot.pos_mgr.exit_position.await_count == 1
     assert results == [(True, True), (True, False)]
+
+
+@pytest.mark.asyncio
+async def test_reversal_clears_stale_risk_state_for_reused_position_key(tmp_path):
+    # The old and new side of a same-key reversal share one position_key
+    # with no gap where it's absent from open_trades, so the periodic
+    # _cleanup_scalp_state() sweep never sees the transition. Without an
+    # explicit clear here, a fresh reversed trade could inherit the
+    # previous trade's stale initial_risk/peak price.
+    from src.audit import AuditStore
+
+    bot = LiveTradingLoop(audit_store=AuditStore(tmp_path / "reverse-state.db"))
+    position_key = "BTCUSDT:4h:trend"
+    bot.pos_mgr.open_trades[position_key] = TradeRecord(
+        symbol="BTCUSDT",
+        side="short",
+        entry_price=101.0,
+        quantity=0.1,
+        timestamp=datetime.now(timezone.utc),
+        timeframe="4h",
+        strategy="trend",
+    )
+    bot._swing_initial_risk[position_key] = 2.0
+    bot._swing_peak_prices[position_key] = 99.0
+
+    signal = FinalSignal(
+        direction=1,
+        confidence=0.90,
+        ta_source="trend_structure_bull",
+        strategy="trend",
+    )
+
+    async def exit_position(pk, _reason):
+        bot.pos_mgr.open_trades.pop(pk, None)
+
+    bot.pos_mgr.exit_position = AsyncMock(side_effect=exit_position)
+
+    await bot._close_opposite_symbol_trades_if_needed(
+        "BTCUSDT", signal, "trend", "BTCUSDT:4h"
+    )
+
+    assert position_key not in bot._swing_initial_risk
+    assert position_key not in bot._swing_peak_prices
 
 
 @pytest.mark.asyncio

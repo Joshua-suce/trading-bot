@@ -568,9 +568,20 @@ class AuditStore:
     def try_recover_trading_level(
         self, reason: str = "", symbol: str | None = None
     ) -> bool:
+        # The blind _clear_all_symbol_trading_state() this used to do here
+        # ran on EVERY successful global reconciliation pass (the reconciler
+        # calls this with no symbol whenever the global level isn't RED) -
+        # instantly wiping every symbol's degrade state with no threshold
+        # gate and no exemption for RED, defeating the whole point of the
+        # per-symbol scoping added alongside it (a stray issue on one symbol
+        # must require its own confirmed recovery, not get cleared as a
+        # side effect of an unrelated global check). Per-symbol recovery
+        # now goes only through _try_recover_symbol_level, which has its
+        # own threshold gate and (like the global path) refuses to
+        # auto-clear RED. _clear_all_symbol_trading_state() remains
+        # reserved for the explicit manual clear_emergency_stop() path.
         if symbol:
             return self._try_recover_symbol_level(symbol, reason)
-        self._clear_all_symbol_trading_state()
         return self._try_recover_global_level(reason)
 
     def _try_recover_global_level(self, reason: str) -> bool:
@@ -608,6 +619,11 @@ class AuditStore:
         current = self.get_symbol_trading_level(symbol)
         if current == self.TRADING_LEVEL_GREEN:
             return True
+        if current == self.TRADING_LEVEL_RED:
+            # Mirror _try_recover_global_level: RED is a manual-clear-only
+            # invariant, not something consecutive clean reconciliation
+            # passes alone should lift for a symbol either.
+            return False
         successes = self._get_symbol_int("symbol_reconciliation_successes", symbol) + 1
         self.set_control(
             self._symbol_control_key("symbol_reconciliation_successes", symbol),

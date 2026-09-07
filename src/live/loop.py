@@ -1143,9 +1143,21 @@ class LiveTradingLoop:
             return False
 
     def _cleanup_scalp_position(self, position_key: str) -> None:
+        # Also clears the swing-side dicts for this key (harmless no-op if
+        # it was never a swing position). This matters for the same-key
+        # reversal path (_close_opposite_symbol_trades_if_needed): the old
+        # side's exit and the new side's entry share one position_key with
+        # no gap where the key is absent from open_trades, so the periodic
+        # _cleanup_scalp_state() sweep (which only clears a key once it's
+        # missing from open_trades entirely) never catches the transition -
+        # without this, a fresh reversed trade could inherit the previous
+        # trade's stale initial_risk/peak price and misprice favorable_r
+        # for break-even/trailing-stop decisions.
         self._scalp_peak_prices.pop(position_key, None)
         self._scalp_initial_risk.pop(position_key, None)
         self._scalp_partial_completed.discard(position_key)
+        self._swing_peak_prices.pop(position_key, None)
+        self._swing_initial_risk.pop(position_key, None)
 
     async def _manage_scalp_position(self, position_key: str, trade) -> None:
         try:
@@ -2537,6 +2549,7 @@ class LiveTradingLoop:
                     scope,
                 )
                 await self.pos_mgr.exit_position(position_key, reason)
+                self._cleanup_scalp_position(position_key)
                 reversed_position = True
 
             remaining = [
@@ -2741,9 +2754,17 @@ class LiveTradingLoop:
         )
         try:
             if should_close_positions:
+                # TradeExecutor.close_all() now catches per-symbol failures
+                # internally and returns False instead of raising (it also
+                # activates its own emergency stop) - the except clause
+                # below is kept as a defensive fallback for anything that
+                # still escapes (e.g. from PositionManager itself), but the
+                # bool return is the path that actually fires in practice
+                # now and must not be silently discarded.
                 try:
-                    await self.pos_mgr.close_all()
+                    closed = await self.pos_mgr.close_all()
                 except Exception as exc:
+                    closed = False
                     logger.critical(
                         "Could not close positions during shutdown; preserving "
                         "protected positions for restart reconciliation: {}",
@@ -2758,6 +2779,22 @@ class LiveTradingLoop:
                             "reason": reason,
                             "positions": list(self.pos_mgr.open_trades),
                             "error": self._describe_exception(exc),
+                        },
+                    )
+                if not closed:
+                    logger.critical(
+                        "Could not close all positions during shutdown; "
+                        "preserving protected positions for restart "
+                        "reconciliation"
+                    )
+                    self.audit_store.safe_record_event(
+                        "shutdown_close_all_failed",
+                        "Could not close all positions during shutdown",
+                        severity="critical",
+                        mode=self.mode,
+                        payload={
+                            "reason": reason,
+                            "positions": list(self.pos_mgr.open_trades),
                         },
                     )
             elif self.pos_mgr.open_trades:

@@ -183,8 +183,8 @@ class PositionManager:
         )
 
     # Close every open position (e.g. on shutdown)
-    async def close_all(self):
-        await self.executor.close_all()
+    async def close_all(self) -> bool:
+        return await self.executor.close_all()
 
     async def close_symbol(self, symbol: str, reason: str = "manual") -> bool:
         return await self.executor._close_symbol_positions(symbol, reason)

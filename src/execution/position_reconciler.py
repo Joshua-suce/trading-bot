@@ -1009,6 +1009,14 @@ class PositionReconciler:
             )
         else:
             self.audit_store.try_recover_trading_level("reconciliation successful")
+            # Per-symbol degrades (e.g. from an unmanaged-position issue
+            # scoped to one symbol) no longer get cleared as a side effect
+            # of the global recovery call above - each symbol needs its own
+            # threshold-gated recovery, same as the global level gets.
+            for symbol in settings.symbols_list:
+                self.audit_store.try_recover_trading_level(
+                    "reconciliation successful", symbol=symbol
+                )
         current = self.audit_store.get_trading_level()
         if current == self.audit_store.TRADING_LEVEL_GREEN:
             self._audit("reconciliation_ok", "Exchange state reconciled")
