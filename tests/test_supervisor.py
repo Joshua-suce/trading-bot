@@ -1,6 +1,6 @@
 import subprocess
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.config import Settings
 from src.monitoring.heartbeat import HeartbeatSnapshot, RuntimeHeartbeat
@@ -180,6 +180,93 @@ def test_supervisor_allows_longer_staleness_while_child_bootstraps(
     assert (
         supervisor._monitor(Process(), started=0.0, instance_id="instance-123") is False
     )
+
+
+def test_alert_exhausted_sends_critical_alert_when_channel_configured(
+    tmp_path, monkeypatch
+):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        telegram_bot_token="token-123",
+        telegram_chat_id="chat-456",
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    send_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "src.supervisor.Alerter.send",
+        send_mock,
+    )
+
+    supervisor._alert_exhausted(5)
+
+    send_mock.assert_awaited_once()
+    (message,), kwargs = send_mock.await_args
+    assert "STOPPED" in message
+    assert "5 time(s)" in message
+    assert kwargs.get("level") == "critical"
+
+
+def test_alert_exhausted_skips_silently_when_no_channel_configured(
+    tmp_path, monkeypatch
+):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        telegram_bot_token="",
+        telegram_chat_id="",
+        discord_webhook_url="",
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    send_mock = AsyncMock()
+    monkeypatch.setattr("src.supervisor.Alerter.send", send_mock)
+
+    supervisor._alert_exhausted(5)  # must not raise
+
+    send_mock.assert_not_awaited()
+
+
+def test_alert_exhausted_swallows_delivery_errors(tmp_path, monkeypatch):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        telegram_bot_token="token-123",
+        telegram_chat_id="chat-456",
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    monkeypatch.setattr(
+        "src.supervisor.Alerter.send",
+        AsyncMock(side_effect=RuntimeError("network down")),
+    )
+
+    supervisor._alert_exhausted(5)  # must not raise, only log
+
+
+def test_run_alerts_and_exits_when_restart_budget_exhausted(tmp_path, monkeypatch):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        supervisor_max_restarts_per_hour=1,
+        supervisor_restart_backoff_seconds=0.0,
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    monkeypatch.setattr("src.supervisor.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(supervisor, "_monitor", lambda *a, **k: True)
+
+    class Process:
+        pid = 42
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        "src.supervisor.subprocess.Popen", lambda *a, **k: Process()
+    )
+    alert_mock = MagicMock()
+    monkeypatch.setattr(supervisor, "_alert_exhausted", alert_mock)
+
+    assert supervisor.run() == 1
+    alert_mock.assert_called_once()
 
 
 def test_supervisor_forces_child_tree_after_interrupt_timeout(tmp_path, monkeypatch):

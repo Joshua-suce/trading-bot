@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 import sys
@@ -8,6 +9,7 @@ from collections import deque
 from loguru import logger
 
 from src.config import Settings, settings
+from src.monitoring.alerter import Alerter
 from src.monitoring.heartbeat import RuntimeHeartbeat
 
 
@@ -59,6 +61,15 @@ class TradingSupervisor:
                 restarts.popleft()
             if len(restarts) >= self.cfg.supervisor_max_restarts_per_hour:
                 logger.critical("Supervisor restart budget exhausted")
+                # This is the single most important event to alert on: the
+                # bot is now fully offline (no more reconciliation, exposure
+                # checks, or trade management - only whatever protective
+                # stop-loss/take-profit orders are already resting on the
+                # exchange). Before this, the only trace was the log file
+                # and a CRITICAL line nobody was watching; a live run on
+                # 2026-09-07 died silently for hours until the operator
+                # happened to be looking at the terminal.
+                self._alert_exhausted(len(restarts))
                 return 1
             restarts.append(now)
             logger.warning("Restarting trading child in {:.1f}s", backoff)
@@ -97,6 +108,34 @@ class TradingSupervisor:
             self._terminate(process)
             return True
         return False
+
+    def _alert_exhausted(self, restart_count: int) -> None:
+        alerter = Alerter(
+            telegram_token=self.cfg.telegram_bot_token,
+            telegram_chat_id=self.cfg.telegram_chat_id,
+            discord_webhook=self.cfg.discord_webhook_url,
+            queue_size=self.cfg.telegram_alert_queue_size,
+            delivery_timeout=self.cfg.telegram_delivery_timeout_seconds,
+        )
+        if not alerter.enabled:
+            logger.warning(
+                "No alert channel configured; supervisor shutdown will not "
+                "be reported outside this log"
+            )
+            return
+        message = (
+            "<b>Trading Bot STOPPED</b>\n"
+            f"Environment: {self.cfg.binance_environment}\n"
+            f"Restarted {restart_count} time(s) in the last hour and gave "
+            "up. The process has exited - no new trades, no exposure "
+            "checks, no position management until it is restarted "
+            "manually. Any stop-loss/take-profit orders already resting "
+            "on the exchange remain active."
+        )
+        try:
+            asyncio.run(alerter.send(message, level="critical"))
+        except Exception as exc:  # noqa: BLE001 - never let alerting block shutdown
+            logger.error("Failed to send supervisor-exhausted alert: {}", exc)
 
     def _terminate(self, process: subprocess.Popen) -> None:
         if sys.platform == "win32":

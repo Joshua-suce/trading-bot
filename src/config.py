@@ -424,14 +424,24 @@ class Settings(BaseSettings):
         ge=1.0,
         le=300.0,
     )
-    supervisor_max_restarts_per_hour: int = Field(default=5, ge=1, le=100)
+    # A live 2026-09-07 run showed a single ~24-minute exchange/network
+    # outage (repeated OHLCV RequestTimeout + failed clock sync) burn the
+    # entire restart budget: each restart cycle costs the 180s startup
+    # grace period plus backoff, so 5 restarts is only ~20-25 minutes of
+    # patience before the bot gives up and stops trading entirely until an
+    # operator notices and restarts it by hand. Raised to 10/120s so a
+    # transient demo-API or home-network blip doesn't strand the bot for
+    # the rest of the hour; genuinely persistent failures still eventually
+    # exhaust the budget and now fire a critical alert (see
+    # TradingSupervisor._alert_exhausted) instead of dying silently.
+    supervisor_max_restarts_per_hour: int = Field(default=10, ge=1, le=100)
     supervisor_restart_backoff_seconds: float = Field(
         default=5.0,
         ge=0.0,
         le=300.0,
     )
     supervisor_max_backoff_seconds: float = Field(
-        default=60.0,
+        default=120.0,
         ge=1.0,
         le=3600.0,
     )
