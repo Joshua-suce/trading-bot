@@ -31,6 +31,15 @@ class Settings(BaseSettings):
         "1w",
         "1M",
     }
+    allowed_strategies: ClassVar[set[str]] = {
+        "trend",
+        "transition",
+        "range",
+        "breakout",
+        "reversal",
+        "countertrend",
+        "scalp",
+    }
 
     binance_api_key: str = ""
     binance_api_secret: str = ""
@@ -51,9 +60,19 @@ class Settings(BaseSettings):
 
     symbols: str = "BTCUSDT,ETHUSDT,BNBUSDT"
     timeframes: str = "1m,3m,5m,15m,30m,1h,4h,1d"
+    enabled_strategies: str = (
+        "trend,transition,range,breakout,reversal,countertrend,scalp"
+    )
     disabled_strategy_scopes: str = ""
     position_scope: str = "symbol"
     scan_sleep_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    network_outage_failure_threshold: int = Field(default=6, ge=1, le=100)
+    network_outage_cooldown_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
+    network_outage_alert_cooldown_seconds: float = Field(
+        default=300.0,
+        ge=30.0,
+        le=86_400.0,
+    )
     candle_close_grace_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     account_balance_cache_seconds: float = Field(default=10.0, ge=0.0, le=60.0)
     account_refresh_interval_seconds: float = Field(default=60.0, ge=10.0, le=600.0)
@@ -77,12 +96,25 @@ class Settings(BaseSettings):
         ge=0.1,
         le=5.0,
     )
-    reentry_cooldown_seconds: int = Field(default=900, ge=0, le=86_400)
+    reentry_cooldown_seconds: int = Field(default=0, ge=0, le=86_400)
     min_order_notional: float = Field(default=5.0, ge=0.0, le=100000.0)
     max_leverage: int = Field(default=3, ge=1, le=20)
-    max_position_size: float = Field(default=0.02, gt=0, le=0.10)
+    # Per-trade notional cap as a fraction of equity. This is the practical
+    # governing constraint on position size at the stop distances this bot
+    # actually uses (0.35%-2%): the risk_fraction-based sizing in
+    # position_sizer.py would need notional up to ~60% of equity to hit its
+    # dollar-risk target at the tightest stops, which is a dangerous single-
+    # trade concentration this cap exists to prevent - raising it further
+    # does not improve win rate, only how much a given win or loss is worth
+    # in dollar terms. Kept comfortably under the validation ceiling (0.10)
+    # and under max_symbol_open_notional_pct (0.10) even with the maximum
+    # 2 concurrent legs per symbol.
+    max_position_size: float = Field(default=0.04, gt=0, le=0.10)
     max_open_positions: int = Field(default=6, ge=1, le=100)
-    max_positions_per_symbol: int = Field(default=1, ge=1, le=20)
+    max_same_direction_positions: int = Field(default=2, ge=1, le=100)
+    reverse_on_opposite_signal: bool = True
+    max_positions_per_symbol: int = Field(default=2, ge=1, le=20)
+    restored_position_exposure_cleanup_enabled: bool = True
     max_total_open_notional_pct: float = Field(default=0.20, gt=0, le=1.0)
     max_symbol_open_notional_pct: float = Field(default=0.10, gt=0, le=1.0)
     correlated_symbols: str = "BTCUSDT,ETHUSDT,BNBUSDT"
@@ -116,7 +148,7 @@ class Settings(BaseSettings):
     strategy_breakout_min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
     strategy_reversal_min_confidence: float = Field(default=0.50, ge=0.0, le=1.0)
     strategy_countertrend_min_confidence: float = Field(
-        default=0.55,
+        default=0.65,
         ge=0.0,
         le=1.0,
     )
@@ -135,15 +167,62 @@ class Settings(BaseSettings):
         gt=0.0,
         le=0.05,
     )
-    strategy_min_net_edge_bps: float = Field(default=5.0, ge=0.0, le=100.0)
-    strategy_max_spread_bps: float = Field(default=25.0, gt=0.0, le=500.0)
+    strategy_min_net_edge_bps: float = Field(default=12.0, ge=0.0, le=100.0)
+    strategy_max_spread_bps: float = Field(default=12.0, gt=0.0, le=500.0)
     strategy_max_consecutive_losses: int = Field(default=3, ge=1, le=20)
     strategy_loss_cooldown_seconds: int = Field(default=1800, ge=60, le=604_800)
     ml_confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     ta_weight: float = Field(default=0.40, ge=0.0, le=1.0)
     ml_weight: float = Field(default=0.40, ge=0.0, le=1.0)
     require_signal_confluence: bool = False
-    strategy_quality_min_score: float = Field(default=0.45, ge=0.0, le=1.0)
+    strategy_quality_min_score: float = Field(default=0.68, ge=0.0, le=1.0)
+    strategy_quality_gate_enforced: bool = True
+    # regime_appropriate_strategies() (src/signals/regime.py) was computed
+    # but only logged, never enforced - every strategy could fire in every
+    # market regime. Backtested via the replay engine on one month of
+    # BTC/ETH/BNB 5m/1m data across all 7 strategies before enabling:
+    #   - trend: ~40% fewer trades, aggregate loss shrank ~40% on all 3
+    #     symbols with similar win rate/profit factor.
+    #   - countertrend: trade count roughly halved, win rate improved on
+    #     2 of 3 symbols (e.g. ETHUSDT 23.3% -> 32.1%), losses shrank.
+    #   - range, breakout, scalp: negligible change (already well-matched
+    #     to their allowed regimes - scalp only after the allow-list fix
+    #     below), confirming the filter isn't over-restricting them.
+    #   - reversal: too few trades (3-11 per symbol) for a confident read;
+    #     mixed, not clearly harmed.
+    #   - transition: fires ~0 times regardless (see ta_signal.py's
+    #     fallback design), not applicable.
+    # No strategy showed clear harm, two showed a clear improvement, so
+    # this defaults to enforced.
+    #
+    # NOTE: an earlier attempt to default this to True surfaced two real
+    # bugs in the allow-list itself before the above validation existed
+    # (scalp's trend-pullback mode and reversal's opposing-trend
+    # requirement were excluded from the "trending" regime they actually
+    # need) via live/loop.py test failures. Both are fixed below; the
+    # validation above is against the corrected table.
+    regime_filter_enforced: bool = True
+    same_symbol_reversal_guard_enabled: bool = True
+    lower_timeframe_reversal_min_confidence: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+    )
+    lower_timeframe_reversal_min_quality_score: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+    )
+    lower_timeframe_reversal_min_hold_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=86_400,
+    )
+    lower_timeframe_reversal_max_timeframe_ratio: float = Field(
+        default=3.0,
+        ge=1.0,
+        le=96.0,
+    )
     strategy_min_adx: float = Field(default=18.0, ge=0.0, le=100.0)
     strategy_min_volume_ratio: float = Field(default=0.70, ge=0.0, le=10.0)
     strategy_min_atr_pct: float = Field(default=0.0005, ge=0.0, le=0.10)
@@ -167,7 +246,12 @@ class Settings(BaseSettings):
         le=1.0,
     )
     strategy_breakout_min_close_location: float = Field(
-        default=0.75,
+        default=0.60,
+        ge=0.50,
+        le=1.0,
+    )
+    strategy_breakout_max_close_location: float = Field(
+        default=0.85,
         ge=0.50,
         le=1.0,
     )
@@ -181,15 +265,15 @@ class Settings(BaseSettings):
     scalp_risk_reward_ratio: float = Field(default=2.00, ge=1.0, le=5.0)
     scalp_min_stop_loss_pct: float = Field(default=0.005, gt=0.0, le=0.02)
     scalp_max_stop_loss_pct: float = Field(default=0.008, gt=0.0, le=0.05)
-    scalp_max_spread_bps: float = Field(default=15.0, ge=0.1, le=100.0)
+    scalp_max_spread_bps: float = Field(default=4.0, ge=0.1, le=100.0)
     scalp_max_entry_slippage_bps: float = Field(default=5.0, ge=0.1, le=100.0)
     scalp_estimated_round_trip_fee_bps: float = Field(
         default=8.0,
         ge=0.0,
         le=100.0,
     )
-    scalp_min_net_edge_bps: float = Field(default=5.0, ge=0.0, le=100.0)
-    scalp_reentry_cooldown_seconds: int = Field(default=60, ge=0, le=3600)
+    scalp_min_net_edge_bps: float = Field(default=15.0, ge=0.0, le=100.0)
+    scalp_reentry_cooldown_seconds: int = Field(default=0, ge=0, le=3600)
     scalp_websocket_enabled: bool = True
     scalp_demo_websocket_enabled: bool = False
     scalp_stream_fallback_seconds: int = Field(default=20, ge=5, le=300)
@@ -226,6 +310,20 @@ class Settings(BaseSettings):
     scalp_partial_profit_enabled: bool = True
     scalp_partial_profit_trigger_r: float = Field(default=1.0, ge=0.25, le=10.0)
     scalp_partial_profit_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+
+    # Swing strategies (trend/range/breakout/reversal/countertrend/transition)
+    # had no analogous position management at all: a fixed stop and target
+    # set at entry, never adjusted, unlike scalp's break-even/trailing/
+    # partial-profit handling in live/loop.py's _manage_scalp_position.
+    # A trade that goes meaningfully favorable and then reverses all the way
+    # back captures none of that unrealized move. These give swing trades
+    # the same class of protection scalp already has, at slightly wider
+    # triggers reflecting their larger stop distances and longer hold times.
+    swing_break_even_trigger_r: float = Field(default=0.75, ge=0.25, le=5.0)
+    swing_break_even_offset_bps: float = Field(default=5.0, ge=0.0, le=100.0)
+    swing_trailing_trigger_r: float = Field(default=1.25, ge=0.5, le=10.0)
+    swing_trailing_distance_r: float = Field(default=0.75, ge=0.1, le=5.0)
+    swing_stop_update_min_bps: float = Field(default=2.0, ge=0.1, le=100.0)
     performance_governance_window_days: int = Field(default=30, ge=7, le=365)
     walk_forward_min_trades: int = Field(default=30, ge=5, le=10000)
     walk_forward_max_drawdown_pct: float = Field(default=15.0, gt=0.0, le=100.0)
@@ -265,10 +363,18 @@ class Settings(BaseSettings):
     )
     min_stop_loss_pct: float = Field(default=0.0035, gt=0.0, le=0.10)
     max_stop_loss_pct: float = Field(default=0.02, gt=0.0, le=0.20)
+    # A flat percentage floor has no relationship to the round-trip fee
+    # sitting right next to it in each StrategyPolicy - if the floor clamps
+    # a stop to a distance only a few times the fee, fees eat a large slice
+    # of the capital actually at risk regardless of signal quality. This
+    # requires the effective stop to be at least this many multiples of the
+    # strategy's own estimated round-trip fee, bounding fee/risk to roughly
+    # 1/min_stop_fee_multiple (5.0 -> fees capped at ~20% of risked capital).
+    min_stop_fee_multiple: float = Field(default=5.0, ge=1.0, le=20.0)
     risk_block_alert_cooldown_seconds: int = Field(default=900, ge=60, le=86_400)
 
-    force_ta_only: bool = False
-    auto_retrain_enabled: bool = True
+    force_ta_only: bool = True
+    auto_retrain_enabled: bool = False
     auto_retrain_on_startup: bool = False
     model_update_interval_hours: int = Field(default=24, ge=1, le=168)
     auto_retrain_check_interval_seconds: int = Field(
@@ -291,6 +397,11 @@ class Settings(BaseSettings):
     ml_drift_min_samples: int = Field(default=100, ge=20, le=10000)
     ml_candidate_min_accuracy: float = Field(default=0.45, ge=0.0, le=1.0)
     ml_candidate_min_macro_f1: float = Field(default=0.35, ge=0.0, le=1.0)
+    signal_source_gate_enabled: bool = True
+    signal_source_gate_min_samples: int = Field(default=3, ge=3, le=10000)
+    signal_source_gate_min_accuracy: float = Field(default=0.45, ge=0.0, le=1.0)
+    signal_source_gate_min_avg_bps: float = Field(default=2.0, ge=-1000.0, le=1000.0)
+    signal_source_gate_lookback: int = Field(default=2000, ge=100, le=100000)
 
     log_level: str = "INFO"
     log_dir: str = "data/logs"
@@ -313,7 +424,43 @@ class Settings(BaseSettings):
         ge=1.0,
         le=300.0,
     )
-    supervisor_max_restarts_per_hour: int = Field(default=5, ge=1, le=100)
+    # A live 2026-09-07 run showed a single ~24-minute exchange/network
+    # outage (repeated OHLCV RequestTimeout + failed clock sync) burn the
+    # entire restart budget: each restart cycle costs the 180s startup
+    # grace period plus backoff, so 5 restarts is only ~17 minutes of
+    # patience before the bot gives up and stops trading entirely until an
+    # operator notices and restarts it by hand. Raised max_restarts to 10
+    # (~38 min patience for a hang, at the unchanged 60s backoff cap - see
+    # below) so a transient demo-API or home-network blip doesn't strand
+    # the bot for the rest of the hour; genuinely persistent failures still
+    # eventually exhaust the budget and now fire a critical alert (see
+    # TradingSupervisor._alert_exhausted) instead of dying silently.
+    #
+    # Deliberately did NOT raise supervisor_max_backoff_seconds alongside
+    # this: for a fast crash-loop (child exits immediately every launch,
+    # e.g. a bad deploy) the pre-alert delay is pure backoff-sum with no
+    # 180s grace wait, and doubling both max_restarts and the backoff cap
+    # together would have made that case ~5.6x slower to alert (135s ->
+    # 755s) for zero benefit - a crash-looping process isn't waiting on a
+    # network timeout, so it doesn't need extra patience. Keeping the 60s
+    # cap while only raising max_restarts gets most of the hang-scenario
+    # benefit (17 -> 38 min) while keeping crash-loop alert latency bounded
+    # (135s -> 495s).
+    #
+    # If you ever raise supervisor_startup_grace_seconds,
+    # supervisor_bootstrap_phase_stall_seconds or bot_progress_stall_seconds,
+    # re-check the math: TradingSupervisor._warn_if_exhaustion_unreachable
+    # warns at startup if max_restarts_per_hour * worst-case-restart-cycle
+    # reaches the 3600s rolling window used to detect exhaustion, since past
+    # that point old restarts get pruned as fast as new ones accumulate and
+    # the "Trading Bot STOPPED" alert stops firing entirely.
+    #
+    # Lowered 10 -> 8 when the bootstrap-phase kill path was added: worst
+    # cycle is now max(grace 180, grace+phase_stall 300, progress_stall+
+    # stale+check 245) + shutdown 30 + max_backoff 60 = 390s, and 390 * 8 =
+    # 3120 < 3600 keeps the alert reachable with margin (390 * 10 = 3900
+    # would not).
+    supervisor_max_restarts_per_hour: int = Field(default=8, ge=1, le=100)
     supervisor_restart_backoff_seconds: float = Field(
         default=5.0,
         ge=0.0,
@@ -323,6 +470,39 @@ class Settings(BaseSettings):
         default=60.0,
         ge=1.0,
         le=3600.0,
+    )
+    # How long the in-process loop watchdog (LiveTradingLoop's heartbeat
+    # publisher) waits before declaring the main scan loop hung and
+    # withholding heartbeats so the supervisor restarts the child.
+    #
+    # Deliberately separate from supervisor_heartbeat_stale_seconds: that
+    # one governs how stale a heartbeat FILE may get before the supervisor
+    # acts, while this governs how long the loop may go without completing
+    # a unit of work. One knob was doing both jobs at 90s, which is far too
+    # tight for the second: a single market-data read can legitimately take
+    # ~93s (3 ccxt attempts x 30s plus backoff), and an entry places four
+    # sequential orders on top of that.
+    bot_progress_stall_seconds: float = Field(default=150.0, ge=30.0, le=1800.0)
+    # Max time a single startup phase (exchange connect, audit restore,
+    # exchange reconciliation, ...) may take before the bootstrap heartbeat
+    # publisher stops refreshing and lets the supervisor restart the child.
+    # Bounds a startup wedged on one await without punishing a merely slow
+    # one - the whole startup measured ~117s on a slow link, and this
+    # bounds any single phase of it.
+    supervisor_bootstrap_phase_stall_seconds: float = Field(
+        default=120.0,
+        ge=10.0,
+        le=1800.0,
+    )
+    # Hard ceiling on TradingSupervisor._alert_exhausted's total delivery
+    # time (all channels, all retries combined). Without this, an
+    # unbounded asyncio.run(alerter.send(...)) could block process exit
+    # for minutes during exactly the degraded-network conditions that
+    # exhausted the restart budget in the first place.
+    supervisor_alert_timeout_seconds: float = Field(
+        default=20.0,
+        ge=1.0,
+        le=120.0,
     )
     rollout_artifact_path: str = "data/governance/rollout.json"
     mainnet_canary_enabled: bool = True
@@ -427,6 +607,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "STRATEGY_MIN_ATR_PCT must be lower than STRATEGY_MAX_ATR_PCT"
             )
+        if (
+            self.strategy_breakout_min_close_location
+            >= self.strategy_breakout_max_close_location
+        ):
+            # With min >= max, quality_gate's min <= close_location <= max
+            # check (and its mirrored short-side range) is unsatisfiable for
+            # every possible candle, silently rejecting every breakout
+            # signal regardless of price action even though the strategy
+            # stays listed as enabled.
+            raise ValueError(
+                "STRATEGY_BREAKOUT_MIN_CLOSE_LOCATION must be lower than "
+                "STRATEGY_BREAKOUT_MAX_CLOSE_LOCATION"
+            )
         minimum_training_rows = (
             self.min_ohlcv_candles + self.prediction_horizon + self.feature_lookback + 1
         )
@@ -461,22 +654,38 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid timeframes: {', '.join(invalid)}")
         return ",".join(timeframes)
 
+    @field_validator("enabled_strategies")
+    @classmethod
+    def validate_enabled_strategies(cls, value: str) -> str:
+        strategies = [item.lower() for item in cls._split_csv(value)]
+        invalid = sorted(set(strategies) - cls.allowed_strategies)
+        if invalid:
+            raise ValueError(f"Invalid enabled strategies: {', '.join(invalid)}")
+        return ",".join(dict.fromkeys(strategies))
+
     @field_validator("disabled_strategy_scopes")
     @classmethod
     def validate_disabled_strategy_scopes(cls, value: str) -> str:
         scopes = []
         for raw_scope in cls._split_csv(value):
-            parts = raw_scope.split(":", 1)
-            if len(parts) != 2:
+            parts = raw_scope.split(":")
+            if len(parts) not in {2, 3}:
                 raise ValueError(
-                    "DISABLED_STRATEGY_SCOPES entries must use SYMBOL:timeframe"
+                    "DISABLED_STRATEGY_SCOPES entries must use SYMBOL:timeframe "
+                    "or SYMBOL:timeframe:strategy"
                 )
             symbol, timeframe = parts[0].upper(), parts[1]
             if not re.fullmatch(r"[A-Z0-9]{6,20}", symbol):
                 raise ValueError(f"Invalid disabled strategy symbol: {symbol}")
             if timeframe not in cls.allowed_timeframes:
                 raise ValueError(f"Invalid disabled strategy timeframe: {timeframe}")
-            scopes.append(f"{symbol}:{timeframe}")
+            if len(parts) == 3:
+                strategy = parts[2].lower()
+                if strategy not in cls.allowed_strategies:
+                    raise ValueError(f"Invalid disabled strategy name: {strategy}")
+                scopes.append(f"{symbol}:{timeframe}:{strategy}")
+            else:
+                scopes.append(f"{symbol}:{timeframe}")
         return ",".join(scopes)
 
     @field_validator("position_scope")
@@ -550,6 +759,10 @@ class Settings(BaseSettings):
         return set(self._split_csv(self.disabled_strategy_scopes))
 
     @property
+    def enabled_strategies_set(self) -> set[str]:
+        return set(self._split_csv(self.enabled_strategies))
+
+    @property
     def has_exchange_credentials(self) -> bool:
         return bool(self.binance_api_key and self.binance_api_secret)
 
@@ -570,8 +783,7 @@ class Settings(BaseSettings):
     @property
     def ml_effective_label_min_return(self) -> float:
         cost_floor = (
-            self.scalp_effective_round_trip_fee_bps
-            + self.strategy_min_net_edge_bps
+            self.scalp_effective_round_trip_fee_bps + self.strategy_min_net_edge_bps
         ) / 10_000
         return max(self.ml_label_min_return, cost_floor)
 

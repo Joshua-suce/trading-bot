@@ -48,6 +48,114 @@ def helper(trades: list[tuple[str, TradeRecord]]):
     return _trades_for_symbol, _open_notional
 
 
+class TestExposureLimiterConcurrentEntryRace:
+    # A passed check isn't recorded into open_trades until many awaits
+    # later (order submission, fill validation, protective-order
+    # placement). These simulate two symbols whose entry attempts are
+    # in flight concurrently in the same scan batch: neither has reached
+    # open_trades yet when the second one's check runs.
+
+    def test_reservation_from_in_flight_entry_counts_toward_total_notional(
+        self, monkeypatch: MonkeyPatch
+    ):
+        # Isolate the total-notional check: disable the symbol and
+        # correlated caps (BTCUSDT/ETHUSDT are correlated by default) so
+        # only the dimension under test can reject.
+        monkeypatch.setattr(settings, "correlated_symbols", "")
+        monkeypatch.setattr(settings, "max_symbol_open_notional_pct", 1.0)
+        monkeypatch.setattr(settings, "max_total_open_notional_pct", 0.20)
+        limiter = make_limiter(total_equity=5_000.0)  # total cap = $1000
+        sym_fn, not_fn = helper([])  # nothing in open_trades yet for either
+
+        first_ok, first_reason = limiter.check_exposure_limits(
+            "BTCUSDT",
+            "long",
+            600.0,
+            1.0,
+            "BTCUSDT:5m:trend",
+            trades_for_symbol=sym_fn,
+            open_notional=not_fn,
+        )
+        assert first_ok, first_reason
+
+        second_ok, second_reason = limiter.check_exposure_limits(
+            "ETHUSDT",
+            "long",
+            500.0,
+            1.0,
+            "ETHUSDT:5m:trend",
+            trades_for_symbol=sym_fn,
+            open_notional=not_fn,
+        )
+
+        assert not second_ok
+        assert "total exposure limit exceeded" in second_reason
+
+    def test_released_reservation_no_longer_blocks_a_later_entry(
+        self, monkeypatch: MonkeyPatch
+    ):
+        monkeypatch.setattr(settings, "correlated_symbols", "")
+        monkeypatch.setattr(settings, "max_symbol_open_notional_pct", 1.0)
+        monkeypatch.setattr(settings, "max_total_open_notional_pct", 0.20)
+        limiter = make_limiter(total_equity=5_000.0)
+        sym_fn, not_fn = helper([])
+
+        ok, reason = limiter.check_exposure_limits(
+            "BTCUSDT",
+            "long",
+            600.0,
+            1.0,
+            "BTCUSDT:5m:trend",
+            trades_for_symbol=sym_fn,
+            open_notional=not_fn,
+        )
+        assert ok, reason
+
+        limiter.release_reservation("BTCUSDT:5m:trend")
+
+        ok, reason = limiter.check_exposure_limits(
+            "ETHUSDT",
+            "long",
+            500.0,
+            1.0,
+            "ETHUSDT:5m:trend",
+            trades_for_symbol=sym_fn,
+            open_notional=not_fn,
+        )
+        assert ok, reason
+
+    def test_reservation_counts_toward_leg_count_limit(
+        self, monkeypatch: MonkeyPatch
+    ):
+        monkeypatch.setattr(settings, "max_positions_per_symbol", 1)
+        limiter = make_limiter()
+        sym_fn, not_fn = helper([])
+
+        first_ok, first_reason = limiter.check_exposure_limits(
+            "BTCUSDT",
+            "long",
+            100.0,
+            1.0,
+            "BTCUSDT:5m:trend",
+            trades_for_symbol=sym_fn,
+            open_notional=not_fn,
+        )
+        assert first_ok, first_reason
+
+        second_ok, second_reason = limiter.check_exposure_limits(
+            "BTCUSDT",
+            "long",
+            100.0,
+            1.0,
+            "BTCUSDT:15m:trend",
+            trades_for_symbol=sym_fn,
+            open_notional=not_fn,
+        )
+
+        assert not second_ok
+        assert "max trade legs" in second_reason
+
+
 class TestExposureLimiter:
     def test_ok_when_no_trades_and_equity_available(self):
         limiter = make_limiter()

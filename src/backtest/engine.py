@@ -8,6 +8,7 @@ import pandas as pd
 from src.backtest.baseline import ScopeBaseline, build_scope_baselines
 from src.backtest.metrics import BacktestMetrics
 from src.backtest.types import BacktestTrade
+from src.config import settings
 from src.indicators.compute import compute_all_indicators
 from src.live.data_quality import timeframe_seconds
 from src.risk.stop_loss import StopLossManager
@@ -78,6 +79,9 @@ class BacktestEngine:
         position_strategy = default_strategy
         entry_bar_index = 0
         maximum_hold_bars: int | None = None
+        # Most favorable price reached since entry, for break-even/trailing
+        # management on policy-active trades (see the update block below).
+        position_peak_price = 0.0
         strategy_registry = StrategyRegistry()
         strategy_names = {policy.name for policy in strategy_registry.all()}
         stop_manager = StopLossManager()
@@ -121,6 +125,7 @@ class BacktestEngine:
                             side,
                             atr_val,
                             strategy=position_strategy,
+                            market_context=row.to_dict(),
                         )
                         stop_loss = levels.stop_loss
                         take_profit = float(levels.take_profit or entry_price)
@@ -149,6 +154,7 @@ class BacktestEngine:
                         entry_bar_index = i
                         position_side = side
                         entry_time = _to_trade_datetime(row.name)
+                        position_peak_price = entry_price
                         if not policy_active:
                             if side == "long":
                                 stop_loss = entry_price - sl_distance
@@ -168,8 +174,14 @@ class BacktestEngine:
                         )
                         equity -= entry_fee
 
-            # In position — check for exit (SL/TP/reversal)
-            else:
+            # In position — check for exit (SL/TP/reversal). Deliberately
+            # `if`, not `elif`/`else`: a position opened above in this same
+            # iteration must still have its exposure to next_row (the very
+            # next bar) checked here, or that bar's high/low is skipped
+            # entirely - a stop-loss (or take-profit) breach on the first
+            # bar after entry would never be detected, silently turning a
+            # real loss (or win) into whatever happens to occur bars later.
+            if in_position:
                 exit_reason = None
                 exit_price = None
                 next_close = next_row["close"]
@@ -269,6 +281,65 @@ class BacktestEngine:
                             next_close + df.iloc[: i + 2]["atr"].iloc[-1] * atr_mult_sl
                         )
                         stop_loss = min(stop_loss, new_sl)
+
+                # Break-even/trailing management for policy-active trades.
+                # Every non-scalp strategy previously had NO analogous
+                # mechanism at all (live/loop.py's break-even/trailing/
+                # partial-profit handling in _manage_scalp_position is
+                # scoped to strategy=="scalp" only) - a trade that moved
+                # deeply favorable and then reversed captured none of that
+                # unrealized move, exiting at the original fixed stop like
+                # it had never been in profit. Ordering matters: the SL/TP
+                # check above already used the stop as it stood at the
+                # START of this bar, so this can only affect bars from here
+                # forward, same as the (disabled-for-policy) block above.
+                if in_position and policy_active and sl_distance > 0:
+                    if position_side == "long":
+                        position_peak_price = max(position_peak_price, next_high)
+                        favorable_r = (
+                            position_peak_price - entry_price
+                        ) / sl_distance
+                    else:
+                        position_peak_price = min(position_peak_price, next_low)
+                        favorable_r = (
+                            entry_price - position_peak_price
+                        ) / sl_distance
+
+                    candidates = [stop_loss]
+                    if favorable_r >= settings.swing_break_even_trigger_r:
+                        offset = (
+                            entry_price * settings.swing_break_even_offset_bps / 10_000
+                        )
+                        candidates.append(
+                            entry_price + offset
+                            if position_side == "long"
+                            else entry_price - offset
+                        )
+                    if favorable_r >= settings.swing_trailing_trigger_r:
+                        distance = sl_distance * settings.swing_trailing_distance_r
+                        candidates.append(
+                            position_peak_price - distance
+                            if position_side == "long"
+                            else position_peak_price + distance
+                        )
+                    proposed = (
+                        max(candidates)
+                        if position_side == "long"
+                        else min(candidates)
+                    )
+                    improvement = (
+                        proposed - stop_loss
+                        if position_side == "long"
+                        else stop_loss - proposed
+                    )
+                    minimum = next_close * settings.swing_stop_update_min_bps / 10_000
+                    stays_valid = (
+                        proposed < next_close
+                        if position_side == "long"
+                        else proposed > next_close
+                    )
+                    if improvement >= minimum and stays_valid:
+                        stop_loss = proposed
 
             # Mark-to-market NAV for the equity curve
             if in_position:

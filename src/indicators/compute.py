@@ -7,7 +7,13 @@ from src.indicators.trend import TrendIndicators
 from src.indicators.volatility import VolatilityIndicators
 from src.indicators.volume import VolumeIndicators
 
-# Stateless singletons — reused across every compute_all_indicators call
+# Stateless singletons — reused across every compute_all_indicators call.
+# They MUST stay stateless: compute_all_indicators is dispatched through
+# asyncio.to_thread from the live loop (it blocks for ~1s on a 200-row
+# frame and was stalling the whole event loop, which made awaited REST
+# reads look like 4-10s hangs and tripped the loop watchdog), so several
+# calls can run concurrently on different threads. Any per-instance
+# mutable state added here becomes a data race.
 trend = TrendIndicators()
 momentum = MomentumIndicators()
 volatility = VolatilityIndicators()

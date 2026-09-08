@@ -13,6 +13,7 @@ from src.signals.decision_policy import (
 )
 from src.signals.invocation import generate_with_context
 from src.signals.quality_gate import StrategyQualityGate
+from src.signals.regime import detect_regime, regime_appropriate_strategies
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,13 @@ class ReplayResult:
 
 
 class DecisionReplayEngine:
+    # Must stay >= the largest lookback used anywhere in the per-bar
+    # evaluate() call path (currently 60, from
+    # StrategyQualityGate._dynamic_percentile). See the comment at its use
+    # site in evaluate() for why this can be small despite indicators
+    # themselves needing much longer warmup (e.g. ema_200).
+    _REPLAY_WINDOW_ROWS = 120
+
     def __init__(
         self,
         aggregator: SignalAggregator,
@@ -41,9 +49,7 @@ class DecisionReplayEngine:
         self.aggregator = aggregator
         self.quality_gate = quality_gate or strategy_quality_gate_from_settings()
         self.backtest_engine = backtest_engine or BacktestEngine(
-            commission=(
-                settings.scalp_effective_round_trip_fee_bps / 2 / 10_000
-            )
+            commission=(settings.scalp_effective_round_trip_fee_bps / 2 / 10_000)
         )
         self.min_history = max(min_history, 2)
 
@@ -54,11 +60,15 @@ class DecisionReplayEngine:
         symbol: str,
         timeframe: str,
         higher_timeframe_df: pd.DataFrame | None = None,
+        strategy: str | None = None,
+        enforce_regime_filter: bool = False,
     ) -> ReplayResult:
         observations = self.evaluate(
             df,
             timeframe=timeframe,
             higher_timeframe_df=higher_timeframe_df,
+            strategy=strategy,
+            enforce_regime_filter=enforce_regime_filter,
         )
         accepted = {
             observation.timestamp: observation
@@ -92,6 +102,14 @@ class DecisionReplayEngine:
         *,
         timeframe: str,
         higher_timeframe_df: pd.DataFrame | None = None,
+        strategy: str | None = None,
+        # Deliberately opt-in, not defaulted from settings.regime_filter_enforced
+        # (which live/loop.py does read by default): this engine is also
+        # exercised with minimal synthetic frames that don't carry a full
+        # indicator set, and detect_regime() would silently classify those
+        # as e.g. "squeeze" and filter out signals the caller never meant
+        # to have regime-checked. Pass True explicitly to test this filter.
+        enforce_regime_filter: bool = False,
     ) -> list[ReplayObservation]:
         if len(df) <= self.min_history:
             return []
@@ -99,19 +117,55 @@ class DecisionReplayEngine:
             df.index,
             higher_timeframe_df,
         )
+        # Every column compute_all_indicators produces is causal (rolling
+        # windows / ewm / shift(N>=0) only look backward - verified across
+        # src/indicators/*.py; the one non-causal computation, Ichimoku's
+        # chikou span, is dead code compute_all_indicators never calls).
+        # That means indicators for row i are unaffected by any row after i,
+        # so computing the full series once here and slicing per iteration
+        # below produces identical values to recomputing from scratch on
+        # every growing window, at a fraction of the cost: this used to be
+        # O(n^2) (every one of ~30 indicators recomputed on an ever-larger
+        # window every bar, and then recomputed AGAIN inside the aggregator
+        # since it was handed the raw window, not this precomputed frame),
+        # which made anything past a few hundred bars impractically slow.
+        full_indicators = compute_all_indicators(df)
         observations = []
         for end in range(self.min_history, len(df)):
-            window = df.iloc[: end + 1]
-            indicators = compute_all_indicators(window)
-            timestamp = pd.Timestamp(window.index[-1])
+            # A trailing window, not the full history-to-date: every rolling
+            # indicator's own warmup is already baked into full_indicators
+            # above, so a slice only needs to be long enough to satisfy
+            # per-bar lookback logic - the largest is
+            # StrategyQualityGate._dynamic_percentile's lookback=60.
+            # _REPLAY_WINDOW_ROWS gives comfortable margin above that.
+            # Bounding this (instead of an ever-growing df.iloc[:end+1])
+            # turns each iteration's slice cost from O(end) into O(1),
+            # making the whole loop O(n) instead of O(n^2) - the
+            # difference between an hour-long 1m/scalp backtest and one
+            # that finishes in a couple of minutes.
+            start = max(0, end + 1 - self._REPLAY_WINDOW_ROWS)
+            window_indicators = full_indicators.iloc[start : end + 1]
+            timestamp = pd.Timestamp(window_indicators.index[-1])
             higher_regime = higher_regimes.get(timestamp)
-            signal = generate_with_context(
+            signals = generate_with_context(
                 self.aggregator,
-                window,
+                window_indicators,
                 higher_regime or 0,
             )
+            if strategy is not None:
+                signals = [signal for signal in signals if signal.strategy == strategy]
+            if enforce_regime_filter:
+                allowed = set(
+                    regime_appropriate_strategies(detect_regime(window_indicators))
+                )
+                signals = [s for s in signals if s.strategy in allowed]
+            if not signals:
+                continue
+            signal = max(signals, key=lambda s: s.confidence)
+            if signal.direction == 0:
+                continue
             decision = evaluate_signal_decision(
-                indicators,
+                window_indicators,
                 signal,
                 timeframe=timeframe,
                 higher_timeframe_regime=higher_regime,

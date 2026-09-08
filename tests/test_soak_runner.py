@@ -2,12 +2,19 @@ import json
 
 import pytest
 
+from src.config import settings
 from src.main import parse_args
 from src.soak import SoakRunner
 
 
 @pytest.mark.asyncio
-async def test_offline_soak_runner_cleans_up_open_trades(tmp_path):
+async def test_offline_soak_runner_cleans_up_open_trades(tmp_path, monkeypatch):
+    # Isolate from whatever DISABLED_STRATEGY_SCOPES happens to be set to in
+    # the local .env (e.g. scopes disabled after a real backtest review) -
+    # this test exercises soak/shutdown lifecycle mechanics via a specific
+    # scope, not the scope-disable feature itself, so it must not depend on
+    # ambient config.
+    monkeypatch.setattr(settings, "disabled_strategy_scopes", "")
     report_path = tmp_path / "soak_report.json"
     runner = SoakRunner(
         audit_path=str(tmp_path / "audit.db"),

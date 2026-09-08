@@ -163,3 +163,10 @@ def test_preflight_allows_demo_trade_with_credentials():
 
     assert result.environment == "demo"
     assert result.credentials_required is True
+
+
+def test_preflight_blocks_inert_signal_confluence_requirement():
+    cfg = make_settings(require_signal_confluence=True)
+
+    with pytest.raises(RuntimeError, match="REQUIRE_SIGNAL_CONFLUENCE"):
+        run_preflight("trade", cfg=cfg)

@@ -260,9 +260,15 @@ async def test_reconciliation_blocks_unmanaged_exchange_position(tmp_path):
     reconciled = await manager.reconcile_exchange_state()
 
     assert reconciled is False
-    allowed, reason = manager.audit_store.trading_allowed()
+    # A stray position on BTCUSDT must block entries on BTCUSDT specifically
+    # ...
+    allowed, reason = manager.audit_store.trading_allowed(symbol="BTCUSDT")
     assert allowed is False
-    assert "trading degraded (level 1)" in reason
+    assert "blocked" in reason
+    # ...but must not halt the whole account: an unrelated symbol, and the
+    # bare global check, both stay allowed.
+    assert manager.audit_store.trading_allowed(symbol="ETHUSDT") == (True, "ok")
+    assert manager.audit_store.trading_allowed() == (True, "ok")
 
 
 @pytest.mark.asyncio
@@ -771,3 +777,48 @@ def test_finished_binance_algo_status_is_treated_as_filled():
     assert FillResolver.order_is_filled(
         {"status": "open", "info": {"algoStatus": "FINISHED"}}
     )
+
+
+def test_global_recovery_does_not_clear_other_symbols_degraded_state(tmp_path):
+    # try_recover_trading_level() with no symbol used to unconditionally
+    # wipe EVERY symbol's degrade state via _clear_all_symbol_trading_state,
+    # with no threshold gate and no exemption for RED - defeating the whole
+    # point of scoping a degrade to one symbol in the first place.
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    audit.degrade_trading_level("stray position", symbol="ADAUSDT")
+    assert audit.get_symbol_trading_level("ADAUSDT") == AuditStore.TRADING_LEVEL_YELLOW
+
+    audit.try_recover_trading_level("reconciliation successful")
+
+    assert audit.get_symbol_trading_level("ADAUSDT") == AuditStore.TRADING_LEVEL_YELLOW
+
+
+def test_symbol_recovery_requires_consecutive_successes(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    audit.degrade_trading_level("stray position", symbol="ADAUSDT")
+    assert audit.get_symbol_trading_level("ADAUSDT") == AuditStore.TRADING_LEVEL_YELLOW
+
+    for _ in range(AuditStore.RECOVERY_THRESHOLD - 1):
+        audit.try_recover_trading_level("ok", symbol="ADAUSDT")
+        assert (
+            audit.get_symbol_trading_level("ADAUSDT")
+            == AuditStore.TRADING_LEVEL_YELLOW
+        )
+
+    audit.try_recover_trading_level("ok", symbol="ADAUSDT")
+    assert audit.get_symbol_trading_level("ADAUSDT") == AuditStore.TRADING_LEVEL_GREEN
+
+
+def test_symbol_red_level_requires_manual_clear_not_auto_recovery(tmp_path):
+    audit = AuditStore(str(tmp_path / "audit.db"))
+    for _ in range(20):
+        if audit.get_symbol_trading_level("ADAUSDT") == AuditStore.TRADING_LEVEL_RED:
+            break
+        audit.degrade_trading_level("repeated failure", symbol="ADAUSDT")
+    assert audit.get_symbol_trading_level("ADAUSDT") == AuditStore.TRADING_LEVEL_RED
+
+    for _ in range(10):
+        recovered = audit.try_recover_trading_level("ok", symbol="ADAUSDT")
+        assert recovered is False
+
+    assert audit.get_symbol_trading_level("ADAUSDT") == AuditStore.TRADING_LEVEL_RED

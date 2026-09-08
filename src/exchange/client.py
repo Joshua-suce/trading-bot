@@ -453,7 +453,25 @@ class ExchangeClient:
 
     # Stream a single OHLCV update via WebSocket (from ccxt.pro)
     async def watch_ohlcv(self, symbol: str, timeframe: str = "1h") -> pd.DataFrame:
-        raw = await self.ws.watch_ohlcv(symbol, timeframe)
+        # ccxt.pro does not itself bound this wait: if the connection goes
+        # silently half-open (no close event fires, so ccxt.pro's own
+        # reconnect logic never triggers) this await would otherwise hang
+        # forever, permanently killing the stream with no recovery path.
+        # Reuse scalp_stream_fallback_seconds as the per-call ceiling since
+        # a read that slow already makes the stream "unhealthy" by that
+        # same threshold (see _scalp_stream_is_healthy) - there's nothing
+        # to gain by waiting past it. On timeout, force-close the socket so
+        # the caller's retry creates a fresh connection instead of waiting
+        # on the same dead one again.
+        try:
+            raw = await asyncio.wait_for(
+                self.ws.watch_ohlcv(symbol, timeframe),
+                timeout=settings.scalp_stream_fallback_seconds,
+            )
+        except asyncio.TimeoutError:
+            with suppress(Exception):
+                await self.ws.close()
+            raise
         df = pd.DataFrame(
             raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
         )

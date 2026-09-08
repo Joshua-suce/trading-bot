@@ -1,8 +1,9 @@
 import json
 import sqlite3
+import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -27,13 +28,11 @@ class AuditStore:
             configured_path = Path(__file__).resolve().parents[2] / configured_path
         self.db_path = configured_path.resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self._init_schema()
         self._retire_legacy_open_trades()
         self._redact_legacy_signed_urls()
         self._migrate_legacy_emergency_stop()
-        self._symbol_levels: dict[str, str] = {}
-        self._symbol_failures: dict[str, int] = {}
-        self._symbol_successes: dict[str, int] = {}
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
@@ -41,14 +40,24 @@ class AuditStore:
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
+    def _thread_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+            self._local.conn = conn
+        return conn
+
     @contextmanager
     def _connection(self):
-        conn = self._connect()
+        conn = self._thread_connection()
         try:
             with conn:
                 yield conn
-        finally:
-            conn.close()
+        except sqlite3.Error:
+            with suppress(Exception):
+                conn.close()
+            self._local.conn = None
+            raise
 
     def _init_schema(self) -> None:
         attempts = 5
@@ -152,9 +161,10 @@ class AuditStore:
                     outcome_horizon_seconds REAL,
                     evaluated_at TEXT,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(symbol, timeframe, candle_timestamp)
+                    UNIQUE(symbol, timeframe, candle_timestamp, strategy)
                 )
                 """)
+            self._migrate_signal_observation_strategy_uniqueness(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS execution_attempts (
                     id TEXT PRIMARY KEY,
@@ -212,7 +222,9 @@ class AuditStore:
                 """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_signal_observations_scope_time
-                ON signal_observations(symbol, timeframe, candle_timestamp DESC)
+                ON signal_observations(
+                    symbol, timeframe, strategy, candle_timestamp DESC
+                )
                 """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_signal_observations_outcome
@@ -226,6 +238,84 @@ class AuditStore:
                 CREATE INDEX IF NOT EXISTS idx_execution_attempts_status_time
                 ON execution_attempts(status, started_at DESC)
                 """)
+
+    def _migrate_signal_observation_strategy_uniqueness(self, conn: sqlite3.Connection):
+        legacy_unique = False
+        for index in conn.execute("PRAGMA index_list(signal_observations)").fetchall():
+            if not bool(index[2]):
+                continue
+            columns = [
+                row[2]
+                for row in conn.execute(
+                    f"PRAGMA index_info({self._quote_identifier(index[1])})"
+                ).fetchall()
+            ]
+            if columns == ["symbol", "timeframe", "candle_timestamp"]:
+                legacy_unique = True
+                break
+        if not legacy_unique:
+            return
+
+        conn.execute(
+            "ALTER TABLE signal_observations RENAME TO signal_observations_old"
+        )
+        conn.execute("""
+            CREATE TABLE signal_observations (
+                id TEXT PRIMARY KEY,
+                observed_at TEXT NOT NULL,
+                candle_timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                direction INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                minimum_confidence REAL NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                signal_price REAL NOT NULL,
+                ta_source TEXT NOT NULL,
+                ml_strength REAL NOT NULL,
+                ml_confidence REAL NOT NULL,
+                quality_score REAL,
+                quality_reason TEXT,
+                metrics_json TEXT NOT NULL,
+                execution_status TEXT NOT NULL DEFAULT 'not_attempted',
+                outcome_status TEXT NOT NULL DEFAULT 'pending',
+                outcome_price REAL,
+                raw_return_bps REAL,
+                directional_return_bps REAL,
+                direction_correct INTEGER,
+                outcome_horizon_seconds REAL,
+                evaluated_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(symbol, timeframe, candle_timestamp, strategy)
+            )
+            """)
+        conn.execute("""
+            INSERT OR IGNORE INTO signal_observations (
+                id, observed_at, candle_timestamp, symbol, timeframe, strategy,
+                direction, confidence, minimum_confidence, decision, reason,
+                signal_price, ta_source, ml_strength, ml_confidence,
+                quality_score, quality_reason, metrics_json, execution_status,
+                outcome_status, outcome_price, raw_return_bps,
+                directional_return_bps, direction_correct,
+                outcome_horizon_seconds, evaluated_at, updated_at
+            )
+            SELECT
+                id, observed_at, candle_timestamp, symbol, timeframe, strategy,
+                direction, confidence, minimum_confidence, decision, reason,
+                signal_price, ta_source, ml_strength, ml_confidence,
+                quality_score, quality_reason, metrics_json, execution_status,
+                outcome_status, outcome_price, raw_return_bps,
+                directional_return_bps, direction_correct,
+                outcome_horizon_seconds, evaluated_at, updated_at
+            FROM signal_observations_old
+            """)
+        conn.execute("DROP TABLE signal_observations_old")
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
 
     @staticmethod
     def _ensure_column(
@@ -312,7 +402,15 @@ class AuditStore:
     def _migrate_legacy_emergency_stop(self) -> None:
         emergency_value = self.get_control("emergency_stop", "false").lower()
         trading_level = self.get_control("trading_level", "")
-        if emergency_value == "true" and not trading_level:
+        # Reconcile on every startup, not just when trading_level has never
+        # been set: activate_emergency_stop() writes the emergency_stop flag
+        # and trading_level in two separate commits, so a crash between them
+        # can leave trading_level at a stale non-RED value (e.g. GREEN) even
+        # though emergency_stop='true' survived. trading_allowed() also
+        # checks emergency_stop directly as a belt-and-suspenders guard, but
+        # this repairs trading_level itself so the state is fully consistent
+        # again rather than permanently relying on that fallback.
+        if emergency_value == "true" and trading_level != self.TRADING_LEVEL_RED:
             reason = self._get_control_reason("emergency_stop")
             self.set_control(
                 "trading_level",
@@ -350,8 +448,45 @@ class AuditStore:
     def get_trading_level(self) -> str:
         return self.get_control("trading_level", self.TRADING_LEVEL_GREEN)
 
+    # Per-symbol circuit-breaker state (level/failures/successes) is
+    # persisted through the same controls table as the global trading
+    # level, keyed by symbol, rather than kept only in memory. An in-memory
+    # dict here would silently clear every symbol-specific trading block on
+    # any process restart (deploy, crash, OOM-kill, supervisor restart)
+    # even though the underlying reconciliation problem that caused the
+    # block was never resolved or reviewed.
+    @staticmethod
+    def _symbol_control_key(prefix: str, symbol: str) -> str:
+        return f"{prefix}:{symbol}"
+
+    def _get_symbol_int(self, prefix: str, symbol: str) -> int:
+        raw = self.get_control(self._symbol_control_key(prefix, symbol), "0")
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return 0
+
+    def _delete_controls_with_prefix(self, prefix: str) -> None:
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM controls WHERE key LIKE ? ESCAPE '\\'",
+                (escaped + "%",),
+            )
+
+    def _clear_all_symbol_trading_state(self) -> None:
+        for prefix in (
+            "symbol_trading_level",
+            "symbol_reconciliation_failures",
+            "symbol_reconciliation_successes",
+        ):
+            self._delete_controls_with_prefix(prefix + ":")
+
     def get_symbol_trading_level(self, symbol: str) -> str:
-        return self._symbol_levels.get(symbol, self.TRADING_LEVEL_GREEN)
+        return self.get_control(
+            self._symbol_control_key("symbol_trading_level", symbol),
+            self.TRADING_LEVEL_GREEN,
+        )
 
     def degrade_trading_level(self, reason: str = "", symbol: str | None = None) -> str:
         if symbol:
@@ -405,28 +540,35 @@ class AuditStore:
             self.TRADING_LEVEL_ORANGE,
             self.TRADING_LEVEL_RED,
         ]
-        current = self._symbol_levels.get(symbol, self.TRADING_LEVEL_GREEN)
+        level_key = self._symbol_control_key("symbol_trading_level", symbol)
+        failures_key = self._symbol_control_key(
+            "symbol_reconciliation_failures", symbol
+        )
+        successes_key = self._symbol_control_key(
+            "symbol_reconciliation_successes", symbol
+        )
+        current = self.get_symbol_trading_level(symbol)
         if current == self.TRADING_LEVEL_RED:
             return current
 
-        failures = self._symbol_failures.get(symbol, 0) + 1
-        self._symbol_failures[symbol] = failures
-        self._symbol_successes.pop(symbol, None)
+        failures = self._get_symbol_int("symbol_reconciliation_failures", symbol) + 1
+        self.set_control(failures_key, str(failures), reason)
+        self.set_control(successes_key, "0", "reset on failure")
 
         if failures >= self.RECOVERY_THRESHOLD:
             idx = levels.index(current)
             if idx < len(levels) - 1:
                 next_level = levels[idx + 1]
-                self._symbol_levels[symbol] = next_level
-                self._symbol_failures[symbol] = 0
+                self.set_control(level_key, next_level, reason)
+                self.set_control(failures_key, "0", "reset after escalation")
                 logger.warning(
                     f"Symbol {symbol} degraded to level {next_level}: {reason}"
                 )
                 return next_level
 
         if current == self.TRADING_LEVEL_GREEN and failures == 1:
-            self._symbol_levels[symbol] = self.TRADING_LEVEL_YELLOW
-            self._symbol_failures[symbol] = 1
+            self.set_control(level_key, self.TRADING_LEVEL_YELLOW, reason)
+            self.set_control(failures_key, "1", "set on first degrade")
             logger.warning(
                 f"Symbol {symbol} degraded to level "
                 f"{self.TRADING_LEVEL_YELLOW}: {reason}"
@@ -438,11 +580,20 @@ class AuditStore:
     def try_recover_trading_level(
         self, reason: str = "", symbol: str | None = None
     ) -> bool:
+        # The blind _clear_all_symbol_trading_state() this used to do here
+        # ran on EVERY successful global reconciliation pass (the reconciler
+        # calls this with no symbol whenever the global level isn't RED) -
+        # instantly wiping every symbol's degrade state with no threshold
+        # gate and no exemption for RED, defeating the whole point of the
+        # per-symbol scoping added alongside it (a stray issue on one symbol
+        # must require its own confirmed recovery, not get cleared as a
+        # side effect of an unrelated global check). Per-symbol recovery
+        # now goes only through _try_recover_symbol_level, which has its
+        # own threshold gate and (like the global path) refuses to
+        # auto-clear RED. _clear_all_symbol_trading_state() remains
+        # reserved for the explicit manual clear_emergency_stop() path.
         if symbol:
             return self._try_recover_symbol_level(symbol, reason)
-        self._symbol_levels.clear()
-        self._symbol_failures.clear()
-        self._symbol_successes.clear()
         return self._try_recover_global_level(reason)
 
     def _try_recover_global_level(self, reason: str) -> bool:
@@ -477,15 +628,27 @@ class AuditStore:
         return False
 
     def _try_recover_symbol_level(self, symbol: str, reason: str) -> bool:
-        current = self._symbol_levels.get(symbol, self.TRADING_LEVEL_GREEN)
+        current = self.get_symbol_trading_level(symbol)
         if current == self.TRADING_LEVEL_GREEN:
             return True
-        successes = self._symbol_successes.get(symbol, 0) + 1
-        self._symbol_successes[symbol] = successes
+        if current == self.TRADING_LEVEL_RED:
+            # Mirror _try_recover_global_level: RED is a manual-clear-only
+            # invariant, not something consecutive clean reconciliation
+            # passes alone should lift for a symbol either.
+            return False
+        successes = self._get_symbol_int("symbol_reconciliation_successes", symbol) + 1
+        self.set_control(
+            self._symbol_control_key("symbol_reconciliation_successes", symbol),
+            str(successes),
+            reason,
+        )
         if successes >= self.RECOVERY_THRESHOLD:
-            self._symbol_levels.pop(symbol, None)
-            self._symbol_failures.pop(symbol, None)
-            self._symbol_successes.pop(symbol, None)
+            for prefix in (
+                "symbol_trading_level",
+                "symbol_reconciliation_failures",
+                "symbol_reconciliation_successes",
+            ):
+                self._delete_control(self._symbol_control_key(prefix, symbol))
             logger.info(f"Symbol {symbol} recovered from level {current}")
             return True
         return False
@@ -746,6 +909,10 @@ class AuditStore:
                 (key, value, reason, self._now()),
             )
 
+    def _delete_control(self, key: str) -> None:
+        with self._connection() as conn:
+            conn.execute("DELETE FROM controls WHERE key = ?", (key,))
+
     def get_control(self, key: str, default: str = "") -> str:
         with self._connection() as conn:
             row = conn.execute(
@@ -904,17 +1071,18 @@ class AuditStore:
         reason: str,
         signal_price: float,
         ta_source: str,
-        ml_strength: float,
-        ml_confidence: float,
+        ml_strength: float = 0.0,
+        ml_confidence: float = 0.0,
         quality_score: float | None = None,
         quality_reason: str | None = None,
         metrics: dict[str, Any] | None = None,
     ) -> str:
         timestamp_text = self._timestamp_text(candle_timestamp)
+        strategy_key = strategy or "unknown"
         observation_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
-                f"signal:{symbol.upper()}:{timeframe}:{timestamp_text}",
+                f"signal:{symbol.upper()}:{timeframe}:{strategy_key}:{timestamp_text}",
             )
         )
         now = self._now()
@@ -929,7 +1097,8 @@ class AuditStore:
                     updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, timeframe, candle_timestamp) DO UPDATE SET
+                ON CONFLICT(symbol, timeframe, candle_timestamp, strategy)
+                DO UPDATE SET
                     strategy=excluded.strategy,
                     direction=excluded.direction,
                     confidence=excluded.confidence,
@@ -951,7 +1120,7 @@ class AuditStore:
                     timestamp_text,
                     symbol.upper(),
                     timeframe,
-                    strategy or "unknown",
+                    strategy_key,
                     int(direction),
                     float(confidence),
                     float(minimum_confidence),
@@ -1495,9 +1664,7 @@ class AuditStore:
             reason or "emergency stop cleared",
         )
         self.reset_reconciliation_counters()
-        self._symbol_levels.clear()
-        self._symbol_failures.clear()
-        self._symbol_successes.clear()
+        self._clear_all_symbol_trading_state()
 
     def trading_allowed(self, symbol: str | None = None) -> tuple[bool, str]:
         if not settings.trading_enabled:
@@ -1505,6 +1672,19 @@ class AuditStore:
         if self.get_control("manual_pause", "false") == "true":
             return False, "manual pause is active"
         level = self.get_trading_level()
+        if (
+            level != self.TRADING_LEVEL_RED
+            and self.get_control("emergency_stop", "false") == "true"
+        ):
+            # activate_emergency_stop() writes this flag and trading_level
+            # separately (two independent commits), so a crash/kill between
+            # them can leave trading_level stale (e.g. still GREEN) while
+            # this flag is the only surviving record that a halt was
+            # triggered. This is a fallback for exactly that mismatch -
+            # when trading_level is already RED the check below already
+            # blocks trading with the normal message.
+            reason = self._get_control_reason("emergency_stop")
+            return False, f"emergency stop active: {reason or 'manual intervention required'}"
         if level == self.TRADING_LEVEL_YELLOW:
             reason = self._get_control_reason("trading_level") or level
             return False, f"trading degraded (level 1): {reason}"
@@ -1519,7 +1699,7 @@ class AuditStore:
         if level != self.TRADING_LEVEL_GREEN:
             return False, f"trading blocked by unknown level: {level}"
         if symbol:
-            sym_level = self._symbol_levels.get(symbol, self.TRADING_LEVEL_GREEN)
+            sym_level = self.get_symbol_trading_level(symbol)
             if sym_level != self.TRADING_LEVEL_GREEN:
                 return (
                     False,

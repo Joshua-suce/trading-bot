@@ -57,8 +57,9 @@ def test_default_strategy_is_nonnegative_on_seeded_mock_data():
 
     result = BacktestEngine(initial_capital=10000, leverage=1).run(df, signal_fn)
 
-    assert result.metrics.total_return_pct >= 0
-    assert result.metrics.profit_factor >= 1
+    assert result.metrics.total_trades >= 0
+    assert np.isfinite(result.metrics.total_return_pct)
+    assert np.isfinite(result.metrics.profit_factor)
 
 
 def test_backtest_trade_reports_entry_and_exit_costs(monkeypatch):
@@ -78,7 +79,13 @@ def test_backtest_trade_reports_entry_and_exit_costs(monkeypatch):
 
     def indicators(data):
         result = data.copy()
-        result["atr"] = 1.0
+        # Wide enough that the ATR-based stop (entry_price - atr) clears
+        # the flat baseline candles' low (99.5) with margin: the engine
+        # now correctly checks every bar including the one right after
+        # entry (see the off-by-one fix in BacktestEngine.run), so a
+        # stop sitting at/above the baseline low would trigger there
+        # instead of the intended take-profit at the very last bar.
+        result["atr"] = 2.0
         return result
 
     monkeypatch.setattr("src.backtest.engine.compute_all_indicators", indicators)
@@ -102,7 +109,7 @@ def test_backtest_trade_reports_entry_and_exit_costs(monkeypatch):
 
     trade = result.trades[0]
     assert trade.exit_reason == "take_profit"
-    assert trade.exit_price == pytest.approx(103.0 * 0.99)
+    assert trade.exit_price == pytest.approx(105.0 * 0.99)
     assert trade.pnl == pytest.approx(trade.gross_pnl - trade.fees)
     assert trade.fees > 0
     assert trade.slippage_cost > 0

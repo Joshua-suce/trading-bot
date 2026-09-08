@@ -21,7 +21,32 @@ class TestStopLoss:
         sl = StopLossManager(atr_mult_sl=1.5, risk_reward_ratio=2.0)
         levels = sl.calculate(entry_price=50000, side="short", atr=1000)
         assert levels.stop_loss > 50000  # Above entry for short
-        assert levels.take_profit < 50000  # Below entry for short
+        assert levels.take_profit < 50000
+
+    def test_range_target_uses_mean_reversion_level_when_reward_is_valid(self):
+        sl = StopLossManager()
+        levels = sl.calculate(
+            entry_price=100.0,
+            side="long",
+            atr=1.0,
+            strategy="range",
+            market_context={"bb_middle": 102.0, "vwap": 101.0},
+        )
+
+        assert levels.take_profit == 102.0
+        assert levels.take_profit_pct == 2.0
+
+    def test_range_target_falls_back_when_mean_target_is_too_close(self):
+        sl = StopLossManager()
+        levels = sl.calculate(
+            entry_price=100.0,
+            side="long",
+            atr=1.0,
+            strategy="range",
+            market_context={"bb_middle": 100.5, "vwap": 100.4},
+        )
+
+        assert levels.take_profit > 101.0
 
     def test_trailing_stop_long(self):
         sl = StopLossManager()
@@ -64,6 +89,61 @@ class TestStopLoss:
         assert levels.take_profit == 1040.0
         assert levels.stop_loss_pct == 2.0
 
+    def test_fee_aware_floor_widens_stop_when_flat_pct_floor_is_too_tight(
+        self, monkeypatch
+    ):
+        # A flat min_stop_loss_pct with no relationship to the round-trip fee
+        # can clamp stops so tight that fees eat a large share of the risked
+        # capital. min_stop_fee_multiple should widen the floor in that case.
+        monkeypatch.setattr("src.risk.stop_loss.settings.min_stop_loss_pct", 0.006)
+        monkeypatch.setattr("src.risk.stop_loss.settings.max_stop_loss_pct", 0.02)
+        monkeypatch.setattr(
+            "src.risk.stop_loss.settings.scalp_estimated_round_trip_fee_bps", 8.0
+        )
+        monkeypatch.setattr("src.risk.stop_loss.settings.binance_api_url", "https://demo-fapi.binance.com")
+        monkeypatch.setattr("src.risk.stop_loss.settings.min_stop_fee_multiple", 5.0)
+
+        levels = StopLossManager().calculate(
+            entry_price=1000.0, side="long", atr=0.1, strategy="trend"
+        )
+
+        # effective round-trip fee is 8bps * 2.0 (demo) = 16bps; floor is
+        # 16bps * 5.0 = 0.8%, wider than the flat 0.6% pct floor.
+        assert levels.stop_loss_pct == pytest.approx(0.8, abs=1e-6)
+
+    def test_fee_aware_floor_never_exceeds_max_stop_loss_pct(self, monkeypatch):
+        monkeypatch.setattr("src.risk.stop_loss.settings.min_stop_loss_pct", 0.001)
+        monkeypatch.setattr("src.risk.stop_loss.settings.max_stop_loss_pct", 0.005)
+        monkeypatch.setattr(
+            "src.risk.stop_loss.settings.scalp_estimated_round_trip_fee_bps", 100.0
+        )
+        monkeypatch.setattr("src.risk.stop_loss.settings.binance_api_url", "https://demo-fapi.binance.com")
+        monkeypatch.setattr("src.risk.stop_loss.settings.min_stop_fee_multiple", 20.0)
+
+        levels = StopLossManager().calculate(
+            entry_price=1000.0, side="long", atr=0.01, strategy="trend"
+        )
+
+        # An aggressive fee multiple would imply a 4% floor here, but it must
+        # never be pushed above max_stop_loss_pct (0.5%), or min > max and
+        # the clamp inverts.
+        assert levels.stop_loss_pct == pytest.approx(0.5, abs=1e-6)
+
+    def test_fee_aware_floor_does_not_apply_without_a_strategy(self, monkeypatch):
+        # The generic (no-strategy) path has no StrategyPolicy/fee estimate
+        # to draw on, so it must keep using the manager's own flat floor.
+        monkeypatch.setattr(
+            "src.risk.stop_loss.settings.scalp_estimated_round_trip_fee_bps", 100.0
+        )
+        monkeypatch.setattr("src.risk.stop_loss.settings.min_stop_fee_multiple", 20.0)
+
+        levels = StopLossManager(
+            min_stop_loss_pct=0.0035,
+            max_stop_loss_pct=0.02,
+        ).calculate(entry_price=1000.0, side="long", atr=0.1)
+
+        assert levels.stop_loss_pct == 0.35
+
 
 def test_exchange_leverage_does_not_multiply_stop_risk_position_size():
     portfolio = PortfolioManager()
@@ -105,6 +185,11 @@ def test_scalp_uses_tighter_stop_and_its_own_reward_ratio(monkeypatch):
     monkeypatch.setattr("src.risk.stop_loss.settings.scalp_min_stop_loss_pct", 0.0015)
     monkeypatch.setattr("src.risk.stop_loss.settings.scalp_max_stop_loss_pct", 0.006)
     monkeypatch.setattr("src.risk.stop_loss.settings.scalp_risk_reward_ratio", 1.5)
+    # Keep the fee-aware stop floor (settings.min_stop_fee_multiple) a no-op
+    # here - this test is about atr_stop_multiplier/reward_ratio, not fees.
+    monkeypatch.setattr(
+        "src.risk.stop_loss.settings.scalp_estimated_round_trip_fee_bps", 0.1
+    )
     manager = StopLossManager(atr_mult_sl=1.5, risk_reward_ratio=2.0)
 
     normal = manager.calculate(1000.0, "long", 5.0)
@@ -167,7 +252,7 @@ def test_mainnet_canary_caps_risk_and_notional(monkeypatch):
 
     size = PositionSizer(portfolio).calculate(100.0, 90.0)
 
-    assert size.risk_amount == 25.0
+    assert size.risk_amount == 5.0
     assert size.quantity == 0.5
 
 

@@ -21,7 +21,6 @@ def parse_args(argv: Optional[list[str]] = None):
         default="trade",
         choices=[
             "trade",
-            "train",
             "dashboard",
             "admin",
             "health",
@@ -29,17 +28,27 @@ def parse_args(argv: Optional[list[str]] = None):
             "soak",
             "supervisor",
             "rollout",
+            "demo-report",
         ],
         help="Trading mode",
     )
     parser.add_argument(
         "--symbol",
         type=str,
-        default="BTCUSDT",
-        help="Trading symbol (default: BTCUSDT)",
+        default=None,
+        help=(
+            "Restrict --mode trade to this symbol only (default: trade every "
+            "symbol from the SYMBOLS env var/config)"
+        ),
     )
     parser.add_argument(
-        "--timeframe", type=str, default="1h", help="Timeframe (default: 1h)"
+        "--timeframe",
+        type=str,
+        default=None,
+        help=(
+            "Restrict --mode trade to this timeframe only (default: trade "
+            "every timeframe from the TIMEFRAMES env var/config)"
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -118,26 +127,25 @@ def parse_args(argv: Optional[list[str]] = None):
         default="data/governance/rollout_evidence.json",
         help="JSON evidence input for rollout gate evaluation",
     )
-    return parser.parse_args(argv)
-
-
-# Fetch OHLCV and train ML models (XGBoost + optional LSTM ensemble)
-async def run_train(symbol: str, timeframe: str, limit: int):
-    from src.exchange.client import ExchangeClient
-    from src.models.trainer import ModelTrainer
-
-    logger.info(f"Training models on {symbol} {timeframe}...")
-    async with ExchangeClient() as client:
-        df = await client.fetch_ohlcv(symbol, timeframe, limit=limit)
-
-    trainer = ModelTrainer()
-    ensemble = trainer.train_ensemble(
-        df,
-        symbol=symbol,
-        timeframe=timeframe,
+    parser.add_argument(
+        "--demo-report",
+        type=str,
+        default="data/governance/demo_canary_report.json",
+        help="Path for demo canary report JSON",
     )
-    logger.info("Training complete!")
-    return ensemble
+    parser.add_argument(
+        "--demo-report-window-hours",
+        type=float,
+        default=336.0,
+        help="Only include demo evidence from the last N hours; 0 includes all",
+    )
+    parser.add_argument(
+        "--demo-report-since",
+        type=str,
+        default="",
+        help="Only include demo evidence at or after this ISO timestamp",
+    )
+    return parser.parse_args(argv)
 
 
 # Connect to the configured exchange environment and execute signals.
@@ -361,13 +369,65 @@ def run_rollout(evidence_path: str) -> int:
     return 0 if decision.passed else 1
 
 
+def run_demo_report(
+    report_path: str,
+    *,
+    window_hours: float | None = 336.0,
+    since: str = "",
+) -> int:
+    import json
+
+    from src.audit import AuditStore
+    from src.governance.rollout import build_demo_canary_report
+
+    report = build_demo_canary_report(
+        AuditStore(),
+        since=since or None,
+        window_hours=window_hours,
+    )
+    path = Path(report_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    print(json.dumps(report, indent=2, sort_keys=True))
+    logger.info(f"Demo canary report written to {path}")
+    return 0 if report["status"] == "promotion_candidate" else 1
+
+
+def _apply_cli_symbol_timeframe_override(
+    symbol: Optional[str], timeframe: Optional[str]
+) -> None:
+    """Restrict live trading to a single symbol/timeframe when passed on the CLI.
+
+    Without this, --symbol/--timeframe were parsed and logged but never
+    actually reached LiveTradingLoop, which scans settings.symbols_list/
+    settings.timeframes_list unconditionally - an operator restricting
+    exposure via the CLI would silently still trade every configured
+    symbol/timeframe with real capital.
+    """
+    if symbol is None and timeframe is None:
+        return
+    from src.config import Settings, settings
+
+    if symbol is not None:
+        settings.symbols = Settings.validate_symbols(symbol)
+        logger.warning(f"CLI override: trading restricted to symbol {settings.symbols}")
+    if timeframe is not None:
+        settings.timeframes = Settings.validate_timeframes(timeframe)
+        logger.warning(
+            f"CLI override: trading restricted to timeframe {settings.timeframes}"
+        )
+
+
 # Top-level dispatch: parse args, set up logging, route to the chosen mode
 def main():
     args = parse_args()
     setup_logging("DEBUG" if args.verbose else None)
 
     logger.info(f"Starting AI Trading Bot - Mode: {args.mode}")
-    logger.info(f"Symbol: {args.symbol}, Timeframe: {args.timeframe}")
+    logger.info(
+        f"Symbol: {args.symbol or 'all configured symbols'}, "
+        f"Timeframe: {args.timeframe or 'all configured timeframes'}"
+    )
     preflight = run_preflight(args.mode)
     logger.info(f"Preflight passed: environment={preflight.environment}")
 
@@ -379,9 +439,16 @@ def main():
         raise SystemExit(TradingSupervisor().run())
     if args.mode == "rollout":
         raise SystemExit(run_rollout(args.rollout_evidence))
-    if args.mode == "train":
-        asyncio.run(run_train(args.symbol, args.timeframe, args.limit))
-    elif args.mode == "trade":
+    if args.mode == "demo-report":
+        raise SystemExit(
+            run_demo_report(
+                args.demo_report,
+                window_hours=args.demo_report_window_hours,
+                since=args.demo_report_since,
+            )
+        )
+    if args.mode == "trade":
+        _apply_cli_symbol_timeframe_override(args.symbol, args.timeframe)
         asyncio.run(run_trade())
     elif args.mode == "dashboard":
         run_dashboard()

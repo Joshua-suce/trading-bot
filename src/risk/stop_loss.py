@@ -1,7 +1,7 @@
-# Stop-loss, take-profit, and trailing stop calculation based on ATR
-import pandas as pd
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
+
+import pandas as pd
 
 from src.config import settings
 from src.strategies import StrategyRegistry
@@ -42,6 +42,7 @@ class StopLossManager:
         side: str,
         atr: float,
         strategy: str | None = None,
+        market_context: Mapping[str, object] | None = None,
     ) -> StopLossLevels:
         if pd.isna(atr) or atr <= 0:
             atr = entry_price * 0.01  # fallback 1%
@@ -51,6 +52,21 @@ class StopLossManager:
         atr_multiplier = policy.atr_stop_multiplier if strategy else self.atr_mult_sl
         min_stop_loss_pct = policy.min_stop_pct if strategy else self.min_stop_loss_pct
         max_stop_loss_pct = policy.max_stop_pct if strategy else self.max_stop_loss_pct
+        if strategy:
+            # Don't let the flat pct floor land so close to the round-trip
+            # fee that fees dominate the risk on every floor-clamped trade -
+            # see settings.min_stop_fee_multiple.
+            fee_floor_pct = (
+                policy.estimated_round_trip_fee_bps
+                / 10_000
+                * settings.min_stop_fee_multiple
+            )
+            # Clamp to max_stop_loss_pct too so an aggressive fee multiple
+            # can never push the floor above the ceiling and invert the
+            # min/max clamp below.
+            min_stop_loss_pct = min(
+                max(min_stop_loss_pct, fee_floor_pct), max_stop_loss_pct
+            )
         risk_reward_ratio = (
             policy.reward_risk_ratio if strategy else self.risk_reward_ratio
         )
@@ -76,8 +92,18 @@ class StopLossManager:
             take_profit = entry_price - sl_distance * risk_reward_ratio
             trailing_stop = entry_price - sl_distance * self.trailing_activation
 
+        take_profit = self._strategy_take_profit(
+            entry_price=entry_price,
+            side=side,
+            strategy=strategy,
+            generic_take_profit=take_profit,
+            sl_distance=sl_distance,
+            risk_reward_ratio=risk_reward_ratio,
+            market_context=market_context,
+        )
+
         sl_pct = sl_distance / entry_price * 100
-        tp_pct = sl_distance * risk_reward_ratio / entry_price * 100
+        tp_pct = abs(take_profit - entry_price) / entry_price * 100
 
         return StopLossLevels(
             stop_loss=round(stop_loss, 2),
@@ -86,6 +112,70 @@ class StopLossManager:
             stop_loss_pct=round(sl_pct, 2),
             take_profit_pct=round(tp_pct, 2),
         )
+
+    @classmethod
+    def _strategy_take_profit(
+        cls,
+        *,
+        entry_price: float,
+        side: str,
+        strategy: str | None,
+        generic_take_profit: float,
+        sl_distance: float,
+        risk_reward_ratio: float,
+        market_context: Mapping[str, object] | None,
+    ) -> float:
+        if not market_context:
+            return generic_take_profit
+        target = cls._context_target(strategy, market_context)
+        if target <= 0:
+            return generic_take_profit
+        if side == "long" and target <= entry_price:
+            return generic_take_profit
+        if side == "short" and target >= entry_price:
+            return generic_take_profit
+        required_distance = sl_distance * cls._minimum_target_rr(strategy)
+        target_distance = abs(target - entry_price)
+        generic_distance = abs(generic_take_profit - entry_price)
+        if target_distance < required_distance:
+            return generic_take_profit
+        if target_distance > generic_distance * max(risk_reward_ratio, 1.0):
+            return generic_take_profit
+        return target
+
+    @staticmethod
+    def _context_target(
+        strategy: str | None,
+        market_context: Mapping[str, object],
+    ) -> float:
+        fields_by_strategy = {
+            "range": ("bb_middle", "vwap", "ema_50"),
+            "reversal": ("ema_50", "bb_middle", "vwap"),
+            "countertrend": ("ema_50", "bb_middle", "vwap"),
+            "transition": ("ema_50", "vwap", "bb_middle"),
+        }
+        for field in fields_by_strategy.get(str(strategy or ""), ()):
+            value = market_context.get(field)
+            if value is None or not isinstance(value, (int, float, str)):
+                continue
+            try:
+                if not pd.notna(value):
+                    continue
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric > 0:
+                return numeric
+        return 0.0
+
+    @staticmethod
+    def _minimum_target_rr(strategy: str | None) -> float:
+        return {
+            "range": 1.1,
+            "countertrend": 1.2,
+            "reversal": 1.3,
+            "transition": 1.5,
+        }.get(str(strategy or ""), 1.0)
 
     # Update trailing stop: only move in the profitable direction
     def update_trailing(

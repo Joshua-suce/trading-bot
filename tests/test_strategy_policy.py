@@ -54,8 +54,28 @@ def test_required_edge_includes_fees_and_minimum_net_edge():
     assert trend.required_target_edge_bps == 21.0
 
 
+def test_policy_requires_meaningful_after_cost_reward_risk():
+    cfg = Settings(_env_file=None)
+
+    trend = StrategyRegistry(cfg).get("trend")
+    countertrend = StrategyRegistry(cfg).get("countertrend")
+
+    assert trend.minimum_after_cost_reward_risk == 1.3
+    assert countertrend.minimum_after_cost_reward_risk == 1.0
+
+
+def test_strategy_registry_reports_enabled_strategies_independently():
+    cfg = Settings(_env_file=None, enabled_strategies="trend,range")
+    registry = StrategyRegistry(cfg)
+
+    assert registry.is_enabled("trend")
+    assert registry.is_enabled("range")
+    assert not registry.is_enabled("breakout")
+    assert {policy.name for policy in registry.enabled()} == {"trend", "range"}
+
+
 def test_signal_policy_rejects_strategy_on_unsupported_timeframe():
-    signal = FinalSignal(1, 0.9, "scalp_pullback_bull", 0.0, 0.0, strategy="scalp")
+    signal = FinalSignal(1, 0.9, "scalp_pullback_bull", strategy="scalp")
 
     decision = evaluate_signal_decision(
         indicators=pd.DataFrame(),

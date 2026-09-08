@@ -63,6 +63,18 @@ def test_quality_gate_rejects_intraday_trend_without_higher_timeframe_alignment(
     assert result.reason == "1h trend regime is not aligned"
 
 
+def test_quality_gate_accepts_equal_minimum_risk_reward_ratio():
+    result = StrategyQualityGate()._validate_risk_reward(
+        quality_frame(),
+        1,
+        "countertrend",
+        atr_mult_sl=1.0,
+        reward_risk_ratio=1.5,
+    )
+
+    assert result is None
+
+
 def test_quality_gate_scores_emerging_trend_in_neutral_local_regime():
     result = StrategyQualityGate().evaluate(
         quality_frame(
@@ -92,7 +104,7 @@ def test_quality_gate_still_rejects_opposite_local_regime():
     )
 
     assert not result.accepted
-    assert result.reason == "local trend regime opposes signal"
+    assert result.reason == "trend strategy cannot trade against strong local regime"
 
 
 def test_quality_gate_accepts_range_mean_reversion():
@@ -112,6 +124,44 @@ def test_quality_gate_accepts_range_mean_reversion():
 
     assert result.accepted
     assert result.reason == "range mean-reversion quality confirmed"
+
+
+def test_quality_gate_rejects_range_without_oscillator_edge():
+    result = StrategyQualityGate().evaluate(
+        quality_frame(
+            adx=15.0,
+            trend_regime=0,
+            rsi_14=55.0,
+            bb_percent_b=0.12,
+            macd_hist=0.1,
+        ),
+        1,
+        timeframe="5m",
+        higher_timeframe_regime=0,
+        strategy="range",
+    )
+
+    assert not result.accepted
+    assert result.reason == "range entry is not at a valid band and oscillator edge"
+
+
+def test_quality_gate_rejects_range_in_trending_market():
+    result = StrategyQualityGate().evaluate(
+        quality_frame(
+            adx=28.0,
+            trend_regime=1,
+            rsi_14=35.0,
+            bb_percent_b=0.1,
+            macd_hist=0.1,
+        ),
+        1,
+        timeframe="5m",
+        higher_timeframe_regime=1,
+        strategy="range",
+    )
+
+    assert not result.accepted
+    assert result.reason == "range strategy requires sideways market regime"
 
 
 def test_quality_gate_accepts_confirmed_reversal():
@@ -229,7 +279,7 @@ def test_quality_gate_rejects_unconfirmed_countertrend_signal():
     )
 
     assert not result.accepted
-    assert "price not overextended" in result.reason
+    assert result.reason == "countertrend strategy requires price overextension"
 
 
 def test_quality_gate_accepts_countertrend_with_overextended_rejection():
@@ -240,7 +290,7 @@ def test_quality_gate_accepts_countertrend_with_overextended_rejection():
             low=98.0,
             close=98.0,
             trend_regime=1,
-            rsi_14=28.0,
+            rsi_14=74.0,
             plus_di=28.0,
             minus_di=14.0,
             adx=30.0,
@@ -254,6 +304,31 @@ def test_quality_gate_accepts_countertrend_with_overextended_rejection():
 
     assert result.accepted
     assert "overextended" in result.reason
+
+
+def test_quality_gate_accepts_countertrend_long_only_when_oversold():
+    result = StrategyQualityGate().evaluate(
+        quality_frame(
+            open=100.0,
+            high=108.0,
+            low=97.0,
+            close=108.0,
+            ema_50=103.0,
+            trend_regime=-1,
+            rsi_14=28.0,
+            plus_di=14.0,
+            minus_di=28.0,
+            adx=30.0,
+            macd_hist=-0.5,
+            vol_ratio=2.0,
+        ),
+        1,
+        timeframe="1h",
+        strategy="countertrend",
+    )
+
+    assert result.accepted
+    assert result.metrics["countertrend_rsi_extreme"] == 1
 
 
 def test_quality_gate_rejects_exhausted_entry():

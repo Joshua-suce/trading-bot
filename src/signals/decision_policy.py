@@ -43,8 +43,19 @@ def strategy_quality_gate_from_settings(
         breakout_max_extension_atr=cfg.strategy_breakout_max_extension_atr,
         breakout_min_body_ratio=cfg.strategy_breakout_min_body_ratio,
         breakout_min_close_location=cfg.strategy_breakout_min_close_location,
+        breakout_max_close_location=cfg.strategy_breakout_max_close_location,
         rejection_min_wick_ratio=cfg.strategy_rejection_min_wick_ratio,
     )
+
+
+def filter_strategies_by_regime(
+    strategies: list[str],
+    market_type: str,
+    allowed: list[str] | None = None,
+) -> list[str]:
+    if allowed is not None:
+        return [s for s in strategies if s in allowed]
+    return strategies
 
 
 def evaluate_signal_decision(
@@ -55,6 +66,8 @@ def evaluate_signal_decision(
     higher_timeframe_regime: int | None,
     quality_gate: StrategyQualityGate,
     cfg: Settings = settings,
+    atr_mult_sl: float | None = None,
+    reward_risk_ratio: float | None = None,
 ) -> SignalDecision:
     policy = StrategyRegistry(cfg).get(signal.strategy)
     minimum = strategy_minimum_confidence(signal.strategy, cfg=cfg)
@@ -72,6 +85,15 @@ def evaluate_signal_decision(
             signal.decision_reason or "entry threshold not met",
             minimum,
         )
+    # Default to the strategy's own policy when a caller doesn't pass these
+    # explicitly, so the reward:risk floor is enforced the same way in
+    # backtesting as it is live - a caller that omitted them (e.g. replay.py)
+    # previously skipped the reward:risk check entirely rather than checking
+    # it against the strategy's real configured ratio.
+    if atr_mult_sl is None:
+        atr_mult_sl = policy.atr_stop_multiplier
+    if reward_risk_ratio is None:
+        reward_risk_ratio = policy.reward_risk_ratio
     quality = quality_gate.evaluate(
         indicators,
         signal.direction,
@@ -79,6 +101,8 @@ def evaluate_signal_decision(
         higher_timeframe_regime=higher_timeframe_regime,
         strategy=signal.strategy,
         signal_source=signal.ta_source,
+        atr_mult_sl=atr_mult_sl,
+        reward_risk_ratio=reward_risk_ratio,
     )
     if not quality.accepted:
         return SignalDecision(

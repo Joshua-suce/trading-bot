@@ -78,6 +78,7 @@ class PositionManager:
             trades=self.trades,
             protection=self.protection,
             check_exposure_limits=self._check_exposure_limits,
+            release_exposure_reservation=self._exposure_limiter.release_reservation,
             fail_reconciliation=self._fail_reconciliation,
             finalize_trade_leg=self._finalize_trade_leg,
         )
@@ -127,6 +128,8 @@ class PositionManager:
         timeframe: str | None = None,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
         return await self.executor.enter_long(
             symbol,
@@ -136,6 +139,8 @@ class PositionManager:
             timeframe,
             signal_timestamp=signal_timestamp,
             strategy=strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
+            market_context=market_context,
         )
 
     async def enter_short(
@@ -147,6 +152,8 @@ class PositionManager:
         timeframe: str | None = None,
         signal_timestamp=None,
         strategy: str | None = None,
+        ignore_reentry_cooldown: bool = False,
+        market_context: dict | None = None,
     ) -> bool:
         return await self.executor.enter_short(
             symbol,
@@ -156,6 +163,8 @@ class PositionManager:
             timeframe,
             signal_timestamp=signal_timestamp,
             strategy=strategy,
+            ignore_reentry_cooldown=ignore_reentry_cooldown,
+            market_context=market_context,
         )
 
     # Exit a position: market order, record PnL, cancel related SL/TP orders
@@ -175,8 +184,8 @@ class PositionManager:
         )
 
     # Close every open position (e.g. on shutdown)
-    async def close_all(self):
-        await self.executor.close_all()
+    async def close_all(self) -> bool:
+        return await self.executor.close_all()
 
     async def close_symbol(self, symbol: str, reason: str = "manual") -> bool:
         return await self.executor._close_symbol_positions(symbol, reason)

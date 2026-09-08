@@ -25,7 +25,12 @@ class OrderManager:
         self._last_failure_reasons: dict[str, str] = {}
 
     async def market_order(
-        self, symbol: str, side: str, quantity: float, reduce_only: bool = False
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        reduce_only: bool = False,
+        position_side: str | None = None,
     ) -> Optional[dict]:
         if quantity <= 0:
             reason = f"invalid quantity: {quantity}"
@@ -37,7 +42,10 @@ class OrderManager:
             "market",
             side,
             quantity,
-            params=self._params(reduce_only=reduce_only),
+            params=self._params(
+                reduce_only=reduce_only,
+                position_side=position_side,
+            ),
         )
 
     async def limit_order(
@@ -67,11 +75,14 @@ class OrderManager:
         quantity: float,
         stop_price: float,
         price: Optional[float] = None,
+        position_side: str | None = None,
     ) -> Optional[dict]:
         if quantity <= 0:
             logger.warning(f"Invalid quantity for {symbol}: {quantity}")
             return None
-        params = self._params(reduce_only=True, prefix="sl")
+        params = self._params(
+            reduce_only=True, prefix="sl", position_side=position_side
+        )
         params["stopPrice"] = stop_price
         order_type = "stop_market" if price is None else "stop_limit"
         if price is not None:
@@ -81,7 +92,12 @@ class OrderManager:
         )
 
     async def take_profit_order(
-        self, symbol: str, side: str, quantity: float, price: float
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        position_side: str | None = None,
     ) -> Optional[dict]:
         if quantity <= 0:
             logger.warning(f"Invalid quantity for {symbol}: {quantity}")
@@ -92,7 +108,9 @@ class OrderManager:
             side,
             quantity,
             price,
-            params=self._params(reduce_only=True, prefix="tp"),
+            params=self._params(
+                reduce_only=True, prefix="tp", position_side=position_side
+            ),
         )
 
     async def cancel_all_orders(self, symbol: str):
@@ -167,12 +185,15 @@ class OrderManager:
         reduce_only: bool = False,
         post_only: bool | None = None,
         prefix: str = "ord",
+        position_side: str | None = None,
     ) -> dict[str, object]:
         params: dict[str, object] = {"newClientOrderId": self._client_order_id(prefix)}
         if reduce_only:
             params["reduceOnly"] = True
         if post_only is not None:
             params["postOnly"] = post_only
+        if position_side:
+            params["positionSide"] = position_side.upper()
         return params
 
     async def _create_order_with_retries(

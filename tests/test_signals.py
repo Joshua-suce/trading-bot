@@ -3,9 +3,15 @@ import pandas as pd
 import pytest
 
 from src.indicators.compute import compute_all_indicators
-from src.models.ensemble import EnsembleSignal, ModelEnsemble
 from src.signals.aggregator import FinalSignal, SignalAggregator
 from src.signals.ta_signal import TASignal, TechnicalSignal
+from src.strategies.breakout import BreakoutStrategy
+from src.strategies.countertrend import CountertrendStrategy
+from src.strategies.range import RangeStrategy
+from src.strategies.reversal import ReversalStrategy
+from src.strategies.scalp import ScalpStrategy
+from src.strategies.transition import TransitionStrategy
+from src.strategies.trend import TrendStrategy
 
 
 def test_technical_signal_handles_short_history():
@@ -34,11 +40,12 @@ def test_signal_aggregator_returns_final_signal():
             "volume": [1000.0, 1100.0, 1200.0],
         }
     )
-    aggregator = SignalAggregator(ModelEnsemble())
-    signal = aggregator.generate(df)
-    assert isinstance(signal, FinalSignal)
-    assert signal.direction in {-1, 0, 1}
-    assert 0.0 <= signal.confidence <= 1.0
+    aggregator = SignalAggregator()
+    signals = aggregator.generate(df)
+    assert isinstance(signals, list)
+    assert all(isinstance(signal, FinalSignal) for signal in signals)
+    assert all(signal.direction in {-1, 1} for signal in signals)
+    assert all(0.0 <= signal.confidence <= 1.0 for signal in signals)
 
 
 def test_compute_all_indicators_is_idempotent():
@@ -251,6 +258,53 @@ def test_one_minute_scalp_detects_confirmed_pullback_entry():
     assert "scalp_pullback_bull" in signal.source
 
 
+def test_scalp_strategy_module_detects_confirmed_pullback_entry():
+    previous = pd.Series(
+        {
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.5,
+            "close": 99.8,
+            "ema_50": 100.0,
+            "ema_50_slope": 0.005,
+            "vwap": 100.3,
+            "macd_hist": -0.05,
+            "rsi_14": 46.0,
+            "stoch_k": 35.0,
+            "stoch_d": 38.0,
+            "vol_ratio": 1.0,
+            "bb_percent_b": 0.4,
+        }
+    )
+    current = pd.Series(
+        {
+            **previous,
+            "open": 99.5,
+            "high": 100.2,
+            "low": 99.4,
+            "close": 100.1,
+            "vwap": 100.2,
+            "macd_hist": 0.0,
+            "stoch_k": 42.0,
+            "stoch_d": 39.0,
+            "vol_ratio": 1.1,
+        }
+    )
+
+    signal = ScalpStrategy.generate(
+        current,
+        previous,
+        adx=20.0,
+        candle=TechnicalSignal._candle_context(current),
+        higher_trend_bias=1,
+    )
+
+    assert signal is not None
+    assert signal.direction == 1
+    assert signal.strategy == "scalp"
+    assert "scalp_pullback_bull" in signal.source
+
+
 def test_one_minute_without_scalp_setup_does_not_use_swing_fallback():
     previous = {
         "open": 99.0,
@@ -391,6 +445,120 @@ def test_non_scalp_trend_structure_can_activate_without_extra_family():
     assert "trend_structure_bull" in signal.source
 
 
+def test_trend_strategy_module_scores_confirmed_structure():
+    previous = pd.Series(
+        {
+            "open": 104.0,
+            "high": 105.0,
+            "low": 103.0,
+            "close": 104.5,
+            "ema_50": 101.0,
+            "ema_200": 98.0,
+            "ema_50_slope": 0.04,
+            "macd_hist": 0.15,
+            "rsi_14": 58.0,
+            "vol_ratio": 1.15,
+            "plus_di": 31.0,
+            "minus_di": 14.0,
+        }
+    )
+    current = pd.Series({**previous, "high": 106.0, "close": 105.6, "macd_hist": 0.22})
+
+    strategy, direction, score = TrendStrategy.structure_score(
+        current,
+        previous,
+        1,
+        1,
+        26.0,
+        TechnicalSignal._candle_context(current),
+    )
+
+    assert strategy == "trend"
+    assert direction == 1
+    assert score >= 0.72
+
+
+def test_range_strategy_module_scores_mean_reversion_structure():
+    previous = pd.Series(
+        {
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.0,
+            "bb_percent_b": 0.35,
+            "rsi_14": 45.0,
+            "macd_hist": -0.05,
+            "vol_ratio": 0.75,
+        }
+    )
+    current = pd.Series(
+        {
+            **previous,
+            "open": 99.5,
+            "high": 100.0,
+            "low": 98.0,
+            "close": 99.8,
+            "bb_percent_b": 0.20,
+            "rsi_14": 38.0,
+            "macd_hist": 0.02,
+        }
+    )
+
+    strategy, direction, score = RangeStrategy.structure_score(
+        current,
+        previous,
+        1,
+        0,
+        16.0,
+        TechnicalSignal._candle_context(current),
+    )
+
+    assert strategy == "range"
+    assert direction == 1
+    assert score >= 0.60
+
+
+def test_reversal_strategy_module_scores_exhaustion_structure():
+    previous = pd.Series(
+        {
+            "open": 99.0,
+            "high": 100.0,
+            "low": 95.0,
+            "close": 96.0,
+            "rsi_14": 30.0,
+            "macd_hist": -0.2,
+            "plus_di": 12.0,
+            "minus_di": 30.0,
+            "vol_ratio": 1.0,
+        }
+    )
+    current = pd.Series(
+        {
+            **previous,
+            "open": 96.0,
+            "high": 99.0,
+            "low": 94.0,
+            "close": 98.5,
+            "macd_hist": 0.1,
+            "plus_di": 32.0,
+            "minus_di": 20.0,
+        }
+    )
+
+    strategy, direction, score = ReversalStrategy.structure_score(
+        current,
+        previous,
+        1,
+        -1,
+        25.0,
+        TechnicalSignal._candle_context(current),
+    )
+
+    assert strategy == "reversal"
+    assert direction == 1
+    assert score >= 0.65
+
+
 def test_non_scalp_breakout_can_activate_as_standalone_structure():
     previous = {
         "open": 101.0,
@@ -402,7 +570,7 @@ def test_non_scalp_breakout_can_activate_as_standalone_structure():
         "ema_50_slope": 0.03,
         "macd_hist": 0.1,
         "rsi_14": 57.0,
-        "vol_ratio": 1.40,
+        "vol_ratio": 1.60,
         "bb_percent_b": 0.70,
         "plus_di": 28.0,
         "minus_di": 12.0,
@@ -424,206 +592,70 @@ def test_non_scalp_breakout_can_activate_as_standalone_structure():
 
     signal = TechnicalSignal().generate(pd.DataFrame([previous, current], index=index))
 
-    assert signal.direction == 1
+    breakout = [item for item in signal if item.strategy == "breakout"]
+    assert breakout
+    assert breakout[0].direction == 1
+    assert "donchian_breakout_bull" in breakout[0].source
+
+
+def test_breakout_strategy_module_detects_donchian_breakout():
+    previous = pd.Series(
+        {
+            "open": 101.0,
+            "high": 103.0,
+            "low": 100.0,
+            "close": 102.0,
+            "atr": 2.0,
+            "dc_upper": 103.0,
+            "dc_lower": 96.0,
+        }
+    )
+    current = pd.Series(
+        {
+            **previous,
+            "open": 103.2,
+            "high": 105.2,
+            "low": 103.0,
+            "close": 105.0,
+        }
+    )
+
+    signal = BreakoutStrategy.donchian_signal(
+        current,
+        previous,
+        trend_regime=1,
+        adx=24.0,
+        adx_strength=0.48,
+        volume_ratio=1.6,
+        candle=TechnicalSignal._candle_context(current),
+    )
+
+    assert signal is not None
     assert signal.strategy == "breakout"
-    assert "donchian_breakout_bull" in signal.source
-
-
-class FakeXgbModel:
-    def __init__(self, direction: int, confidence: float):
-        self.direction = direction
-        self.confidence = confidence
-
-    def predict_with_confidence(self, X):
-        return np.array([self.direction]), np.array([self.confidence])
-
-
-def test_signal_aggregator_filters_low_confidence_ml_noise():
-    df = pd.DataFrame(
-        {
-            "open": np.linspace(50000, 50100, 220),
-            "high": np.linspace(50100, 50200, 220),
-            "low": np.linspace(49900, 50000, 220),
-            "close": np.linspace(50050, 50150, 220),
-            "volume": np.linspace(1000, 1100, 220),
-        }
-    )
-    ensemble = ModelEnsemble(
-        xgb_model=FakeXgbModel(direction=1, confidence=0.4),
-        confidence_threshold=0.6,
-    )
-
-    signal = SignalAggregator(
-        ensemble,
-        ta_weight=0.0,
-        ml_weight=1.0,
-        min_ta_strength=1.0,
-        min_ml_strength=0.1,
-        decision_threshold=0.1,
-    ).generate(df)
-
-    assert signal.direction == 0
-
-
-def test_signal_aggregator_accepts_high_confidence_ml_signal():
-    df = pd.DataFrame(
-        {
-            "open": np.linspace(50000, 50100, 220),
-            "high": np.linspace(50100, 50200, 220),
-            "low": np.linspace(49900, 50000, 220),
-            "close": np.linspace(50050, 50150, 220),
-            "volume": np.linspace(1000, 1100, 220),
-        }
-    )
-    ensemble = ModelEnsemble(
-        xgb_model=FakeXgbModel(direction=-1, confidence=0.9),
-        confidence_threshold=0.6,
-    )
-
-    signal = SignalAggregator(
-        ensemble,
-        ta_weight=0.0,
-        ml_weight=1.0,
-        min_ta_strength=1.0,
-        min_ml_strength=0.1,
-        decision_threshold=0.1,
-    ).generate(df)
-
-    assert signal.direction == -1
-    assert signal.confidence >= 0.9
-
-
-def test_signal_confluence_blocks_disagreement(monkeypatch):
-    ensemble = ModelEnsemble(
-        xgb_model=FakeXgbModel(direction=-1, confidence=0.9),
-        confidence_threshold=0.6,
-    )
-    aggregator = SignalAggregator(
-        ensemble,
-        min_ta_strength=0.1,
-        min_ml_strength=0.1,
-        require_confluence=True,
-    )
-    monkeypatch.setattr(
-        aggregator.ta,
-        "generate",
-        lambda _df: TASignal(direction=1, strength=0.9, source="bullish"),
-    )
-    monkeypatch.setattr(
-        ensemble,
-        "predict",
-        lambda _x: EnsembleSignal(
-            direction=-1,
-            confidence=0.9,
-            strength=0.9,
-            sources={"xgb": -1},
-        ),
-    )
-    aggregator.feature_engineer.create_features = lambda df: df
-    aggregator.feature_engineer.get_feature_matrix = lambda _df: np.array([[1.0]])
-
-    signal = aggregator.generate(
-        pd.DataFrame(
-            {
-                "open": [1.0],
-                "high": [1.0],
-                "low": [1.0],
-                "close": [1.0],
-                "volume": [1.0],
-            }
-        )
-    )
-
-    assert signal.direction == 0
-    assert signal.decision_reason == "active ML opposes regime signal"
-
-
-def test_trend_signal_can_proceed_when_ml_is_inactive(monkeypatch):
-    ensemble = ModelEnsemble(
-        xgb_model=FakeXgbModel(direction=0, confidence=0.4),
-        confidence_threshold=0.55,
-    )
-    aggregator = SignalAggregator(
-        ensemble,
-        min_ta_strength=0.1,
-        min_ml_strength=0.1,
-        decision_threshold=0.3,
-        require_confluence=True,
-    )
-    monkeypatch.setattr(
-        aggregator.ta,
-        "generate",
-        lambda _df: TASignal(
-            direction=1,
-            strength=0.75,
-            source="trend_structure_bull+structure_score_0.88",
-            strategy="trend",
-        ),
-    )
-    monkeypatch.setattr(
-        ensemble,
-        "predict",
-        lambda _x: EnsembleSignal(
-            direction=0,
-            confidence=0.4,
-            strength=0.0,
-            sources={"xgb": 0},
-        ),
-    )
-    aggregator.feature_engineer.create_features = lambda df: df
-    aggregator.feature_engineer.get_feature_matrix = lambda _df: np.array([[1.0]])
-
-    signal = aggregator.generate(
-        pd.DataFrame(
-            {
-                "open": [1.0],
-                "high": [1.0],
-                "low": [1.0],
-                "close": [1.0],
-                "volume": [1.0],
-            }
-        )
-    )
-
     assert signal.direction == 1
-    assert signal.strategy == "trend"
-    assert signal.decision_reason == "aligned signal ready"
 
 
-def test_range_signal_reports_weak_ta_instead_of_confluence_failure(monkeypatch):
-    ensemble = ModelEnsemble(
-        xgb_model=FakeXgbModel(direction=0, confidence=0.4),
-        confidence_threshold=0.55,
-    )
-    aggregator = SignalAggregator(
-        ensemble,
-        min_ta_strength=0.2,
-        require_confluence=True,
-    )
+def test_countertrend_and_transition_modules_claim_expected_signals():
+    assert CountertrendStrategy.claims_signal(-1, 1)
+    assert not CountertrendStrategy.claims_signal(1, 1)
+    # Transition has no source of its own: it must never claim a signal by
+    # source prefix in the main strategy_map loop, only through the explicit
+    # mixed-signal fallback path (which applies fallback_multiplier()).
+    assert not TransitionStrategy.claims_source("any_ta_source")
+
+
+def test_signal_aggregator_emits_independent_ta_strategy_signals(monkeypatch):
+    aggregator = SignalAggregator(decision_threshold=0.1)
     monkeypatch.setattr(
         aggregator.ta,
         "generate",
-        lambda _df: TASignal(
-            direction=-1,
-            strength=0.15,
-            source="rsi_bearish+bb_upper_reject",
-            strategy="range",
-        ),
+        lambda _df: [
+            TASignal(1, 0.75, "trend_structure_bull", strategy="trend"),
+            TASignal(-1, 0.65, "bb_upper_reject", strategy="range"),
+        ],
     )
-    monkeypatch.setattr(
-        ensemble,
-        "predict",
-        lambda _x: EnsembleSignal(
-            direction=0,
-            confidence=0.4,
-            strength=0.0,
-            sources={"xgb": 0},
-        ),
-    )
-    aggregator.feature_engineer.create_features = lambda df: df
-    aggregator.feature_engineer.get_feature_matrix = lambda _df: np.array([[1.0]])
 
-    signal = aggregator.generate(
+    signals = aggregator.generate(
         pd.DataFrame(
             {
                 "open": [1.0],
@@ -635,47 +667,19 @@ def test_range_signal_reports_weak_ta_instead_of_confluence_failure(monkeypatch)
         )
     )
 
-    assert signal.direction == 0
-    assert signal.decision_reason == "TA signal below activation threshold"
-    assert signal.confidence == 0.0
+    assert [signal.strategy for signal in signals] == ["trend", "range"]
+    assert [signal.direction for signal in signals] == [1, -1]
 
 
-def test_range_signal_can_proceed_when_ml_is_inactive(monkeypatch):
-    ensemble = ModelEnsemble(
-        xgb_model=FakeXgbModel(direction=0, confidence=0.4),
-        confidence_threshold=0.55,
-    )
-    aggregator = SignalAggregator(
-        ensemble,
-        min_ta_strength=0.1,
-        min_ml_strength=0.1,
-        decision_threshold=0.3,
-        require_confluence=True,
-    )
+def test_signal_aggregator_filters_weak_ta_signals(monkeypatch):
+    aggregator = SignalAggregator(decision_threshold=0.5)
     monkeypatch.setattr(
         aggregator.ta,
         "generate",
-        lambda _df: TASignal(
-            direction=1,
-            strength=0.8,
-            source="bb_lower_bounce+rsi_oversold",
-            strategy="range",
-        ),
+        lambda _df: [TASignal(1, 0.25, "weak_trend", strategy="trend")],
     )
-    monkeypatch.setattr(
-        ensemble,
-        "predict",
-        lambda _x: EnsembleSignal(
-            direction=0,
-            confidence=0.4,
-            strength=0.0,
-            sources={"xgb": 0},
-        ),
-    )
-    aggregator.feature_engineer.create_features = lambda df: df
-    aggregator.feature_engineer.get_feature_matrix = lambda _df: np.array([[1.0]])
 
-    signal = aggregator.generate(
+    signals = aggregator.generate(
         pd.DataFrame(
             {
                 "open": [1.0],
@@ -687,66 +691,7 @@ def test_range_signal_can_proceed_when_ml_is_inactive(monkeypatch):
         )
     )
 
-    assert signal.direction == 1
-    assert signal.strategy == "range"
-
-
-def test_range_signal_is_blocked_by_active_opposing_ml(monkeypatch):
-    ensemble = ModelEnsemble(
-        xgb_model=FakeXgbModel(direction=-1, confidence=0.9),
-        confidence_threshold=0.55,
-    )
-    aggregator = SignalAggregator(
-        ensemble,
-        min_ta_strength=0.1,
-        min_ml_strength=0.1,
-        require_confluence=True,
-    )
-    monkeypatch.setattr(
-        aggregator.ta,
-        "generate",
-        lambda _df: TASignal(
-            direction=1,
-            strength=0.8,
-            source="bb_lower_bounce+rsi_oversold",
-            strategy="range",
-        ),
-    )
-    monkeypatch.setattr(
-        ensemble,
-        "predict",
-        lambda _x: EnsembleSignal(
-            direction=-1,
-            confidence=0.9,
-            strength=0.9,
-            sources={"xgb": -1},
-        ),
-    )
-    aggregator.feature_engineer.create_features = lambda df: df
-    aggregator.feature_engineer.get_feature_matrix = lambda _df: np.array([[1.0]])
-
-    signal = aggregator.generate(
-        pd.DataFrame(
-            {
-                "open": [1.0],
-                "high": [1.0],
-                "low": [1.0],
-                "close": [1.0],
-                "volume": [1.0],
-            }
-        )
-    )
-
-    assert signal.direction == 0
-    assert signal.decision_reason == "active ML opposes regime signal"
-
-
-def test_signal_fusion_uses_regime_specific_weights():
-    aggregator = SignalAggregator(ModelEnsemble())
-
-    assert aggregator._strategy_weights("trend") == (0.4, 0.6)
-    assert aggregator._strategy_weights("range") == pytest.approx((0.7, 0.3))
-    assert aggregator._strategy_weights("breakout") == pytest.approx((0.6, 0.402))
+    assert signals == []
 
 
 def test_trend_scalp_rejects_pullback_on_wrong_side_of_ema():
@@ -798,7 +743,7 @@ def test_trend_scalp_requires_directional_candle_and_participation():
     assert (
         TechnicalSignal._score_trend_scalp(
             **common,
-            volume_ratio=0.99,
+            volume_ratio=0.75,
             candle_confirmed=True,
         )[1]
         == 0.0
@@ -808,5 +753,5 @@ def test_trend_scalp_requires_directional_candle_and_participation():
 def test_common_trend_scalp_score_clears_configured_confidence_gate():
     confidence = TechnicalSignal._trend_scalp_confidence(0.78)
 
-    assert confidence == pytest.approx(0.656)
+    assert confidence == pytest.approx(0.81)
     assert confidence >= 0.65

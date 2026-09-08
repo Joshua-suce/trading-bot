@@ -13,7 +13,6 @@ from src.exchange.client import ExchangeClient
 from src.execution.order_manager import OrderManager
 from src.live.data_quality import timeframe_seconds
 from src.live.loop import LiveTradingLoop
-from src.models.ensemble import ModelEnsemble
 from src.monitoring.alerter import Alerter
 from src.monitoring.heartbeat import RuntimeHeartbeat
 from src.signals.aggregator import FinalSignal, SignalAggregator
@@ -182,18 +181,18 @@ class SoakAggregator:
         self.calls = 0
         self.strategy = strategy
 
-    def generate(self, _df, higher_trend_bias: int = 0) -> FinalSignal:
+    def generate(self, _df, higher_trend_bias: int = 0) -> list[FinalSignal]:
         self.calls += 1
         direction = 1 if self.calls == 1 else 0
         confidence = 0.9 if direction else 0.0
-        return FinalSignal(
-            direction=direction,
-            confidence=confidence,
-            ta_source="soak",
-            ml_strength=0.0,
-            ml_confidence=0.0,
-            strategy=self.strategy,
-        )
+        return [
+            FinalSignal(
+                direction=direction,
+                confidence=confidence,
+                ta_source="soak",
+                strategy=self.strategy,
+            )
+        ]
 
 
 @dataclass(frozen=True)
@@ -224,10 +223,7 @@ class SoakRunner:
         self.iterations = iterations
 
     async def run(self) -> SoakReport:
-        bot = LiveTradingLoop(
-            ensemble=ModelEnsemble(),
-            audit_store=self.audit_store,
-        )
+        bot = LiveTradingLoop(audit_store=self.audit_store)
         bot._heartbeat = RuntimeHeartbeat(
             str(self.report_path.with_name("soak_heartbeat.json"))
         )
@@ -238,7 +234,6 @@ class SoakRunner:
         symbol, timeframe = self._enabled_scope()
         strategy = "scalp" if timeframe in {"1m", "3m"} else "trend"
         bot.aggregator = cast(SignalAggregator, SoakAggregator(strategy))
-        bot._scoped_aggregators = {}
         soak_orders = SoakOrderManager()
         bot.order_mgr = cast(OrderManager, soak_orders)
         bot.pos_mgr.rebind_runtime(

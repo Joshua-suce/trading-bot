@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 
@@ -9,6 +10,17 @@ class StrategyQuality:
     score: float
     reason: str
     metrics: dict[str, float | int | str]
+
+
+MIN_RR_BY_STRATEGY: dict[str, float] = {
+    "trend": 2.0,
+    "breakout": 2.5,
+    "transition": 2.0,
+    "reversal": 1.8,
+    "range": 1.5,
+    "countertrend": 1.5,
+    "scalp": 2.0,
+}
 
 
 class StrategyQualityGate:
@@ -26,8 +38,11 @@ class StrategyQualityGate:
         breakout_min_volume_ratio: float = 1.0,
         breakout_max_extension_atr: float = 3.0,
         breakout_min_body_ratio: float = 0.50,
-        breakout_min_close_location: float = 0.75,
+        breakout_min_close_location: float = 0.60,
+        breakout_max_close_location: float = 0.85,
         rejection_min_wick_ratio: float = 0.25,
+        min_reward_risk: float = 1.5,
+        enable_dynamic_thresholds: bool = True,
     ) -> None:
         self.min_score = min_score
         self.min_adx = min_adx
@@ -41,7 +56,10 @@ class StrategyQualityGate:
         self.breakout_max_extension_atr = breakout_max_extension_atr
         self.breakout_min_body_ratio = breakout_min_body_ratio
         self.breakout_min_close_location = breakout_min_close_location
+        self.breakout_max_close_location = breakout_max_close_location
         self.rejection_min_wick_ratio = rejection_min_wick_ratio
+        self.min_reward_risk = min_reward_risk
+        self.enable_dynamic_thresholds = enable_dynamic_thresholds
 
     def evaluate(  # noqa: C901
         self,
@@ -52,6 +70,8 @@ class StrategyQualityGate:
         higher_timeframe_regime: int | None = None,
         strategy: str = "trend",
         signal_source: str = "",
+        atr_mult_sl: float | None = None,
+        reward_risk_ratio: float | None = None,
     ) -> StrategyQuality:
         if df.empty or direction not in {-1, 1}:
             return StrategyQuality(False, 0.0, "invalid signal context", {})
@@ -95,6 +115,15 @@ class StrategyQualityGate:
             return StrategyQuality(False, 0.0, "invalid price or ATR", metrics)
         extension_atr = abs(close - ema_50) / atr
         metrics["extension_atr"] = extension_atr
+        regime_reason = self._market_regime_rejection(
+            strategy=strategy,
+            direction=direction,
+            trend_regime=trend_regime,
+            adx=adx,
+            extension_atr=extension_atr,
+        )
+        if regime_reason:
+            return StrategyQuality(False, 0.0, regime_reason, metrics)
         if not self.min_atr_pct <= atr_pct <= self.max_atr_pct:
             return StrategyQuality(
                 False,
@@ -104,6 +133,16 @@ class StrategyQualityGate:
             )
         if volume_ratio < self.min_volume_ratio:
             return StrategyQuality(False, 0.0, "volume participation too low", metrics)
+
+        rr_check = self._validate_risk_reward(
+            df,
+            direction,
+            strategy,
+            atr_mult_sl,
+            reward_risk_ratio,
+        )
+        if rr_check is not None:
+            return rr_check
         if strategy == "countertrend":
             return self._evaluate_countertrend(row, direction, metrics)
         if strategy == "scalp":
@@ -116,18 +155,18 @@ class StrategyQualityGate:
                 signal_source=signal_source,
             )
         if strategy == "range":
-            return self._evaluate_range(row, direction, metrics)
+            return self._evaluate_range(row, direction, metrics, df=df)
         if strategy == "reversal":
-            return self._evaluate_reversal(row, direction, metrics)
+            return self._evaluate_reversal(row, direction, metrics, df=df)
         if strategy == "transition":
-            return self._evaluate_transition(row, direction, metrics)
+            return self._evaluate_transition(row, direction, metrics, df=df)
         if adx < self.min_adx:
             return StrategyQuality(False, 0.0, "trend strength too low", metrics)
-        if trend_regime == -direction:
+        if adx >= 25 and trend_regime == -direction:
             return StrategyQuality(
                 False,
                 0.0,
-                "local trend regime opposes signal",
+                "local trend regime strongly opposes signal",
                 metrics,
             )
         if strategy == "breakout" and volume_ratio < max(
@@ -151,11 +190,19 @@ class StrategyQualityGate:
             candle["body_ratio"] < self.breakout_min_body_ratio
             or (
                 direction == 1
-                and candle["close_location"] < self.breakout_min_close_location
+                and not (
+                    self.breakout_min_close_location
+                    <= candle["close_location"]
+                    <= self.breakout_max_close_location
+                )
             )
             or (
                 direction == -1
-                and candle["close_location"] > 1.0 - self.breakout_min_close_location
+                and not (
+                    1.0 - self.breakout_max_close_location
+                    <= candle["close_location"]
+                    <= 1.0 - self.breakout_min_close_location
+                )
             )
             or not candle["direction_aligned"]
         ):
@@ -239,27 +286,146 @@ class StrategyQualityGate:
             metrics,
         )
 
+    def _market_regime_rejection(
+        self,
+        *,
+        strategy: str,
+        direction: int,
+        trend_regime: int,
+        adx: float,
+        extension_atr: float,
+    ) -> str:
+        checks = {
+            "range": self._range_regime_rejection,
+            "breakout": self._breakout_regime_rejection,
+            "trend": self._trend_regime_rejection,
+            "reversal": self._reversal_regime_rejection,
+            "countertrend": self._countertrend_regime_rejection,
+            "transition": self._transition_regime_rejection,
+        }
+        check = checks.get(strategy)
+        if check is None:
+            return ""
+        return check(direction, trend_regime, adx, extension_atr)
+
+    def _range_regime_rejection(
+        self,
+        _direction: int,
+        trend_regime: int,
+        adx: float,
+        _extension_atr: float,
+    ) -> str:
+        if trend_regime != 0 or adx > self.range_max_adx:
+            return "range strategy requires sideways market regime"
+        return ""
+
+    def _breakout_regime_rejection(
+        self,
+        direction: int,
+        trend_regime: int,
+        adx: float,
+        _extension_atr: float,
+    ) -> str:
+        if trend_regime not in {0, direction}:
+            return "breakout strategy cannot trade against local regime"
+        if adx < self.min_adx:
+            return "breakout strategy requires expanding trend strength"
+        return ""
+
+    @staticmethod
+    def _trend_regime_rejection(
+        direction: int,
+        trend_regime: int,
+        adx: float,
+        _extension_atr: float,
+    ) -> str:
+        if trend_regime == -direction and adx >= 25:
+            return "trend strategy cannot trade against strong local regime"
+        return ""
+
+    @staticmethod
+    def _reversal_regime_rejection(
+        direction: int,
+        trend_regime: int,
+        _adx: float,
+        _extension_atr: float,
+    ) -> str:
+        if trend_regime != -direction:
+            return "reversal strategy requires an opposing established trend"
+        return ""
+
+    @staticmethod
+    def _countertrend_regime_rejection(
+        direction: int,
+        trend_regime: int,
+        _adx: float,
+        extension_atr: float,
+    ) -> str:
+        if trend_regime != -direction:
+            return "countertrend strategy requires an opposing established trend"
+        if extension_atr <= 2.0:
+            return "countertrend strategy requires price overextension"
+        return ""
+
+    @staticmethod
+    def _transition_regime_rejection(
+        direction: int,
+        trend_regime: int,
+        _adx: float,
+        _extension_atr: float,
+    ) -> str:
+        if trend_regime != direction:
+            return "transition strategy requires a weakening existing trend"
+        return ""
+
     def _evaluate_range(
         self,
         row: pd.Series,
         direction: int,
         metrics: dict[str, float | int | str],
+        df: pd.DataFrame | None = None,
     ) -> StrategyQuality:
-        adx = self._number(row.get("adx"))
-        trend_regime = int(self._number(row.get("trend_regime")))
         rsi = self._number(row.get("rsi_14"), 50.0)
         percent_b = self._number(row.get("bb_percent_b"), 0.5)
         macd_raw = row.get("macd_hist")
         macd_hist = self._number(macd_raw)
-        if trend_regime != 0 or adx > self.range_max_adx:
-            return StrategyQuality(False, 0.0, "market is not range-bound", metrics)
+        if self.enable_dynamic_thresholds and df is not None:
+            rsi_low = self._dynamic_percentile(df, "rsi_14", 0.20, default=40.0)
+            rsi_high = self._dynamic_percentile(df, "rsi_14", 0.80, default=60.0)
+            bb_low = self._dynamic_percentile(df, "bb_percent_b", 0.20, default=0.25)
+            bb_high = self._dynamic_percentile(df, "bb_percent_b", 0.80, default=0.75)
+        else:
+            rsi_low, rsi_high = 42.0, 58.0
+            bb_low, bb_high = 0.25, 0.75
 
-        band_edge = percent_b <= 0.25 if direction == 1 else percent_b >= 0.75
-        rsi_edge = rsi <= 42 if direction == 1 else rsi >= 58
+        absolute_band_edge = percent_b <= 0.35 if direction == 1 else percent_b >= 0.65
+        absolute_rsi_edge = rsi <= 45.0 if direction == 1 else rsi >= 55.0
+        dynamic_band_edge = (
+            percent_b <= bb_low if direction == 1 else percent_b >= bb_high
+        )
+        dynamic_rsi_edge = rsi <= rsi_low if direction == 1 else rsi >= rsi_high
+        band_edge = absolute_band_edge and dynamic_band_edge
+        rsi_edge = absolute_rsi_edge and dynamic_rsi_edge
         macd_valid = pd.notna(macd_raw)
         momentum_turn = macd_valid and macd_hist * direction >= 0
         candle = self._candle_context(row, direction)
         rejection = bool(candle["rejection_confirmed"])
+        if not band_edge or not rsi_edge:
+            metrics.update(
+                {
+                    "bb_percent_b": percent_b,
+                    "range_band_edge": int(band_edge),
+                    "range_rsi_edge": int(rsi_edge),
+                    "range_momentum_turn": int(momentum_turn),
+                    "range_rejection_candle": int(rejection),
+                }
+            )
+            return StrategyQuality(
+                False,
+                0.0,
+                "range entry is not at a valid band and oscillator edge",
+                metrics,
+            )
         if not rejection:
             metrics.update(
                 {
@@ -307,8 +473,8 @@ class StrategyQualityGate:
         row: pd.Series,
         direction: int,
         metrics: dict[str, float | int | str],
+        df: pd.DataFrame | None = None,
     ) -> StrategyQuality:
-        trend_regime = int(self._number(row.get("trend_regime")))
         adx = self._number(row.get("adx"))
         rsi = self._number(row.get("rsi_14"), 50.0)
         plus_di = self._number(row.get("plus_di"))
@@ -316,13 +482,6 @@ class StrategyQualityGate:
         macd_raw = row.get("macd_hist")
         macd_hist = self._number(macd_raw)
         volume_ratio = self._number(row.get("vol_ratio"), 1.0)
-        if trend_regime != -direction:
-            return StrategyQuality(
-                False,
-                0.0,
-                "no established trend to reverse",
-                metrics,
-            )
         if adx < self.min_adx:
             return StrategyQuality(
                 False,
@@ -331,7 +490,13 @@ class StrategyQualityGate:
                 metrics,
             )
 
-        exhausted = rsi <= 35 if direction == 1 else rsi >= 65
+        if self.enable_dynamic_thresholds and df is not None:
+            rsi_low = self._dynamic_percentile(df, "rsi_14", 0.15, default=35.0)
+            rsi_high = self._dynamic_percentile(df, "rsi_14", 0.85, default=65.0)
+        else:
+            rsi_low, rsi_high = 35.0, 65.0
+
+        exhausted = rsi <= rsi_low if direction == 1 else rsi >= rsi_high
         momentum_turn = pd.notna(macd_raw) and macd_hist * direction > 0
         di_turn = plus_di > minus_di if direction == 1 else minus_di > plus_di
         volume_confirmed = volume_ratio >= 1.0
@@ -381,6 +546,7 @@ class StrategyQualityGate:
         row: pd.Series,
         direction: int,
         metrics: dict[str, float | int | str],
+        df: pd.DataFrame | None = None,
     ) -> StrategyQuality:
         adx = self._number(row.get("adx"))
         trend_regime = int(self._number(row.get("trend_regime")))
@@ -410,12 +576,18 @@ class StrategyQualityGate:
                 metrics,
             )
 
+        if self.enable_dynamic_thresholds and df is not None:
+            rsi_mid_low = self._dynamic_percentile(df, "rsi_14", 0.35, default=40.0)
+            rsi_mid_high = self._dynamic_percentile(df, "rsi_14", 0.65, default=60.0)
+        else:
+            rsi_mid_low, rsi_mid_high = 40.0, 60.0
+
         slope_weakening = abs(ema_50_slope) < 0.5
         price_near_ema = extension_atr <= 1.0
         momentum_fading = macd_valid and macd_hist * direction <= 0
         di_narrowing = plus_di > minus_di if direction == 1 else minus_di > plus_di
         di_cross = plus_di < minus_di if direction == 1 else minus_di < plus_di
-        rsi_mid = 40 <= rsi <= 60
+        rsi_mid = rsi_mid_low <= rsi <= rsi_mid_high
         candle = self._candle_context(row, direction)
         rejection = bool(candle["rejection_confirmed"])
         transition_setup = slope_weakening and price_near_ema
@@ -467,12 +639,11 @@ class StrategyQualityGate:
         metrics: dict[str, float | int | str],
     ) -> StrategyQuality:
         adx = self._number(row.get("adx"))
-        trend_regime = int(self._number(row.get("trend_regime")))
         rsi = self._number(row.get("rsi_14"), 50.0)
         close = self._number(row.get("close"))
         ema_50 = self._number(row.get("ema_50"))
         atr = self._number(row.get("atr"))
-        volume_ratio = self._number(row.get("volume_ratio"))
+        volume_ratio = self._number(row.get("vol_ratio"))
         macd_raw = row.get("macd_hist")
         macd_hist = self._number(macd_raw)
         macd_valid = pd.notna(macd_raw)
@@ -483,13 +654,6 @@ class StrategyQualityGate:
         candle = self._candle_context(row, direction)
         rejection = bool(candle["rejection_confirmed"])
         long_wick_ratio = self._number(candle.get("wick_ratio", 0.0))
-        if trend_regime == 0 or trend_regime == direction:
-            return StrategyQuality(
-                False,
-                0.0,
-                "no established trend to counter",
-                metrics,
-            )
         if adx < self.min_adx:
             return StrategyQuality(
                 False,
@@ -498,16 +662,9 @@ class StrategyQualityGate:
                 metrics,
             )
         overextended = extension_atr > 2.0
-        if not overextended:
-            return StrategyQuality(
-                False,
-                0.0,
-                f"price not overextended: extension_atr={extension_atr:.2f}",
-                metrics,
-            )
         momentum_exhaust = macd_valid and macd_hist * direction < 0
         volume_climax = volume_ratio > 1.5
-        rsi_extreme = (direction == 1 and rsi > 70) or (direction == -1 and rsi < 30)
+        rsi_extreme = (direction == 1 and rsi < 30) or (direction == -1 and rsi > 70)
         score = (
             0.20 * overextended
             + 0.20 * rejection
@@ -595,18 +752,11 @@ class StrategyQualityGate:
             )
             momentum_aligned = (
                 pd.notna(macd_raw) and macd_hist * direction >= 0
-                or candle["rejection_confirmed"]
-            )
+            ) or candle["rejection_confirmed"]
             candle_confirmed = bool(candle["rejection_confirmed"])
         else:
-            ema_aligned = (
-                close > ema_50 if direction == 1
-                else close < ema_50
-            )
-            vwap_aligned = (
-                close > vwap if direction == 1
-                else close < vwap
-            )
+            ema_aligned = close > ema_50 if direction == 1 else close < ema_50
+            vwap_aligned = close > vwap if direction == 1 else close < vwap
             price_aligned = ema_aligned and vwap_aligned
             oscillator_aligned = (
                 stoch_k > stoch_d and rsi <= 70
@@ -615,8 +765,7 @@ class StrategyQualityGate:
             )
             momentum_aligned = (
                 pd.notna(macd_raw) and macd_hist * direction >= 0
-                or ema_slope * direction > 0
-            )
+            ) or ema_slope * direction > 0
             candle_confirmed = bool(
                 candle["direction_aligned"] or candle["rejection_confirmed"]
             )
@@ -666,6 +815,58 @@ class StrategyQualityGate:
             metrics,
         )
 
+    def _validate_risk_reward(
+        self,
+        df: pd.DataFrame,
+        direction: int,
+        strategy: str,
+        atr_mult_sl: float | None,
+        reward_risk_ratio: float | None,
+    ) -> StrategyQuality | None:
+        if atr_mult_sl is None or reward_risk_ratio is None:
+            return None
+        last = df.iloc[-1]
+        close = self._number(last.get("close"))
+        atr = self._number(last.get("atr"))
+        if atr <= 0 or close <= 0:
+            return None
+        # tp_distance is defined as sl_distance * reward_risk_ratio, so the
+        # implied ratio always equals reward_risk_ratio regardless of ATR -
+        # this is really just reward_risk_ratio vs. the strategy's configured
+        # minimum, gated on having valid ATR/close data to size a trade at
+        # all. ATR is only needed below to report the implied price distances.
+        min_rr = MIN_RR_BY_STRATEGY.get(strategy, self.min_reward_risk)
+        if reward_risk_ratio + 1e-9 < min_rr:
+            sl_distance = atr * atr_mult_sl
+            metrics: dict[str, float | int | str] = {
+                "implied_sl_distance": round(sl_distance, 4),
+                "implied_tp_distance": round(sl_distance * reward_risk_ratio, 4),
+                "implied_rr_ratio": round(reward_risk_ratio, 2),
+                "required_min_rr": min_rr,
+            }
+            return StrategyQuality(
+                False,
+                0.0,
+                f"risk-reward {reward_risk_ratio:.2f} < {min_rr} minimum",
+                metrics,
+            )
+        return None
+
+    @staticmethod
+    def _dynamic_percentile(
+        df: pd.DataFrame,
+        column: str,
+        percentile: float,
+        lookback: int = 60,
+        default: float = 0.5,
+    ) -> float:
+        if not df.empty and column in df.columns:
+            series = df[column].iloc[-min(lookback, len(df)) :]
+            values = series.dropna().values
+            if len(values) > 0:
+                return float(np.percentile(values, percentile * 100))
+        return default
+
     def _candle_context(
         self,
         row: pd.Series,
@@ -704,6 +905,7 @@ class StrategyQualityGate:
             "close_location": close_location,
             "direction_aligned": direction_aligned,
             "rejection_confirmed": rejection_confirmed,
+            "wick_ratio": lower_wick_ratio if direction == 1 else upper_wick_ratio,
         }
 
     @staticmethod
