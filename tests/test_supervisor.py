@@ -325,6 +325,55 @@ def test_run_swallows_keyboard_interrupt_during_exhaustion_alert(
     assert supervisor.run() == 1
 
 
+def test_warn_if_exhaustion_unreachable_counts_the_bootstrap_phase_path(
+    tmp_path, monkeypatch
+):
+    # The bootstrap-phase kill path costs grace + phase_stall, because the
+    # phase timer cannot start until the grace window ends. A guard that
+    # models only (grace + backoff) misses it and stays silent while the
+    # "Trading Bot STOPPED" alert is in fact unreachable.
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        supervisor_startup_grace_seconds=180.0,
+        supervisor_bootstrap_phase_stall_seconds=180.0,
+        supervisor_max_backoff_seconds=60.0,
+        supervisor_shutdown_timeout_seconds=30.0,
+        supervisor_max_restarts_per_hour=10,
+    )
+    # grace+phase = 360 -> worst cycle 360+30+60 = 450; 450*10 = 4500 >= 3600
+    supervisor = TradingSupervisor(cfg=cfg)
+    warning_mock = MagicMock()
+    monkeypatch.setattr("src.supervisor.logger.warning", warning_mock)
+
+    supervisor._warn_if_exhaustion_unreachable()
+
+    warning_mock.assert_called_once()
+
+
+def test_warn_if_exhaustion_unreachable_counts_the_loop_stall_path(
+    tmp_path, monkeypatch
+):
+    # The main-loop stall path costs bot_progress_stall + heartbeat_stale
+    # + one supervisor poll interval before the child is even killed.
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        bot_progress_stall_seconds=600.0,
+        supervisor_heartbeat_stale_seconds=90.0,
+        supervisor_check_interval_seconds=5.0,
+        supervisor_max_restarts_per_hour=6,
+    )
+    # 600+90+5 = 695 -> 695+30+60 = 785; 785*6 = 4710 >= 3600
+    supervisor = TradingSupervisor(cfg=cfg)
+    warning_mock = MagicMock()
+    monkeypatch.setattr("src.supervisor.logger.warning", warning_mock)
+
+    supervisor._warn_if_exhaustion_unreachable()
+
+    warning_mock.assert_called_once()
+
+
 def test_warn_if_exhaustion_unreachable_warns_when_budget_never_reachable(
     tmp_path, monkeypatch
 ):

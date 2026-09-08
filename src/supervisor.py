@@ -149,22 +149,45 @@ class TradingSupervisor:
         # reachable by raising supervisor_startup_grace_seconds (e.g. for a
         # slower exchange/VPS) without also lowering the restart budget, so
         # warn loudly rather than fail silently.
+        # Model EVERY path that can end a restart cycle, not just the
+        # startup-grace one - whichever is slowest sets the cycle time:
+        #   * child killed at the plain startup grace
+        #   * child killed for a wedged startup phase; its phase timer
+        #     cannot start until the grace window ends, so these add
+        #   * child killed for a stalled main loop: the in-process watchdog
+        #     waits bot_progress_stall_seconds before it stops publishing,
+        #     then the file must age past the stale limit, then the
+        #     supervisor's poll interval has to come round
+        # plus the time to actually kill it and the backoff before relaunch.
         worst_cycle = (
-            self.cfg.supervisor_startup_grace_seconds
+            max(
+                self.cfg.supervisor_startup_grace_seconds,
+                self.cfg.supervisor_startup_grace_seconds
+                + self.cfg.supervisor_bootstrap_phase_stall_seconds,
+                self.cfg.bot_progress_stall_seconds
+                + self.cfg.supervisor_heartbeat_stale_seconds
+                + self.cfg.supervisor_check_interval_seconds,
+            )
+            + self.cfg.supervisor_shutdown_timeout_seconds
             + self.cfg.supervisor_max_backoff_seconds
         )
-        if worst_cycle * self.cfg.supervisor_max_restarts_per_hour >= 3600:
+        budget = worst_cycle * self.cfg.supervisor_max_restarts_per_hour
+        if budget >= 3600:
             logger.warning(
-                "supervisor_startup_grace_seconds ({:.0f}s) + "
-                "supervisor_max_backoff_seconds ({:.0f}s), times "
-                "supervisor_max_restarts_per_hour ({}), is >= the 3600s "
-                "rolling window used to detect restart-budget exhaustion. "
-                "A persistently-hanging trading child may restart-loop "
+                "Worst-case restart cycle is {:.0f}s and "
+                "supervisor_max_restarts_per_hour is {}, so filling the "
+                "restart budget would take {:.0f}s - at or beyond the "
+                "3600s rolling window used to detect exhaustion. Old "
+                "restarts will be pruned as fast as new ones accumulate, "
+                "so a persistently-failing trading child can restart-loop "
                 "forever without the critical 'bot stopped' alert ever "
-                "firing. Lower one of these three settings to restore it.",
-                self.cfg.supervisor_startup_grace_seconds,
-                self.cfg.supervisor_max_backoff_seconds,
+                "firing. Lower supervisor_max_restarts_per_hour, or one of "
+                "supervisor_startup_grace_seconds / "
+                "supervisor_bootstrap_phase_stall_seconds / "
+                "bot_progress_stall_seconds / supervisor_max_backoff_seconds.",
+                worst_cycle,
                 self.cfg.supervisor_max_restarts_per_hour,
+                budget,
             )
 
     def _alert_exhausted(self, restart_count: int) -> None:

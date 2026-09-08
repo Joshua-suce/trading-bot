@@ -1,6 +1,7 @@
 # Unified trading loop for Binance Demo Trading and mainnet.
 import asyncio
 import html
+import threading
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -112,26 +113,64 @@ class LiveTradingLoop:
         self._stopped = False
         self._heartbeat = RuntimeHeartbeat(settings.runtime_heartbeat_path)
         self._heartbeat_task: asyncio.Task | None = None
-        # Updated once per completed main-loop iteration; the heartbeat
-        # publisher (a separate asyncio task) checks this before writing a
-        # "running" heartbeat, so a hung main loop (stuck on an await that
-        # never resolves) stops refreshing the heartbeat instead of looking
-        # perpetually healthy to the supervisor.
+        # Updated every time the main loop completes a unit of real work -
+        # one processed (symbol, timeframe) pair, or one finished step of
+        # the loop body - NOT once per full sweep. The heartbeat publisher
+        # (a separate asyncio task) checks this before writing a "running"
+        # heartbeat, so a main loop hung on an await that never resolves
+        # stops refreshing the heartbeat instead of looking perpetually
+        # healthy to the supervisor.
+        #
+        # Per-sweep granularity was the wrong measurement: it timed "how
+        # long does a full sweep take" rather than "is the loop alive", so
+        # when indicator computation was stalling the event loop and REST
+        # reads looked like 4-10s hangs, a fully healthy loop needed >90s
+        # per sweep and was killed mid-trade (2026-09-08 03:36:26, "has
+        # not progressed in 102s", fired while a BTCUSDT entry was being
+        # placed). See _mark_loop_progress for the invariant that keeps
+        # this honest.
         self._last_loop_progress_at = time.monotonic()
+        # Startup ("bootstrapping") heartbeat state. start() can take
+        # minutes on a slow link - exchange connect, account snapshot,
+        # audit restore, full exchange reconciliation - and until the
+        # main-loop publisher starts, NOTHING refreshed the heartbeat. The
+        # supervisor grants an extended grace only while the heartbeat
+        # state is "launching"/"bootstrapping", but the only such record
+        # was the one the supervisor wrote itself before spawning, so it
+        # simply aged out and every restarted child was killed mid-startup
+        # having logged nothing at all (2026-09-07 18:46, 2026-09-08
+        # 05:10 - all died at 180-186s).
+        #
+        # A dedicated thread now publishes "bootstrapping" for the whole
+        # pre-loop sequence, but only while the phase marker below keeps
+        # advancing - so a startup genuinely wedged on one await still
+        # stops heartbeating and is still restarted.
+        self._bootstrap_lock = threading.Lock()
+        self._bootstrap_phase = "starting"
+        self._bootstrap_phase_at = time.monotonic()
+        self._bootstrap_stop = threading.Event()
+        self._bootstrap_thread: threading.Thread | None = None
 
     # Connect, fetch account, then scan every configured timeframe in sequence
     async def start(self):
         try:
+            # Publish "bootstrapping" heartbeats across the whole startup
+            # sequence below. The one-shot "starting" write this replaces
+            # was actively harmful: "starting" is not in the supervisor's
+            # extended-grace state set, so it downgraded the child's stale
+            # limit from the startup grace back to the much tighter
+            # heartbeat-stale limit while it was still legitimately
+            # bootstrapping.
+            self._set_bootstrap_phase("alerter_start")
+            self._start_bootstrap_heartbeat()
             await self.alerter.start(self._handle_telegram_command)
+            self._set_bootstrap_phase("initializing_alert")
             await self.alerter.initializing_alert(
                 self.mode, settings.binance_environment
             )
+            self._set_bootstrap_phase("exchange_connect")
             await self.client.connect()
-            await self._emit_heartbeat(
-                "starting",
-                mode=self.mode,
-                environment=settings.binance_environment,
-            )
+            self._set_bootstrap_phase("exchange_connected")
             logger.info(
                 "Starting trading loop on Binance "
                 f"{settings.binance_environment.upper()}"
@@ -147,17 +186,23 @@ class LiveTradingLoop:
                 },
             )
 
+            self._set_bootstrap_phase("restore_risk_state")
             self._restore_persisted_risk_state()
+            self._set_bootstrap_phase("account_snapshot")
             await self._refresh_account(required=True)
             if self.portfolio.account:
                 logger.info(
                     f"Account equity: {self.portfolio.account.total_equity:.2f}"
                 )
+            self._set_bootstrap_phase("restore_open_trades")
             self.pos_mgr.trades.restore_open_trades_from_audit()
+            self._set_bootstrap_phase("restore_exit_cooldowns")
             self.pos_mgr.trades.restore_recent_exit_cooldowns()
+            self._set_bootstrap_phase("exchange_reconciliation")
             reconciled = await self.pos_mgr.reconcile_exchange_state(
                 auto_close_unmanaged=True
             )
+            self._set_bootstrap_phase("reconciliation_complete")
             if reconciled is None:
                 logger.warning(
                     "Startup reconciliation unavailable; exchange may be unreachable. "
@@ -172,7 +217,9 @@ class LiveTradingLoop:
                     "protective orders."
                 )
             else:
+                self._set_bootstrap_phase("restored_exposure_cleanup")
                 await self._cleanup_restored_position_exposure()
+            self._set_bootstrap_phase("manual_request_recovery")
             interrupted_requests = (
                 self.audit_store.fail_interrupted_manual_trade_requests()
             )
@@ -183,24 +230,35 @@ class LiveTradingLoop:
                 )
             self._last_reconciliation_at = time.monotonic()
 
+            self._set_bootstrap_phase("set_leverage")
             await self._set_configured_leverage()
 
+            self._set_bootstrap_phase("startup_alert")
             await self.alerter.startup_alert(
                 self.mode,
                 settings.binance_environment,
                 settings.symbols_list,
             )
+            self._set_bootstrap_phase("scalp_streams")
             self._start_scalp_streams()
             # Reset the clock right as heartbeat publishing begins, not at
             # __init__ time - construction happens before the (potentially
             # long) startup sequence above, so an unreset timestamp here
             # would look falsely stale on the very first stall check below.
             self._last_loop_progress_at = time.monotonic()
+            # Stop the bootstrap publisher BEFORE starting the main-loop
+            # publisher, never the reverse: a surviving bootstrap thread
+            # would keep writing fresh "bootstrapping" records over the
+            # heartbeat that _heartbeat_publisher deliberately withholds
+            # when the main loop stalls, defeating that detector entirely.
+            self._stop_bootstrap_heartbeat()
             self._start_heartbeat_publisher()
 
             while True:
                 await self._refresh_account_if_due()
+                self._mark_loop_progress()
                 await self._process_manual_trade_requests()
+                self._mark_loop_progress()
                 if self._network_outage_active():
                     logger.warning(
                         "Network outage cooldown active for {:.0f}s; "
@@ -210,9 +268,14 @@ class LiveTradingLoop:
                     )
                 else:
                     await self._reconcile_if_due()
+                    self._mark_loop_progress()
                     await self._manage_scalp_positions_if_due()
+                    self._mark_loop_progress()
                     await self._scan_due_timeframes_once()
-                self._last_loop_progress_at = time.monotonic()
+                # Retained end-of-iteration mark. Still required: in the
+                # outage branch above the loop does no work at all but is
+                # very much alive, and this is its only liveness signal.
+                self._mark_loop_progress()
                 await asyncio.sleep(settings.scan_sleep_seconds)
         except asyncio.CancelledError:
             await self.stop("cancelled")
@@ -240,6 +303,11 @@ class LiveTradingLoop:
             )
             await self.alerter.error_alert(error)
             await self.stop("fatal error")
+        finally:
+            # Idempotent safety net. stop() also stops this thread, but
+            # tests monkeypatch stop(), and a leaked daemon thread would
+            # keep rewriting the heartbeat file after the loop is gone.
+            self._stop_bootstrap_heartbeat()
 
     async def _write_heartbeat(self, state: str, **details: object) -> None:
         try:
@@ -256,6 +324,108 @@ class LiveTradingLoop:
         if asyncio.iscoroutine(result):
             await result
 
+    def _set_bootstrap_phase(self, phase: str) -> None:
+        """Mark forward progress through the startup sequence.
+
+        The bootstrap publisher refreshes the heartbeat only while this
+        marker keeps moving, so a startup wedged on a single await is still
+        detected and restarted by the supervisor.
+        """
+        with self._bootstrap_lock:
+            self._bootstrap_phase = phase
+            self._bootstrap_phase_at = time.monotonic()
+        logger.debug("Bootstrap phase: {}", phase)
+
+    def _start_bootstrap_heartbeat(self) -> None:
+        if self._bootstrap_thread is not None:
+            return
+        self._bootstrap_stop.clear()
+        self._bootstrap_thread = threading.Thread(
+            target=self._publish_bootstrap_heartbeat,
+            name="bootstrap-heartbeat",
+            daemon=True,
+        )
+        self._bootstrap_thread.start()
+
+    def _stop_bootstrap_heartbeat(self) -> None:
+        thread = self._bootstrap_thread
+        self._bootstrap_thread = None
+        if thread is None:
+            return
+        self._bootstrap_stop.set()
+        thread.join(timeout=5.0)
+        if thread.is_alive():
+            logger.warning(
+                "Bootstrap heartbeat thread did not stop within 5s; it is a "
+                "daemon thread and will not block shutdown"
+            )
+
+    def _publish_bootstrap_heartbeat(self) -> None:
+        # Deliberately a plain thread, not an asyncio task: the startup
+        # sequence makes blocking sync calls (audit/SQLite restore) that
+        # would freeze an event-loop publisher and reproduce the very
+        # "child did not publish a valid heartbeat" kill this exists to
+        # prevent.
+        #
+        # Do NOT pass instance_id here - RuntimeHeartbeat.write() reads
+        # TRADING_BOT_INSTANCE_ID from the environment the supervisor
+        # injected, and the supervisor matches on exactly that.
+        interval = max(
+            1.0,
+            min(15.0, settings.supervisor_heartbeat_stale_seconds / 3),
+        )
+        stall_after = settings.supervisor_bootstrap_phase_stall_seconds
+        while not self._bootstrap_stop.is_set():
+            with self._bootstrap_lock:
+                phase = self._bootstrap_phase
+                stuck_for = time.monotonic() - self._bootstrap_phase_at
+            if stuck_for > stall_after:
+                logger.error(
+                    "Startup phase {!r} has not advanced in {:.0f}s "
+                    "(> {:.0f}s); withholding heartbeat so the supervisor "
+                    "detects the wedged startup and restarts",
+                    phase,
+                    stuck_for,
+                    stall_after,
+                )
+            else:
+                try:
+                    self._heartbeat.write(
+                        "bootstrapping",
+                        mode=self.mode,
+                        environment=settings.binance_environment,
+                        phase=phase,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never kill startup
+                    logger.warning(
+                        "Bootstrap heartbeat write failed ({}); continuing",
+                        self._describe_exception(exc),
+                    )
+            self._bootstrap_stop.wait(interval)
+
+    def _mark_loop_progress(self) -> None:
+        # Call on COMPLETION of a unit of real work in the main loop, never
+        # on entry: the signal the watchdog needs is "an await resolved", so
+        # a unit that starts and then hangs forever must leave the timestamp
+        # frozen.
+        #
+        # Safe to call from inside an asyncio.gather() child even though a
+        # hang in one child is briefly masked by siblings still finishing:
+        # every gather in the loop body is awaited to completion, so a
+        # permanently hung child stops the main loop from ever starting
+        # another sweep. The pool of siblings that can mask it is therefore
+        # finite and drains, after which the timestamp freezes and the
+        # stall is detected. Two rules keep that property true - do not
+        # break them:
+        #   1. Never call this from a fire-and-forget task. In particular
+        #      _process_market_frame (and _on_candle beneath it) is shared
+        #      with _run_scalp_stream, which the main loop launches via
+        #      create_task and never awaits - a mark there would let a
+        #      healthy WebSocket stream mask a genuinely deadlocked main
+        #      loop forever. tests/test_live_loop.py guards this.
+        #   2. Never convert the loop-body gathers to create_task().
+        self._last_loop_progress_at = time.monotonic()
+
     def _start_heartbeat_publisher(self) -> None:
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(self._heartbeat_publisher())
@@ -271,7 +441,12 @@ class LiveTradingLoop:
         # otherwise leave this publisher writing fresh "running" heartbeats
         # forever, and the supervisor (which only checks heartbeat age) would
         # never restart the hung process.
-        stall_after = settings.supervisor_heartbeat_stale_seconds
+        # Deliberately NOT supervisor_heartbeat_stale_seconds: that governs
+        # how stale the heartbeat file may get, this governs how long the
+        # loop may go without completing a unit of work. They are different
+        # questions and 90s is far too tight for the second - one market
+        # read can legitimately take ~93s on its own.
+        stall_after = settings.bot_progress_stall_seconds
         while not self._stopped:
             try:
                 stalled_for = time.monotonic() - self._last_loop_progress_at
@@ -476,7 +651,7 @@ class LiveTradingLoop:
                 "reason": f"market data rejected: {quality.reason}",
             }
         closed_df = df.iloc[:-1].copy()
-        indicators = compute_all_indicators(closed_df)
+        indicators = await asyncio.to_thread(compute_all_indicators, closed_df)
         price = float(indicators["close"].iloc[-1])
         atr = float(indicators["atr"].iloc[-1])
         if price <= 0 or atr <= 0:
@@ -572,7 +747,9 @@ class LiveTradingLoop:
                     "success": False,
                     "reason": f"1h context rejected: {context_quality.reason}",
                 }
-            context_indicators = compute_all_indicators(context_df.iloc[:-1].copy())
+            context_indicators = await asyncio.to_thread(
+                compute_all_indicators, context_df.iloc[:-1].copy()
+            )
             higher_regime = int(context_indicators["trend_regime"].iloc[-1])
         quality_result = self.strategy_quality.evaluate(
             indicators,
@@ -681,14 +858,41 @@ class LiveTradingLoop:
         timeframe: str,
     ) -> bool:
         if self._network_outage_active():
+            # Deliberately no progress mark: this is a zero-work
+            # short-circuit, not a completed unit. The outage branch in the
+            # main loop body marks progress for the iteration instead.
             return False
         async with self._market_data_semaphore:
             await self._process_timeframe(symbol, timeframe)
+        # One (symbol, timeframe) pair fully processed - the unit of work
+        # that corresponds to a "Candle: ..." log line. Marking here is
+        # what stops a merely-slow sweep from being mistaken for a hang:
+        # the semaphore serializes pairs, so a full sweep legitimately runs
+        # for minutes when REST is degraded.
+        #
+        # This is a correct boundary because this method's call sites are
+        # both inside gathers the main loop awaits - unlike
+        # _process_market_frame, which is also reached from the
+        # fire-and-forget scalp stream tasks.
+        self._mark_loop_progress()
         return True
 
     async def _process_timeframe(self, symbol: str, timeframe: str):
         try:
             df = await self._fetch_rest_market_frame(symbol, timeframe)
+            # Bound the gap between marks across the two slowest awaits of
+            # a pair. The fetch can legitimately take ~93s (3 ccxt attempts
+            # x 30s plus backoff), and _process_market_frame beneath this
+            # may place an entry - market order, fill resolve, stop, limit -
+            # each its own multi-second exchange round trip. Without these
+            # two marks the entire order-placement chain is invisible to
+            # the watchdog, which is exactly the window in which the
+            # 2026-09-08 03:36:26 false stall fired.
+            #
+            # Safe here (unlike in _process_market_frame itself): this
+            # method is only ever reached from the awaited scan gather,
+            # never from the fire-and-forget scalp stream tasks.
+            self._mark_loop_progress()
             self._record_connectivity_success()
             self._cache_market_frame(symbol, timeframe, df)
             await self._process_market_frame(
@@ -697,6 +901,7 @@ class LiveTradingLoop:
                 df,
                 market_data_source="rest",
             )
+            self._mark_loop_progress()
         except Exception as e:
             await self._record_connectivity_failure(e)
             await self._report_timeframe_error(symbol, timeframe, e)
@@ -802,7 +1007,12 @@ class LiveTradingLoop:
                 return
 
             self._last_processed_candles[candle_key] = candle_timestamp
-            df_ind = compute_all_indicators(closed_df)
+            # Off the event loop: this blocks ~1s per 200-row frame, and
+            # with several pairs in flight it stalled the loop for seconds
+            # at a time - which is what made awaited REST reads look like
+            # 4-10s hangs and tripped the loop-progress watchdog into
+            # killing a healthy process mid-trade (2026-09-08 03:36:26).
+            df_ind = await asyncio.to_thread(compute_all_indicators, closed_df)
             last = closed_df.iloc[-1]
             candle = {
                 "symbol": symbol,
@@ -1852,7 +2062,7 @@ class LiveTradingLoop:
                 from src.indicators.compute import compute_all_indicators
 
                 df = await self.client.fetch_ohlcv(symbol, timeframe, limit=200)
-                df_ind = compute_all_indicators(df)
+                df_ind = await asyncio.to_thread(compute_all_indicators, df)
 
             from src.signals.regime import detect_regime, regime_appropriate_strategies
 
@@ -2740,6 +2950,11 @@ class LiveTradingLoop:
             return
         self._stopped = True
         await self._stop_heartbeat_publisher()
+        # Must precede the "stopping" write below: a surviving bootstrap
+        # thread would overwrite that record with a stale "bootstrapping"
+        # one, and the supervisor reads exactly that record's reason field
+        # to decide whether the child exited fatally.
+        self._stop_bootstrap_heartbeat()
         await self._emit_heartbeat("stopping", mode=self.mode, reason=reason)
         logger.info("Stopping trading loop...")
         for task in self._scalp_stream_tasks:

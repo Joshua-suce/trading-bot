@@ -447,13 +447,20 @@ class Settings(BaseSettings):
     # benefit (17 -> 38 min) while keeping crash-loop alert latency bounded
     # (135s -> 495s).
     #
-    # If you ever raise supervisor_startup_grace_seconds materially above
-    # its 180s default, re-check the math: TradingSupervisor.run() warns at
-    # startup if max_restarts_per_hour * (grace + max_backoff) is close to
-    # the 3600s rolling window used to detect exhaustion, since past that
-    # point old restarts get pruned as fast as new ones accumulate and the
-    # exhaustion alert can stop firing entirely.
-    supervisor_max_restarts_per_hour: int = Field(default=10, ge=1, le=100)
+    # If you ever raise supervisor_startup_grace_seconds,
+    # supervisor_bootstrap_phase_stall_seconds or bot_progress_stall_seconds,
+    # re-check the math: TradingSupervisor._warn_if_exhaustion_unreachable
+    # warns at startup if max_restarts_per_hour * worst-case-restart-cycle
+    # reaches the 3600s rolling window used to detect exhaustion, since past
+    # that point old restarts get pruned as fast as new ones accumulate and
+    # the "Trading Bot STOPPED" alert stops firing entirely.
+    #
+    # Lowered 10 -> 8 when the bootstrap-phase kill path was added: worst
+    # cycle is now max(grace 180, grace+phase_stall 300, progress_stall+
+    # stale+check 245) + shutdown 30 + max_backoff 60 = 390s, and 390 * 8 =
+    # 3120 < 3600 keeps the alert reachable with margin (390 * 10 = 3900
+    # would not).
+    supervisor_max_restarts_per_hour: int = Field(default=8, ge=1, le=100)
     supervisor_restart_backoff_seconds: float = Field(
         default=5.0,
         ge=0.0,
@@ -463,6 +470,29 @@ class Settings(BaseSettings):
         default=60.0,
         ge=1.0,
         le=3600.0,
+    )
+    # How long the in-process loop watchdog (LiveTradingLoop's heartbeat
+    # publisher) waits before declaring the main scan loop hung and
+    # withholding heartbeats so the supervisor restarts the child.
+    #
+    # Deliberately separate from supervisor_heartbeat_stale_seconds: that
+    # one governs how stale a heartbeat FILE may get before the supervisor
+    # acts, while this governs how long the loop may go without completing
+    # a unit of work. One knob was doing both jobs at 90s, which is far too
+    # tight for the second: a single market-data read can legitimately take
+    # ~93s (3 ccxt attempts x 30s plus backoff), and an entry places four
+    # sequential orders on top of that.
+    bot_progress_stall_seconds: float = Field(default=150.0, ge=30.0, le=1800.0)
+    # Max time a single startup phase (exchange connect, audit restore,
+    # exchange reconciliation, ...) may take before the bootstrap heartbeat
+    # publisher stops refreshing and lets the supervisor restart the child.
+    # Bounds a startup wedged on one await without punishing a merely slow
+    # one - the whole startup measured ~117s on a slow link, and this
+    # bounds any single phase of it.
+    supervisor_bootstrap_phase_stall_seconds: float = Field(
+        default=120.0,
+        ge=10.0,
+        le=1800.0,
     )
     # Hard ceiling on TradingSupervisor._alert_exhausted's total delivery
     # time (all channels, all retries combined). Without this, an

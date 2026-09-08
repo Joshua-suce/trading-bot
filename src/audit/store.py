@@ -1,8 +1,9 @@
 import json
 import sqlite3
+import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ class AuditStore:
             configured_path = Path(__file__).resolve().parents[2] / configured_path
         self.db_path = configured_path.resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
         self._init_schema()
         self._retire_legacy_open_trades()
         self._redact_legacy_signed_urls()
@@ -38,14 +40,24 @@ class AuditStore:
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
+    def _thread_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+            self._local.conn = conn
+        return conn
+
     @contextmanager
     def _connection(self):
-        conn = self._connect()
+        conn = self._thread_connection()
         try:
             with conn:
                 yield conn
-        finally:
-            conn.close()
+        except sqlite3.Error:
+            with suppress(Exception):
+                conn.close()
+            self._local.conn = None
+            raise
 
     def _init_schema(self) -> None:
         attempts = 5

@@ -1,5 +1,7 @@
 import asyncio
+import inspect
 import time
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1018,6 +1020,142 @@ async def test_heartbeat_publisher_runs_independently_of_scan_loop(monkeypatch):
 
     assert writes[0][0] == "running"
     assert writes[0][1]["open_positions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_pair_marks_progress_without_finishing_a_sweep(monkeypatch):
+    # A merely-slow sweep must not look like a hang: each completed
+    # (symbol, timeframe) pair refreshes the watchdog's clock, so a sweep
+    # that legitimately runs for minutes never trips the stall detector.
+    bot = LiveTradingLoop()
+    monkeypatch.setattr(bot, "_network_outage_active", lambda: False)
+    monkeypatch.setattr(bot, "_process_timeframe", AsyncMock())
+    bot._last_loop_progress_at = time.monotonic() - 10_000
+
+    assert await bot._bounded_process_timeframe("BTCUSDT", "1h") is True
+    assert time.monotonic() - bot._last_loop_progress_at < 1.0
+
+
+@pytest.mark.asyncio
+async def test_outage_short_circuit_does_not_mark_progress(monkeypatch):
+    # Zero-work short-circuit, not a completed unit - must not refresh.
+    bot = LiveTradingLoop()
+    monkeypatch.setattr(bot, "_network_outage_active", lambda: True)
+    stale = time.monotonic() - 10_000
+    bot._last_loop_progress_at = stale
+
+    assert await bot._bounded_process_timeframe("BTCUSDT", "1h") is False
+    assert bot._last_loop_progress_at == stale
+
+
+@pytest.mark.asyncio
+async def test_hung_pair_freezes_progress_once_siblings_drain(monkeypatch):
+    # The watchdog must still catch a genuine deadlock even though healthy
+    # siblings in the same gather keep marking progress for a while. The
+    # sibling pool is finite and drains, after which the clock freezes.
+    bot = LiveTradingLoop()
+    monkeypatch.setattr(bot, "_network_outage_active", lambda: False)
+    hang = asyncio.Event()  # never set
+
+    async def process(_symbol, timeframe):
+        if timeframe == "1h":
+            await hang.wait()
+
+    monkeypatch.setattr(bot, "_process_timeframe", process)
+    sweep = asyncio.gather(
+        bot._bounded_process_timeframe("BTCUSDT", "1h"),
+        bot._bounded_process_timeframe("ETHUSDT", "15m"),
+    )
+    await asyncio.sleep(0.05)
+    drained_at = bot._last_loop_progress_at
+    await asyncio.sleep(0.2)
+
+    assert bot._last_loop_progress_at == drained_at  # marker frozen
+    assert not sweep.done()
+    sweep.cancel()
+    with suppress(asyncio.CancelledError):
+        await sweep
+
+
+def test_progress_is_not_marked_on_the_shared_stream_path():
+    # _process_market_frame and _on_candle beneath it are reachable from
+    # the fire-and-forget scalp stream tasks, which the main loop never
+    # awaits. A progress mark in either would let a healthy WebSocket
+    # stream mask a deadlocked main loop forever, defeating the watchdog.
+    # (_process_timeframe is deliberately NOT in this list - it is only
+    # reached from the awaited scan gather, so marking there is safe and
+    # is what covers the order-placement chain.)
+    for method in (
+        LiveTradingLoop._process_market_frame,
+        LiveTradingLoop._on_candle,
+    ):
+        assert "_mark_loop_progress" not in inspect.getsource(method)
+
+
+def test_process_timeframe_marks_progress_around_the_order_chain():
+    # Placing an entry issues four sequential exchange round trips inside
+    # _process_market_frame; without marks on both sides of it the whole
+    # order chain is invisible to the watchdog. This is the exact window
+    # in which the 2026-09-08 03:36:26 false stall fired.
+    source = inspect.getsource(LiveTradingLoop._process_timeframe)
+    assert source.count("_mark_loop_progress") == 2
+
+
+def test_bootstrap_publisher_withholds_heartbeat_on_a_wedged_phase(monkeypatch):
+    # A startup wedged on one await must stop heartbeating so the
+    # supervisor still restarts it - the phase gate is what keeps the
+    # thread-based publisher honest.
+    bot = LiveTradingLoop()
+    writes = []
+    monkeypatch.setattr(
+        bot._heartbeat,
+        "write",
+        lambda state, **details: writes.append((state, details)),
+    )
+    # Stop after the first pass. Must not pre-set the event: the publisher
+    # checks it as the loop condition, so pre-setting would skip the body
+    # entirely and make this assertion pass vacuously.
+    monkeypatch.setattr(
+        bot._bootstrap_stop, "wait", lambda _timeout: bot._bootstrap_stop.set()
+    )
+
+    bot._set_bootstrap_phase("exchange_connect")
+    # Wedge it: phase last advanced longer ago than the allowed bound.
+    bot._bootstrap_phase_at = (
+        time.monotonic()
+        - live_loop_module.settings.supervisor_bootstrap_phase_stall_seconds
+        - 1
+    )
+    bot._publish_bootstrap_heartbeat()
+
+    assert writes == []
+
+
+def test_bootstrap_publisher_heartbeats_while_phases_advance(monkeypatch):
+    bot = LiveTradingLoop()
+    writes = []
+    monkeypatch.setattr(
+        bot._heartbeat,
+        "write",
+        lambda state, **details: writes.append((state, details)),
+    )
+
+    # Stop after the first pass (see note in the wedged-phase test above).
+    monkeypatch.setattr(
+        bot._bootstrap_stop, "wait", lambda _timeout: bot._bootstrap_stop.set()
+    )
+
+    bot._set_bootstrap_phase("exchange_connect")
+    bot._publish_bootstrap_heartbeat()
+
+    assert len(writes) == 1
+    state, details = writes[0]
+    # Must be a state the supervisor grants extended startup grace to.
+    assert state == "bootstrapping"
+    assert details["phase"] == "exchange_connect"
+    # Never pass instance_id explicitly - RuntimeHeartbeat reads it from
+    # the env the supervisor injected, and the supervisor matches on that.
+    assert "instance_id" not in details
 
 
 @pytest.mark.asyncio
@@ -2191,16 +2329,28 @@ async def test_scan_timeframes_runs_in_configured_sequence(monkeypatch):
         timeframes=["5m", "15m", "30m"],
     )
 
+    # Fetches are dispatched in the configured sequence.
     assert fake_client.calls == [
         ("BTCUSDT", "5m", 201),
         ("BTCUSDT", "15m", 201),
         ("BTCUSDT", "30m", 201),
     ]
-    assert processed == [
-        ("BTCUSDT", "5m"),
-        ("BTCUSDT", "15m"),
-        ("BTCUSDT", "30m"),
-    ]
+    # Every pair is processed exactly once. Deliberately order-insensitive:
+    # _scan_timeframes_once gathers pairs behind a semaphore of
+    # market_data_concurrency (>1), so completion order follows whichever
+    # fetch resolves first, never the configured order. This assertion used
+    # to be an ordered one, which only held because FakeSequentialClient
+    # returns without awaiting - so each task ran fetch -> compute ->
+    # _on_candle without ever yielding. Real network latency broke that
+    # long before indicator computation moved to a worker thread; the
+    # ordering was an artifact of the fake, not an invariant of the code.
+    assert sorted(processed) == sorted(
+        [
+            ("BTCUSDT", "5m"),
+            ("BTCUSDT", "15m"),
+            ("BTCUSDT", "30m"),
+        ]
+    )
 
 
 @pytest.mark.asyncio

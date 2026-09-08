@@ -4,6 +4,16 @@ import pandas as pd
 
 
 class MomentumIndicators:
+    @staticmethod
+    def _wilder_smooth(values: pd.Series, period: int) -> pd.Series:
+        seed = values.rolling(window=period, min_periods=period).mean()
+        if len(values) < period:
+            return seed
+        smoothed = values.astype("float64").copy()
+        smoothed.iloc[: period - 1] = np.nan
+        smoothed.iloc[period - 1] = seed.iloc[period - 1]
+        return smoothed.ewm(alpha=1.0 / period, adjust=False).mean()
+
     # RSI (Relative Strength Index): measures speed/change of price movements
     # Values below 30 = oversold, above 70 = overbought
     @staticmethod
@@ -11,15 +21,8 @@ class MomentumIndicators:
         delta = close.diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=period, min_periods=period).mean()
-        avg_loss = loss.rolling(window=period, min_periods=period).mean()
-        for i in range(period, len(avg_gain)):
-            avg_gain.iloc[i] = (
-                avg_gain.iloc[i - 1] * (period - 1) + gain.iloc[i]
-            ) / period
-            avg_loss.iloc[i] = (
-                avg_loss.iloc[i - 1] * (period - 1) + loss.iloc[i]
-            ) / period
+        avg_gain = MomentumIndicators._wilder_smooth(gain, period)
+        avg_loss = MomentumIndicators._wilder_smooth(loss, period)
         rs = avg_gain / avg_loss.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
         return rsi
@@ -48,7 +51,18 @@ class MomentumIndicators:
     ) -> pd.Series:
         tp = (high + low + close) / 3
         sma = tp.rolling(period).mean()
-        mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean())
+        values = tp.to_numpy(dtype="float64")
+        if len(values) >= period:
+            windows = np.lib.stride_tricks.sliding_window_view(values, period)
+            deviations = np.abs(
+                windows - windows.mean(axis=1, keepdims=True)
+            ).mean(axis=1)
+            mad_values = np.concatenate(
+                [np.full(period - 1, np.nan), deviations]
+            )
+        else:
+            mad_values = np.full(len(values), np.nan)
+        mad = pd.Series(mad_values, index=tp.index)
         cci = (tp - sma) / (0.015 * mad.replace(0, np.nan))
         return cci
 
