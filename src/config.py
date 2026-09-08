@@ -427,13 +427,32 @@ class Settings(BaseSettings):
     # A live 2026-09-07 run showed a single ~24-minute exchange/network
     # outage (repeated OHLCV RequestTimeout + failed clock sync) burn the
     # entire restart budget: each restart cycle costs the 180s startup
-    # grace period plus backoff, so 5 restarts is only ~20-25 minutes of
+    # grace period plus backoff, so 5 restarts is only ~17 minutes of
     # patience before the bot gives up and stops trading entirely until an
-    # operator notices and restarts it by hand. Raised to 10/120s so a
-    # transient demo-API or home-network blip doesn't strand the bot for
-    # the rest of the hour; genuinely persistent failures still eventually
-    # exhaust the budget and now fire a critical alert (see
+    # operator notices and restarts it by hand. Raised max_restarts to 10
+    # (~38 min patience for a hang, at the unchanged 60s backoff cap - see
+    # below) so a transient demo-API or home-network blip doesn't strand
+    # the bot for the rest of the hour; genuinely persistent failures still
+    # eventually exhaust the budget and now fire a critical alert (see
     # TradingSupervisor._alert_exhausted) instead of dying silently.
+    #
+    # Deliberately did NOT raise supervisor_max_backoff_seconds alongside
+    # this: for a fast crash-loop (child exits immediately every launch,
+    # e.g. a bad deploy) the pre-alert delay is pure backoff-sum with no
+    # 180s grace wait, and doubling both max_restarts and the backoff cap
+    # together would have made that case ~5.6x slower to alert (135s ->
+    # 755s) for zero benefit - a crash-looping process isn't waiting on a
+    # network timeout, so it doesn't need extra patience. Keeping the 60s
+    # cap while only raising max_restarts gets most of the hang-scenario
+    # benefit (17 -> 38 min) while keeping crash-loop alert latency bounded
+    # (135s -> 495s).
+    #
+    # If you ever raise supervisor_startup_grace_seconds materially above
+    # its 180s default, re-check the math: TradingSupervisor.run() warns at
+    # startup if max_restarts_per_hour * (grace + max_backoff) is close to
+    # the 3600s rolling window used to detect exhaustion, since past that
+    # point old restarts get pruned as fast as new ones accumulate and the
+    # exhaustion alert can stop firing entirely.
     supervisor_max_restarts_per_hour: int = Field(default=10, ge=1, le=100)
     supervisor_restart_backoff_seconds: float = Field(
         default=5.0,
@@ -441,9 +460,19 @@ class Settings(BaseSettings):
         le=300.0,
     )
     supervisor_max_backoff_seconds: float = Field(
-        default=120.0,
+        default=60.0,
         ge=1.0,
         le=3600.0,
+    )
+    # Hard ceiling on TradingSupervisor._alert_exhausted's total delivery
+    # time (all channels, all retries combined). Without this, an
+    # unbounded asyncio.run(alerter.send(...)) could block process exit
+    # for minutes during exactly the degraded-network conditions that
+    # exhausted the restart budget in the first place.
+    supervisor_alert_timeout_seconds: float = Field(
+        default=20.0,
+        ge=1.0,
+        le=120.0,
     )
     rollout_artifact_path: str = "data/governance/rollout.json"
     mainnet_canary_enabled: bool = True

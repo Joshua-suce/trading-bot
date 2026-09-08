@@ -1,4 +1,6 @@
+import asyncio
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -240,6 +242,122 @@ def test_alert_exhausted_swallows_delivery_errors(tmp_path, monkeypatch):
     )
 
     supervisor._alert_exhausted(5)  # must not raise, only log
+
+
+def test_alert_exhausted_bounds_a_slow_or_hanging_send(tmp_path, monkeypatch):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        telegram_bot_token="token-123",
+        telegram_chat_id="chat-456",
+        supervisor_alert_timeout_seconds=1.0,
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+
+    async def hangs_forever(*_args, **_kwargs):
+        await asyncio.sleep(3600)
+        return True  # pragma: no cover - never reached
+
+    monkeypatch.setattr("src.supervisor.Alerter.send", hangs_forever)
+    error_mock = MagicMock()
+    monkeypatch.setattr("src.supervisor.logger.error", error_mock)
+
+    start = time.monotonic()
+    supervisor._alert_exhausted(5)  # must return well before 3600s
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5.0
+    assert any(
+        "timed out" in str(call.args[0]) for call in error_mock.call_args_list
+    )
+
+
+def test_alert_exhausted_logs_when_delivery_returns_false(tmp_path, monkeypatch):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        telegram_bot_token="token-123",
+        telegram_chat_id="chat-456",
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    monkeypatch.setattr(
+        "src.supervisor.Alerter.send", AsyncMock(return_value=False)
+    )
+    error_mock = MagicMock()
+    monkeypatch.setattr("src.supervisor.logger.error", error_mock)
+
+    supervisor._alert_exhausted(5)  # must not raise
+
+    assert any(
+        "not confirmed delivered" in str(call.args[0])
+        for call in error_mock.call_args_list
+    )
+
+
+def test_run_swallows_keyboard_interrupt_during_exhaustion_alert(
+    tmp_path, monkeypatch
+):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        supervisor_max_restarts_per_hour=1,
+        supervisor_restart_backoff_seconds=0.0,
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    monkeypatch.setattr("src.supervisor.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(supervisor, "_monitor", lambda *a, **k: True)
+
+    class Process:
+        pid = 42
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        "src.supervisor.subprocess.Popen", lambda *a, **k: Process()
+    )
+    monkeypatch.setattr(
+        supervisor, "_alert_exhausted", MagicMock(side_effect=KeyboardInterrupt)
+    )
+
+    # Must return the normal exhausted-exit code, not propagate the
+    # KeyboardInterrupt raised mid-alert-send as a raw traceback.
+    assert supervisor.run() == 1
+
+
+def test_warn_if_exhaustion_unreachable_warns_when_budget_never_reachable(
+    tmp_path, monkeypatch
+):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+        supervisor_startup_grace_seconds=300.0,
+        supervisor_max_backoff_seconds=120.0,
+        supervisor_max_restarts_per_hour=10,
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    warning_mock = MagicMock()
+    monkeypatch.setattr("src.supervisor.logger.warning", warning_mock)
+
+    supervisor._warn_if_exhaustion_unreachable()
+
+    warning_mock.assert_called_once()
+
+
+def test_warn_if_exhaustion_unreachable_silent_with_shipped_defaults(
+    tmp_path, monkeypatch
+):
+    cfg = Settings(
+        _env_file=None,
+        runtime_heartbeat_path=str(tmp_path / "heartbeat.json"),
+    )
+    supervisor = TradingSupervisor(cfg=cfg)
+    warning_mock = MagicMock()
+    monkeypatch.setattr("src.supervisor.logger.warning", warning_mock)
+
+    supervisor._warn_if_exhaustion_unreachable()
+
+    warning_mock.assert_not_called()
 
 
 def test_run_alerts_and_exits_when_restart_budget_exhausted(tmp_path, monkeypatch):
